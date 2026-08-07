@@ -1,4 +1,4 @@
-# BCO Live v0.1.0 — locked production bootstrap
+# BCO Live v0.1.1 — instrument price precision fix
 # Project Exit Plan
 #
 # Design sources:
@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "BCO Live v0.1.0 — Locked Production Bootstrap"
-APP_VERSION = "0.1.0"
-POLICY_VERSION = "bco_live_v0.1.0_index_v10.1.26_behaviour"
+APP_NAME = "BCO Live v0.1.1 — Locked Production Bootstrap + Price Precision Fix"
+APP_VERSION = "0.1.1"
+POLICY_VERSION = "bco_live_v0.1.1_index_v10.1.26_behaviour_price_precision"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -817,6 +817,18 @@ def floor_to_precision(value: float, precision: int) -> float:
     return math.floor(value * factor + 1e-12) / factor
 
 
+def format_oanda_price(value: float, precision: int) -> str:
+    """Format an order/stop price to the instrument's broker precision.
+
+    OANDA rejects stopLossOnFill / trade stop updates when the submitted price
+    contains more decimals than the instrument's displayPrecision. BCO_USD
+    currently reports displayPrecision=3, but we derive it from instrument
+    metadata rather than hard-coding it into order construction.
+    """
+    p = max(0, int(precision or 0))
+    return f"{float(value):.{p}f}"
+
+
 def risk_preview(target_risk_gbp: float = BCO_RISK_PER_TRADE_GBP) -> Dict[str, Any]:
     inst = BCO_OANDA_INSTRUMENT
     if not inst:
@@ -835,6 +847,7 @@ def risk_preview(target_risk_gbp: float = BCO_RISK_PER_TRADE_GBP) -> Dict[str, A
     risk_per_unit_home = delta_quote * home_factor
     raw_units = float(target_risk_gbp) / risk_per_unit_home if risk_per_unit_home > 0 else 0.0
     precision = int(safe_float(details.get("tradeUnitsPrecision")) or 0)
+    display_precision = int(safe_float(details.get("displayPrecision")) or 0)
     minimum = float(safe_float(details.get("minimumTradeSize")) or 1.0)
     units = floor_to_precision(raw_units, precision)
     used_min = False
@@ -845,7 +858,8 @@ def risk_preview(target_risk_gbp: float = BCO_RISK_PER_TRADE_GBP) -> Dict[str, A
     overage_pct = ((effective_risk / target_risk_gbp) - 1.0) * 100.0 if target_risk_gbp > 0 else 0.0
     return {
         "ok": True, "instrument": inst, "target_risk_gbp": target_risk_gbp, "entry_price": entry,
-        "stop_price": sl_price, "sl_pct": BCO_SL_PCT, "units": units, "raw_units": raw_units,
+        "stop_price": sl_price, "stop_price_formatted": format_oanda_price(sl_price, display_precision),
+        "display_precision": display_precision, "sl_pct": BCO_SL_PCT, "units": units, "raw_units": raw_units,
         "units_precision": precision, "minimum_trade_size": minimum, "used_minimum_trade_size": used_min,
         "effective_risk_gbp": effective_risk, "risk_overage_pct": overage_pct,
         "spread_pct": price.get("spread_pct"), "home_loss_conversion_factor": home_factor,
@@ -876,10 +890,16 @@ def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
         return {"ok": False, "blocked": True, "error": "spread exceeds guardrail", "preview": preview}
     units = preview["units"]
     stop = preview["stop_price"]
+    stop_text = safe_str(preview.get("stop_price_formatted"))
+    if not stop_text:
+        stop_text = format_oanda_price(stop, int(preview.get("display_precision") or 0))
+    # Whole-unit BCO instruments should be sent as whole-unit strings where possible.
+    units_precision = int(preview.get("units_precision") or 0)
+    units_text = f"{float(units):.{units_precision}f}"
     body = {"order": {
-        "type": "MARKET", "instrument": BCO_OANDA_INSTRUMENT, "units": str(units),
+        "type": "MARKET", "instrument": BCO_OANDA_INSTRUMENT, "units": units_text,
         "timeInForce": "FOK", "positionFill": "DEFAULT",
-        "stopLossOnFill": {"price": f"{stop:.8f}"}
+        "stopLossOnFill": {"price": stop_text}
     }}
     resp = oanda_write(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", "POST", body, BCO_OANDA_INSTRUMENT, "OPEN_BCO", trade_id=local_trade_id)
     fill = extract_fill(resp)
@@ -891,7 +911,14 @@ def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
 
 
 def update_broker_stop(broker_trade_id: str, stop_price: float, local_trade_id: str) -> Dict[str, Any]:
-    body = {"stopLoss": {"price": f"{stop_price:.8f}", "timeInForce": "GTC"}}
+    # Use the broker-reported display precision for every stop amendment too.
+    # This prevents the same precision rejection that can affect stopLossOnFill.
+    details = instrument_details(BCO_OANDA_INSTRUMENT) or {}
+    display_precision = int(safe_float(details.get("displayPrecision")) or 0)
+    if display_precision <= 0:
+        return {"ok": False, "blocked": True, "error": "instrument displayPrecision unavailable for stop update"}
+    stop_text = format_oanda_price(stop_price, display_precision)
+    body = {"stopLoss": {"price": stop_text, "timeInForce": "GTC"}}
     return oanda_write(f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{broker_trade_id}/orders", "PUT", body,
                        BCO_OANDA_INSTRUMENT, "UPDATE_STOP", trade_id=local_trade_id, broker_trade_id=broker_trade_id)
 
