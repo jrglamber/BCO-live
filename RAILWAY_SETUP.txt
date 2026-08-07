@@ -1,0 +1,22 @@
+BCO LIVE — FIRST RAILWAY SETUP
+==============================
+
+1. Push every file in this package to a new GitHub repo: bco-live
+2. Railway -> New Project -> Deploy from GitHub repo -> bco-live
+3. Add Railway Postgres to the same project/service environment.
+4. Add variables from .env.example.
+5. Replace WEBHOOK_SECRET, ADMIN_SECRET, OANDA_ACCOUNT_ID and OANDA_API_TOKEN in Railway only.
+6. KEEP BROKER LOCKED on first deploy:
+   BROKER_READ_ONLY=true
+   BROKER_EXECUTION_ENABLED=false
+   BROKER_KILL_SWITCH=true
+   BCO_LIVE_EXECUTION_ARMED=false
+   BCO_AUTO_ENTRY_ENABLED=false
+   BCO_AUTO_MANAGEMENT_ENABLED=false
+   BCO_PRACTICE_SMOKE_TEST_ENABLED=false
+7. Deploy and confirm /health is green.
+8. Open /broker/instruments/discover and identify exact Brent/BCO instrument.
+9. Set BCO_OANDA_INSTRUMENT to that exact value and redeploy.
+10. Check /broker/risk-preview.
+
+DO NOT unlock execution yet. Send the preflight / risk-preview result back for review.
