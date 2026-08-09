@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.2.0 — Project Standard"
-APP_VERSION = "0.2.0"
-POLICY_VERSION = "bco_v0.2.0_project_standard_index_learnings"
+APP_NAME = "Project Exit Plan — BCO v0.2.1 — Project Standard"
+APP_VERSION = "0.2.1"
+POLICY_VERSION = "bco_v0.2.1_project_standard_tiles"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1600,6 +1600,8 @@ def _bco_standard_top_uncached():
             "latest_time": safe_str(latest.get("timestamp_readable")),
             "latest_price": safe_float(latest.get("exec_close")),
             "latest_signal_id": safe_str(latest.get("signal_id")),
+            "received_assets": 1 if safe_str(latest.get("signal_id")) else 0,
+            "expected_assets": 1,
         },
         "config": {
             "risk_per_trade_gbp": BCO_RISK_PER_TRADE_GBP,
@@ -1800,16 +1802,33 @@ details{{background:var(--panel);border:1px solid var(--border);border-radius:10
 .metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}}.mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}table{{width:100%;border-collapse:collapse;background:var(--panel)}}th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}}th{{background:#0f141a;color:white}}.table-scroll{{width:100%;overflow-x:auto}}a{{color:var(--blue);text-decoration:none}}.links{{margin:9px 0 14px;font-size:12px}}
 @media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
 </style></head><body><div class="page">
-<h1>Project Exit Plan — BCO</h1><div class="sub">v0.2.0 Project Standard · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
+<h1>Project Exit Plan — BCO</h1><div class="sub">v0.2.1 Project Standard · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div><div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">BCO P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
 <div class="links"><a href="/dashboard-full">Full legacy dashboard</a> · <a href="/health">Health</a> · <a href="/snapshot">Snapshot JSON</a> · <a href="/export/all.zip">BCO analysis ZIP</a></div><h2>Details</h2>{sections}</div>
 <script>
 function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}function money(v){{const n=Number(v);if(!Number.isFinite(n))return'n/a';return(n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}function cls(v){{const n=Number(v);return!Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}function card(l,v,s='',c=''){{return`<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}function localTime(iso){{if(!iso)return'';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
-async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`<div class="cards four">${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}${{card('BCO P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}${{card('Giveback',`${{gb.toFixed(1)}}%`,`Phase ${{eh(s.basket_phase||'FLAT')}}`,gbc)}}</div><div class="cards four">${{card('Open Trades',eh(s.open_trades||0),`Manager ${{eh(s.tide_status||'FLAT')}}`)}}${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}${{card('Banked This Cycle',`${{Number(s.banked_r_cycle||0).toFixed(2)}}R`,'Immediate harvest ladder',cls(s.banked_r_cycle))}}${{card('Candidate Support',g.candidate?'1/1':'0/1',g.candidate?'BCO candidate active':'No current candidate',g.candidate?'pos':'neg')}}</div><div class="cards three">${{card('Lane',s.orders_allowed?'ENABLED':'LOCKED',`${{eh(d.mode)}} · entry ${{s.auto_entry?'ON':'OFF'}} · management ${{s.auto_management?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}${{card('Risk / Trade',money(c.risk_per_trade_gbp),`${{Number(c.sl_pct||0).toFixed(2)}}% SL · ${{eh(c.direction||'')}}`)}}${{card('Scope',eh(c.instrument||'BCO'),'Standalone BCO project')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
+async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
+   <div class="cards four">
+    ${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
+    ${{card('BCO P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+    ${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+    ${{card('Giveback',`${{gb.toFixed(1)}}%`,`Basket state ${{eh(s.basket_phase||'FLAT')}}`,gbc)}}
+   </div>
+   <div class="cards four">
+    ${{card('Open Trades',eh(s.open_trades||0),'BCO long basket')}}
+    ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}
+    ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,g.latest_time?'Latest BCO signal received':'Waiting for BCO signal',Number(g.received_assets||0)===Number(g.expected_assets||1)?'pos':'warn')}}
+    ${{card('Candidate Support',g.candidate?'1/1':'0/1',g.candidate?'Current BCO candidate':'No current candidate',g.candidate?'pos':'neg')}}
+   </div>
+   <div class="cards three">
+    ${{card('Lane',s.orders_allowed?'ENABLED':'LOCKED',`${{eh(d.mode)}} · manager ${{s.auto_management?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}
+    ${{card('Risk / Trade',money(c.risk_per_trade_gbp),`${{Number(c.sl_pct||0).toFixed(2)}}% SL · ${{eh(c.direction||'')}}`)}}
+    ${{card('Scope',eh(c.instrument||'BCO'),'Standalone BCO project')}}
+   </div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
 </script></body></html>'''
 
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
-    return {"status":"ok","version":"0.2.0","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
+    return {"status":"ok","version":"0.2.1","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
 
