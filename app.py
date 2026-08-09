@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "BCO Live v0.1.1 — Locked Production Bootstrap + Price Precision Fix"
-APP_VERSION = "0.1.1"
-POLICY_VERSION = "bco_live_v0.1.1_index_v10.1.26_behaviour_price_precision"
+APP_NAME = "Project Exit Plan — BCO v0.2.0 — Project Standard"
+APP_VERSION = "0.2.0"
+POLICY_VERSION = "bco_v0.2.0_project_standard_index_learnings"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1496,8 +1496,8 @@ def export_all_zip():
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-live-analysis.zip"'})
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
+@app.get("/dashboard-full", response_class=HTMLResponse)
+def dashboard_full():
     s=snapshot(); b=s.get("basket") or {}; safety=s.get("broker_safety") or {}; acct=s.get("account") or {}; latest=s.get("latest_signal") or {}
     open_rows=s.get("open_trades") or []
     rows="".join(f"<tr><td>{esc(t.get('trade_id'))}</td><td>{esc(t.get('entry_time'))}</td><td>{safe_float(t.get('entry_price')) or 0:.3f}</td><td>{int(safe_float(t.get('hold_candles')) or 0)}</td><td>{safe_float(t.get('current_R')) or 0:.2f}R</td><td>{esc(t.get('decision_48'))}</td><td>{esc(t.get('decision_72'))}</td><td>{esc(t.get('managed_stop_stage'))}</td><td>{esc(t.get('broker_trade_id'))}</td></tr>" for t in open_rows)
@@ -1521,3 +1521,295 @@ def dashboard():
 
 @app.get("/")
 def root(): return {"app":APP_NAME,"dashboard":"/dashboard","health":"/health","preflight":"/broker/preflight"}
+
+# ============================================================
+# BCO v0.2.0 — PROJECT EXIT PLAN STANDARD DASHBOARD
+# ============================================================
+
+_BCO_STD_TOP_CACHE = {"payload": None, "expires_at": 0.0}
+_BCO_STD_TOP_LOCK = threading.Lock()
+BCO_STANDARD_TOP_CACHE_SECONDS = max(5.0, min(float(os.getenv("BCO_STANDARD_TOP_CACHE_SECONDS", "20")), 120.0))
+
+def _money(v):
+    n = safe_float(v)
+    if n is None:
+        return "n/a"
+    return ("-" if n < 0 else "") + f"£{abs(n):,.2f}"
+
+def _pnl_class(v):
+    n = safe_float(v)
+    if n is None or abs(n) < 1e-12:
+        return ""
+    return "pos" if n > 0 else "neg"
+
+def _bco_standard_top_uncached():
+    s = snapshot()
+    basket = s.get("basket") or {}
+    acct = s.get("account") or {}
+    safety = s.get("broker_safety") or {}
+    latest = s.get("latest_signal") or {}
+    rows = s.get("open_trades") or []
+    closed = s.get("closed_summary") or {}
+
+    open_count = len(rows)
+    mature = sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0) >= BCO_MIN_HOLD_HOURS)
+    oldest = max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
+
+    basket_r = safe_float(basket.get("basket_R")) or 0.0
+    hwm_r = safe_float(basket.get("high_water_R")) or 0.0
+    giveback_pct = safe_float(basket.get("giveback_pct")) or 0.0
+    open_pnl = safe_float(basket.get("basket_pnl_gbp"))
+    if open_pnl is None:
+        open_pnl = basket_r * BCO_RISK_PER_TRADE_GBP
+
+    realized_pnl = safe_float(closed.get("p")) or 0.0
+    realized_r = safe_float(closed.get("r")) or 0.0
+
+    return {
+        "status": "ok",
+        "project": "BCO",
+        "mode": safe_str(OANDA_ENV).upper(),
+        "time_utc": now_utc_iso(),
+        "account": {
+            "nav": safe_float(acct.get("NAV")),
+            "balance": safe_float(acct.get("balance")),
+            "margin_available": safe_float(acct.get("marginAvailable")),
+            "currency": safe_str(acct.get("currency")),
+        },
+        "strategy": {
+            "open_pnl": open_pnl,
+            "realized_pnl": realized_pnl,
+            "realized_r": realized_r,
+            "total_pnl": open_pnl + realized_pnl,
+            "open_trades": open_count,
+            "mature_48h_plus": mature,
+            "oldest_hold": oldest,
+            "basket_r": basket_r,
+            "high_water_r": hwm_r,
+            "giveback_pct": giveback_pct,
+            "basket_phase": safe_str(basket.get("basket_phase") or "FLAT"),
+            "tide_status": safe_str(basket.get("tide_status") or "FLAT"),
+            "manager_action": safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),
+            "orders_allowed": bool(safety.get("orders_allowed")),
+            "auto_entry": bool(safety.get("auto_entry")),
+            "auto_management": bool(safety.get("auto_management")),
+            "banked_r_cycle": safe_float(basket.get("banked_R_cycle")) or 0.0,
+        },
+        "signals": {
+            "candidate": parse_bool(latest.get("candidate_8h"), False),
+            "latest_time": safe_str(latest.get("timestamp_readable")),
+            "latest_price": safe_float(latest.get("exec_close")),
+            "latest_signal_id": safe_str(latest.get("signal_id")),
+        },
+        "config": {
+            "risk_per_trade_gbp": BCO_RISK_PER_TRADE_GBP,
+            "sl_pct": BCO_SL_PCT,
+            "min_hold_hours": BCO_MIN_HOLD_HOURS,
+            "instrument": BCO_OANDA_INSTRUMENT,
+            "direction": BCO_DIRECTION,
+        },
+    }
+
+def bco_standard_top_snapshot(force=False):
+    now_ts = time.time()
+    with _BCO_STD_TOP_LOCK:
+        if (not force and _BCO_STD_TOP_CACHE.get("payload") is not None and float(_BCO_STD_TOP_CACHE.get("expires_at") or 0.0) > now_ts):
+            out = dict(_BCO_STD_TOP_CACHE["payload"])
+            out["cached"] = True
+            return out
+    out = _bco_standard_top_uncached()
+    with _BCO_STD_TOP_LOCK:
+        _BCO_STD_TOP_CACHE["payload"] = dict(out)
+        _BCO_STD_TOP_CACHE["expires_at"] = now_ts + BCO_STANDARD_TOP_CACHE_SECONDS
+    out["cached"] = False
+    return out
+
+@app.get("/dashboard/top")
+def bco_standard_top_route(force: bool = False):
+    return bco_standard_top_snapshot(force=force)
+
+def _bco_standard_basket_manager_html():
+    s = snapshot()
+    b = s.get("basket") or {}
+    rows = s.get("open_trades") or []
+    trade_rows = ""
+    for t in rows:
+        trade_rows += f'''
+        <tr>
+          <td>{esc(t.get("trade_id"))}</td>
+          <td>{esc(t.get("entry_time"))}</td>
+          <td>{safe_float(t.get("entry_price")) or 0:.3f}</td>
+          <td>{int(safe_float(t.get("hold_candles")) or 0)}</td>
+          <td class="{_pnl_class(t.get("current_R"))}">{safe_float(t.get("current_R")) or 0:.2f}R</td>
+          <td>{esc(t.get("decision_48") or "-")}</td>
+          <td>{esc(t.get("decision_72") or "-")}</td>
+          <td>{esc(t.get("managed_stop_stage") or "-")}</td>
+          <td>{esc(t.get("broker_trade_id") or "-")}</td>
+        </tr>'''
+    if not trade_rows:
+        trade_rows = "<tr><td colspan='9'>No open BCO trades.</td></tr>"
+    return f'''
+      <div class="section-note">Same Project Exit Plan manager contract: 48h minimum normal hold, hourly post-48h review, staged defence, and tighten-only protection.</div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Basket Phase</div><div class="v">{esc(b.get("basket_phase") or "FLAT")}</div></div>
+        <div class="mini-card"><div class="k">Tide</div><div class="v">{esc(b.get("tide_status") or "FLAT")}</div></div>
+        <div class="mini-card"><div class="k">Manager Action</div><div class="v small">{esc(b.get("manager_action") or "NO_OPEN_BASKET")}</div></div>
+        <div class="mini-card"><div class="k">Basket</div><div class="v {_pnl_class(b.get("basket_R"))}">{safe_float(b.get("basket_R")) or 0:.2f}R</div><div class="small">{_money(b.get("basket_pnl_gbp"))}</div></div>
+      </div>
+      <div class="table-scroll"><table><thead><tr><th>Trade</th><th>Entry</th><th>Price</th><th>Age</th><th>R</th><th>48h</th><th>72h</th><th>Protection</th><th>Broker ID</th></tr></thead><tbody>{trade_rows}</tbody></table></div>
+    '''
+
+def _bco_standard_profit_harvesting_html():
+    s = snapshot()
+    b = s.get("basket") or {}
+    cycle = safe_str(b.get("cycle_id"))
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute("SELECT * FROM protection_stages WHERE cycle_id=? ORDER BY stage_type,threshold_R", (cycle,))) if cycle else []
+
+    banks = []
+    for threshold, fraction in BCO_BANK_LEVELS:
+        m = next((r for r in rows if safe_str(r.get("stage_type")).upper()=="BANK" and abs((safe_float(r.get("threshold_R")) or 0)-threshold)<1e-9), {})
+        target = safe_float(m.get("target_bank_R"))
+        executed = safe_float(m.get("executed_R"))
+        banks.append(f'''
+        <tr>
+          <td>{threshold:.0f}R</td><td>{esc(m.get("status") or "NOT_ARMED")}</td><td>{fraction*100:.0f}%</td>
+          <td>{target:.2f}R</td><td class="{_pnl_class(executed)}">{executed:.2f}R</td>
+          <td>{_money((executed or 0.0)*BCO_RISK_PER_TRADE_GBP) if executed is not None else "—"}</td>
+          <td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("selected_trade_ids") or "waiting")}</td>
+        </tr>''')
+
+    cohorts = []
+    for threshold, fraction in BCO_COHORT_LEVELS:
+        m = next((r for r in rows if safe_str(r.get("stage_type")).upper()=="COHORT" and abs((safe_float(r.get("threshold_R")) or 0)-threshold)<1e-9), {})
+        cohorts.append(f'''
+        <tr><td>{threshold:.0f}R</td><td>{esc(m.get("status") or "NOT_ARMED")}</td><td>{fraction*100:.0f}%</td><td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("cohort_trade_ids") or "waiting")}</td></tr>''')
+
+    return f'''
+      <div class="section-note">Immediate banking mirrors the Indices philosophy: when a banking level is reached, profitable whole trades can be banked immediately; selected trades do not need to be 48h old.</div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(b.get("basket_R"))}">{safe_float(b.get("basket_R")) or 0:.2f}R</div></div>
+        <div class="mini-card"><div class="k">High-Water</div><div class="v {_pnl_class(b.get("high_water_R"))}">{safe_float(b.get("high_water_R")) or 0:.2f}R</div></div>
+        <div class="mini-card"><div class="k">Giveback</div><div class="v">{safe_float(b.get("giveback_pct")) or 0:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Banked This Cycle</div><div class="v pos">{safe_float(b.get("banked_R_cycle")) or 0:.2f}R</div></div>
+      </div>
+      <h3>Actual Cash-Banking Stages</h3>
+      <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Approx £ Banked</th><th>Executed At</th><th>Trade IDs</th></tr></thead><tbody>{"".join(banks)}</tbody></table></div>
+      <h3>Exceptional Pre-48h One-Shot Cohorts</h3>
+      <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Lock</th><th>Executed At</th><th>Cohort Trade IDs</th></tr></thead><tbody>{"".join(cohorts)}</tbody></table></div>
+    '''
+
+def _bco_standard_broker_html():
+    s = snapshot()
+    safety = s.get("broker_safety") or {}
+    acct = s.get("account") or {}
+    preview = risk_preview()
+    return f'''
+      <div class="section-note warn"><strong>{"LIVE" if OANDA_ENV=="live" else "DEMO / PRACTICE"}.</strong> Exact BCO instrument ownership is enforced.</div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {"pos" if safety.get("orders_allowed") else "warn"}>{"ENABLED" if safety.get("orders_allowed") else "LOCKED"}</div><div class="small">{esc(safety.get("reason"))}</div></div>
+        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{_money(acct.get("NAV"))}</div><div class="small">Margin {_money(acct.get("marginAvailable"))}</div></div>
+        <div class="mini-card"><div class="k">Instrument</div><div class="v">{esc(BCO_OANDA_INSTRUMENT or "NOT SET")}</div></div>
+        <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{BCO_RISK_PER_TRADE_GBP:.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL</div></div>
+      </div>
+      <div class="section-note small"><a href="/broker/preflight">preflight</a> · <a href="/broker/risk-preview">risk preview</a> · <a href="/broker/instruments/discover">instrument discovery</a></div>
+    '''
+
+def _bco_standard_execution_html():
+    with get_conn() as conn:
+        audits = fetchall_dict(conn.execute("SELECT * FROM execution_audit ORDER BY id DESC LIMIT 50"))
+        stops = fetchall_dict(conn.execute("SELECT * FROM managed_stop_events ORDER BY id DESC LIMIT 50"))
+        events = fetchall_dict(conn.execute("SELECT * FROM system_events ORDER BY id DESC LIMIT 50"))
+    return f'''
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Execution Audit</div><div class="v">{len(audits)}</div></div>
+        <div class="mini-card"><div class="k">Managed Stops</div><div class="v">{len(stops)}</div></div>
+        <div class="mini-card"><div class="k">System Events</div><div class="v">{len(events)}</div></div>
+        <div class="mini-card"><div class="k">Scope</div><div class="v">BCO ONLY</div></div>
+      </div>
+      <div class="section-note small"><a href="/export/execution-audit.csv">execution audit CSV</a> · <a href="/export/managed-stops.csv">managed stops CSV</a> · <a href="/export/system-events.csv">system events CSV</a></div>
+    '''
+
+def _bco_standard_signal_html():
+    s = snapshot()
+    latest = s.get("latest_signal") or {}
+    with get_conn() as conn:
+        recent = fetchall_dict(conn.execute("SELECT id,timestamp_readable,signal_id,candidate_8h,signal_side,exec_close,model_name FROM raw_signals ORDER BY id DESC LIMIT 25"))
+    rows = "".join(f'<tr><td>{esc(r.get("timestamp_readable"))}</td><td>{esc(r.get("signal_id"))}</td><td>{"TRUE" if parse_bool(r.get("candidate_8h")) else "FALSE"}</td><td>{esc(r.get("signal_side") or "-")}</td><td>{esc(r.get("exec_close"))}</td><td>{esc(r.get("model_name") or "-")}</td></tr>' for r in recent)
+    if not rows:
+        rows = "<tr><td colspan='6'>Waiting for BCO signals.</td></tr>"
+    return f'''
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Latest Candidate</div><div class="v {"pos" if parse_bool(latest.get("candidate_8h")) else "neg"}>{"CANDIDATE" if parse_bool(latest.get("candidate_8h")) else "NO TRADE"}</div></div>
+        <div class="mini-card"><div class="k">Latest Signal</div><div class="v small">{esc(latest.get("timestamp_readable") or "-")}</div></div>
+        <div class="mini-card"><div class="k">Latest Price</div><div class="v">{safe_float(latest.get("exec_close")) or 0:.3f}</div></div>
+        <div class="mini-card"><div class="k">Direction</div><div class="v">{esc(BCO_DIRECTION.upper())}</div></div>
+      </div>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Signal ID</th><th>Candidate</th><th>Side</th><th>Price</th><th>Model</th></tr></thead><tbody>{rows}</tbody></table></div>
+    '''
+
+def _bco_standard_research_html():
+    return '''
+      <div class="section-note">BCO keeps its strategy-specific candidate model and 3.5% stop research. The surrounding dashboard, management, audit and protection conventions now follow the common Project Exit Plan standard.</div>
+      <div class="section-note small"><a href="/export/raw-signals.csv">raw signals CSV</a> · <a href="/export/trades.csv">trades CSV</a> · <a href="/export/basket-decisions.csv">basket decisions CSV</a> · <a href="/export/protection-stages.csv">protection stages CSV</a> · <a href="/export/all.zip">full BCO analysis ZIP</a></div>
+    '''
+
+_BCO_STD_SECTIONS = {
+    "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
+    "profit-harvesting": ("Profit Harvesting / Protection Plan", _bco_standard_profit_harvesting_html),
+    "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_html),
+    "execution": ("Execution / Reconciliation", _bco_standard_execution_html),
+    "signals": ("Signal State", _bco_standard_signal_html),
+    "research": ("Research / Evidence / Exports", _bco_standard_research_html),
+}
+
+@app.get("/dashboard/section/{section_key}", response_class=HTMLResponse)
+def bco_standard_section(section_key: str):
+    item = _BCO_STD_SECTIONS.get(safe_str(section_key))
+    if not item:
+        return HTMLResponse('<div class="lazy-error">Unknown section.</div>', status_code=404)
+    title, fn = item
+    started = time.perf_counter()
+    try:
+        body = fn()
+        return f'<div class="lazy-meta">{esc(title)} loaded in {time.perf_counter()-started:.2f}s</div>{body}'
+    except Exception as exc:
+        return f'<div class="lazy-error"><strong>{esc(title)} failed.</strong><br>{esc(type(exc).__name__)}: {esc(exc)}</div>'
+
+def _bco_std_placeholder(key, title, note=""):
+    return f'<details class="lazy-section" data-section="{esc(key)}"><summary>{esc(title)}</summary><div class="lazy-body"><div class="lazy-placeholder"><strong>Not loaded yet.</strong> {esc(note)}<br>Open this section to fetch it.</div></div></details>'
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def bco_standard_dashboard():
+    sections = "".join([
+        _bco_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48h management and staged defence."),
+        _bco_std_placeholder("profit-harvesting", "Profit Harvesting / Protection Plan", "100R / 200R / 300R immediate banking and exceptional cohort ratchets."),
+        _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO-only OANDA lane, account view and risk sizing."),
+        _bco_std_placeholder("execution", "Execution / Reconciliation", "Audit, managed stops and ownership safety."),
+        _bco_std_placeholder("signals", "Signal State", "Latest BCO candidate and recent signal history."),
+        _bco_std_placeholder("research", "Research / Evidence / Exports", "BCO evidence and downloads."),
+    ])
+    env_label = "LIVE" if OANDA_ENV == "live" else "DEMO / PRACTICE"
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Exit Plan — BCO</title>
+<style>
+:root{{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#f3f4f6;--muted:#aab2bf;--green:#54d98c;--amber:#f7c65d;--red:#ff7b72;--blue:#58a6ff;--summary:#2a1114;--summary2:#3b1519}}
+*{{box-sizing:border-box}}body{{font-family:Arial,sans-serif;margin:0;padding:14px;background:var(--bg);color:var(--text)}}.page{{max-width:1900px;margin:auto}}h1{{margin:0 0 2px;font-size:clamp(28px,4vw,46px)}}h2{{margin:18px 0 10px}}h3{{padding:0 12px}}
+.sub{{color:var(--muted);margin-bottom:10px;font-size:14px}}.banner{{padding:9px 12px;border-radius:9px;background:#12351f;border:1px solid #275c37;margin:8px 0;color:#d8ffe4;font-size:13px}}.top-status{{padding:9px 12px;border-radius:9px;background:#10263b;border:1px solid #1f4e73;margin:8px 0 12px;color:#d8ecff;font-size:14px}}
+.cards{{display:grid;gap:8px;margin-bottom:8px}}.cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{background:var(--panel);border:1px solid var(--border);padding:11px 12px;border-radius:10px;min-height:84px;overflow:hidden}}.label,.k{{color:var(--muted);font-size:12px}}.value,.v{{font-size:clamp(20px,2.2vw,29px);font-weight:800;margin-top:4px}}.small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}.pos{{color:var(--green)!important;font-weight:800}}.neg{{color:var(--red)!important;font-weight:800}}.warn{{color:var(--amber)!important;font-weight:800}}
+details{{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:9px;overflow:hidden}}details>summary{{cursor:pointer;padding:11px 13px;font-weight:800;font-size:15px;background:var(--summary);color:white;border-left:5px solid #6f1d27}}details>summary:hover{{background:var(--summary2)}}.lazy-placeholder,.section-note{{padding:12px;color:var(--muted);background:#11161d;line-height:1.5;border-bottom:1px solid var(--border)}}.lazy-loading{{padding:14px;color:#8ecbff;font-weight:700}}.lazy-error{{margin:10px;padding:12px;background:#2b1113;border:1px solid #5f2329;border-radius:8px;color:#ffb4ad}}.lazy-meta{{padding:7px 12px;background:#11161d;border-bottom:1px solid var(--border);color:var(--muted);font-size:11px}}
+.metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}}.mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}table{{width:100%;border-collapse:collapse;background:var(--panel)}}th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}}th{{background:#0f141a;color:white}}.table-scroll{{width:100%;overflow-x:auto}}a{{color:var(--blue);text-decoration:none}}.links{{margin:9px 0 14px;font-size:12px}}
+@media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
+</style></head><body><div class="page">
+<h1>Project Exit Plan — BCO</h1><div class="sub">v0.2.0 Project Standard · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
+<div id="topStatus" class="top-status">Loading top tiles…</div><div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">BCO P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
+<div class="links"><a href="/dashboard-full">Full legacy dashboard</a> · <a href="/health">Health</a> · <a href="/snapshot">Snapshot JSON</a> · <a href="/export/all.zip">BCO analysis ZIP</a></div><h2>Details</h2>{sections}</div>
+<script>
+function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}function money(v){{const n=Number(v);if(!Number.isFinite(n))return'n/a';return(n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}function cls(v){{const n=Number(v);return!Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}function card(l,v,s='',c=''){{return`<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}function localTime(iso){{if(!iso)return'';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
+async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`<div class="cards four">${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}${{card('BCO P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}${{card('Giveback',`${{gb.toFixed(1)}}%`,`Phase ${{eh(s.basket_phase||'FLAT')}}`,gbc)}}</div><div class="cards four">${{card('Open Trades',eh(s.open_trades||0),`Manager ${{eh(s.tide_status||'FLAT')}}`)}}${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}${{card('Banked This Cycle',`${{Number(s.banked_r_cycle||0).toFixed(2)}}R`,'Immediate harvest ladder',cls(s.banked_r_cycle))}}${{card('Candidate Support',g.candidate?'1/1':'0/1',g.candidate?'BCO candidate active':'No current candidate',g.candidate?'pos':'neg')}}</div><div class="cards three">${{card('Lane',s.orders_allowed?'ENABLED':'LOCKED',`${{eh(d.mode)}} · entry ${{s.auto_entry?'ON':'OFF'}} · management ${{s.auto_management?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}${{card('Risk / Trade',money(c.risk_per_trade_gbp),`${{Number(c.sl_pct||0).toFixed(2)}}% SL · ${{eh(c.direction||'')}}`)}}${{card('Scope',eh(c.instrument||'BCO'),'Standalone BCO project')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
+async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
+</script></body></html>'''
+
+@app.get("/dashboard-standard-status")
+def bco_standard_status():
+    return {"status":"ok","version":"0.2.0","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
+
