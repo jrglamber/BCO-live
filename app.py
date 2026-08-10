@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.3.0 — Master Parity"
-APP_VERSION = "0.3.0"
-POLICY_VERSION = "bco_v0.3.0_master_parity_focused_research"
+APP_NAME = "Project Exit Plan — BCO v0.3.1 — Master Parity Fix"
+APP_VERSION = "0.3.1"
+POLICY_VERSION = "bco_v0.3.1_master_parity_focused_research"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1897,12 +1897,12 @@ details{{background:var(--panel);border:1px solid var(--border);border-radius:10
 .metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}}.mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}table{{width:100%;border-collapse:collapse;background:var(--panel)}}th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}}th{{background:#0f141a;color:white}}.table-scroll{{width:100%;overflow-x:auto}}a{{color:var(--blue);text-decoration:none}}.links{{margin:9px 0 14px;font-size:12px}}
 @media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
 </style></head><body><div class="page">
-<h1>Project Exit Plan — BCO</h1><div class="sub">v0.3.0 Master Parity · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
+<h1>Project Exit Plan — BCO</h1><div class="sub">v0.3.1 Master Parity · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div><div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">BCO P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
 <div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/snapshot">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/all.zip">⬇ BCO Analysis ZIP</a><a class="export-btn research" href="/export/bco-focused-research.zip">⬇ BCO Research ZIP</a></div><h2>Details</h2>{sections}</div>
 <script>
 function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}function money(v){{const n=Number(v);if(!Number.isFinite(n))return'n/a';return(n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}function cls(v){{const n=Number(v);return!Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}function card(l,v,s='',c=''){{return`<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}function localTime(iso){{if(!iso)return'';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
-async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
+async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}},ac=d.accounting||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
 ${{card('Broker P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
