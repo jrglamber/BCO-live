@@ -25,15 +25,15 @@ import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.2.1 — Project Standard"
-APP_VERSION = "0.2.1"
-POLICY_VERSION = "bco_v0.2.1_project_standard_tiles"
+APP_NAME = "Project Exit Plan — BCO v0.3.0 — Master Parity"
+APP_VERSION = "0.3.0"
+POLICY_VERSION = "bco_v0.3.0_master_parity_focused_research"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1411,10 +1411,11 @@ async def tradingview_webhook(request: Request, secret: str = Query(default=""))
     if duplicate: return {"status":"duplicate","raw_signal_id":raw_id}
     try:
         result=process_signal(raw_id,payload)
+        focused_research=record_bco_focused_research(raw_id)
     except Exception as e:
         log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id})
         raise
-    return {"status":"ok","raw_signal_id":raw_id,"result":result}
+    return {"status":"ok","raw_signal_id":raw_id,"result":result,"focused_research":focused_research}
 
 
 @app.get("/snapshot")
@@ -1504,7 +1505,7 @@ def dashboard_full():
     if not rows: rows="<tr><td colspan='9'>No open BCO trades.</td></tr>"
     allowed="YES" if safety.get("orders_allowed") else "NO — LOCKED"
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='60'><title>{esc(APP_NAME)}</title><style>
-    body{{background:#0b1220;color:#e5e7eb;font-family:Arial,sans-serif;margin:22px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}} .card{{background:#111827;border:1px solid #243044;border-radius:10px;padding:14px}} .label{{color:#94a3b8;font-size:12px;text-transform:uppercase}} .value{{font-size:24px;font-weight:700;margin-top:5px}} .ok{{color:#86efac}} .bad{{color:#fca5a5}} table{{width:100%;border-collapse:collapse;background:#111827;margin-top:12px}} th,td{{padding:8px;border-bottom:1px solid #243044;text-align:left;font-size:13px}} a{{color:#7dd3fc}} code{{color:#fde68a}} .note{{background:#172033;padding:10px;border-radius:8px;margin:12px 0}}</style></head><body>
+    body{{background:#0b1220;color:#e5e7eb;font-family:Arial,sans-serif;margin:22px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}} .card{{background:#111827;border:1px solid #243044;border-radius:10px;padding:14px}} .label{{color:#94a3b8;font-size:12px;text-transform:uppercase}} .value{{font-size:24px;font-weight:700;margin-top:5px}} .ok{{color:#86efac}} .bad{{color:#fca5a5}} table{{width:100%;border-collapse:collapse;background:#111827;margin-top:12px}} th,td{{padding:8px;border-bottom:1px solid #243044;text-align:left;font-size:13px}} a{{color:#7dd3fc}} code{{color:#fde68a}} .note{{background:#172033;padding:10px;border-radius:8px;margin:12px 0}}.research-inner{margin:7px 10px}.research-inner>summary{background:#11161d;border-left-color:#315f39}.research-inner-body{padding:0}</style></head><body>
     <h1>BCO Live</h1><div class='note'>Production bootstrap. Shared OANDA account may be read, but this service owns <strong>BCO only</strong>. Initial live v1 is LONG-only, £{BCO_RISK_PER_TRADE_GBP:.2f}/R requested, {BCO_SL_PCT:.2f}% SL, 48h minimum then hourly management.</div>
     <div class='grid'>
       <div class='card'><div class='label'>Broker writes</div><div class='value {'ok' if safety.get('orders_allowed') else 'bad'}'>{allowed}</div><div>{esc(safety.get('reason'))}</div></div>
@@ -1521,6 +1522,153 @@ def dashboard_full():
 
 @app.get("/")
 def root(): return {"app":APP_NAME,"dashboard":"/dashboard","health":"/health","preflight":"/broker/preflight"}
+
+
+# ============================================================
+# v0.3.0 FOCUSED BCO RESEARCH — master v10.1.35 parity
+# Research-only. Never consumed by execution/management.
+# ============================================================
+BCO_FOCUSED_THRESHOLDS=[40,60,75,100,150,200,300,400,500,600]
+BCO_FOCUSED_HORIZONS=[6,12,24,48]
+BCO_FOCUSED_EFFICIENCY_LOOKBACKS=[8,12,24]
+
+def ensure_bco_focused_research_tables():
+    with get_conn() as conn:
+        idt="BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_efficiency (
+            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT, signal_time TEXT, lookback_candles BIGINT,
+            candles_found BIGINT, net_move_pct DOUBLE PRECISION, path_travelled_pct DOUBLE PRECISION,
+            efficiency DOUBLE PRECISION, state TEXT, UNIQUE(raw_signal_id,lookback_candles))""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_alignment (
+            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, signal_time TEXT, state TEXT,
+            return_4h DOUBLE PRECISION, return_8h DOUBLE PRECISION, return_24h DOUBLE PRECISION, candidate BIGINT)""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_recovery (
+            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, cycle_id TEXT, trigger_signal_time TEXT,
+            trigger_status TEXT, trigger_action TEXT, trigger_open_count BIGINT, trigger_r DOUBLE PRECISION,
+            trigger_hwm_r DOUBLE PRECISION, trigger_giveback_pct DOUBLE PRECISION,
+            outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
+            completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT)""")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_highwater (
+            id {idt}, created_at_utc TEXT NOT NULL, cycle_id TEXT, threshold_r DOUBLE PRECISION,
+            trigger_raw_signal_id BIGINT, trigger_signal_time TEXT, trigger_r DOUBLE PRECISION,
+            trigger_hwm_r DOUBLE PRECISION,trigger_giveback_pct DOUBLE PRECISION,trigger_banked_r DOUBLE PRECISION,
+            outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
+            completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT,UNIQUE(cycle_id,threshold_r))""")
+
+def _bf_return(conn,raw_id,lookback):
+    rows=conn.execute("SELECT exec_close FROM raw_signals WHERE exec_close IS NOT NULL AND id<=? ORDER BY id DESC LIMIT ?",(int(raw_id),int(lookback)+1)).fetchall()
+    closes=[safe_float(r["exec_close"]) for r in reversed(rows)];closes=[float(x) for x in closes if x is not None]
+    if len(closes)<2 or not closes[0]:return None
+    return (closes[-1]/closes[0]-1)*100
+
+def _bf_state():
+    with get_conn() as conn:row=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'").fetchone()
+    d=dict(row) if row else {}
+    return {"cycle_id":safe_str(d.get("cycle_id")),"open_count":int(safe_float(d.get("open_count")) or 0),
+            "r":safe_float(d.get("basket_R")) or 0.0,"hwm":safe_float(d.get("high_water_R")) or 0.0,
+            "giveback":safe_float(d.get("giveback_pct")) or 0.0,"status":safe_str(d.get("tide_status") or d.get("status") or "FLAT").upper(),
+            "action":safe_str(d.get("manager_action") or ""),"banked_r":safe_float(d.get("banked_R_cycle")) or 0.0}
+
+def _bf_elapsed(conn,raw_id):
+    row=conn.execute("SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals WHERE id>? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''",(int(raw_id),)).fetchone()
+    return int(row["c"] if row else 0)
+
+def _bf_eff_state(x):
+    x=safe_float(x)
+    if x is None:return "INSUFFICIENT_DATA"
+    if x<0.25:return "CHOPPY"
+    if x<0.40:return "MIXED"
+    if x<0.60:return "TRENDING"
+    return "CLEAN_TREND"
+
+def record_bco_focused_research(raw_signal_id):
+    try:
+        ensure_bco_focused_research_tables();raw_signal_id=int(raw_signal_id or 0)
+        with get_conn() as conn:
+            raw=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(raw_signal_id,)).fetchone()
+            if not raw:return {"ok":False,"research_only":True,"reason":"raw_signal_not_found"}
+            d=dict(raw);sig=safe_str(d.get("timestamp_readable"))
+            for lb in BCO_FOCUSED_EFFICIENCY_LOOKBACKS:
+                rows=conn.execute("SELECT exec_close FROM raw_signals WHERE exec_close IS NOT NULL AND id<=? ORDER BY id DESC LIMIT ?",(raw_signal_id,lb+1)).fetchall()
+                closes=[safe_float(r["exec_close"]) for r in reversed(rows)];closes=[float(x) for x in closes if x is not None]
+                eff=net=path=None
+                if len(closes)>=2 and closes[0]:
+                    net_abs=abs(closes[-1]-closes[0]);path_abs=sum(abs(b-a) for a,b in zip(closes[:-1],closes[1:]))
+                    net=abs((closes[-1]/closes[0]-1)*100);path=sum(abs((b/a-1)*100) for a,b in zip(closes[:-1],closes[1:]) if a)
+                    eff=net_abs/path_abs if path_abs else None
+                conn.execute("""INSERT INTO bco_focused_efficiency
+                    (created_at_utc,raw_signal_id,signal_time,lookback_candles,candles_found,net_move_pct,path_travelled_pct,efficiency,state)
+                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id,lookback_candles) DO NOTHING""",
+                    (now_utc_iso(),raw_signal_id,sig,lb,len(closes),net,path,eff,_bf_eff_state(eff)))
+            r4=_bf_return(conn,raw_signal_id,4);r8=_bf_return(conn,raw_signal_id,8);r24=_bf_return(conn,raw_signal_id,24)
+            vals=[x for x in (r4,r8,r24) if x is not None]
+            al="INSUFFICIENT_DATA" if len(vals)<2 else ("ALIGNED_UP" if all(x>0 for x in vals) else "ALIGNED_DOWN" if all(x<0 for x in vals) else "DIVERGENT_TIMEFRAMES")
+            conn.execute("""INSERT INTO bco_focused_alignment
+                (created_at_utc,raw_signal_id,signal_time,state,return_4h,return_8h,return_24h,candidate)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+                (now_utc_iso(),raw_signal_id,sig,al,r4,r8,r24,1 if parse_bool(d.get("candidate_8h"),False) else 0))
+            st=_bf_state()
+            for table in ("bco_focused_recovery","bco_focused_highwater"):
+                for pr in conn.execute(f"SELECT * FROM {table} WHERE COALESCE(completed_48,0)=0 ORDER BY id ASC LIMIT 500").fetchall():
+                    pd=dict(pr);tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_bf_elapsed(conn,tid);sets=[];vals2=[]
+                    for h in BCO_FOCUSED_HORIZONS:
+                        col=f"outcome_{h}_r"
+                        if elapsed>=h and safe_float(pd.get(col)) is None:
+                            sets.append(f"{col}=?");vals2.append(st["r"])
+                            if h==48:sets.append("completed_48=?");vals2.append(1)
+                    if sets:
+                        sets.append("updated_at_utc=?");vals2.extend([now_utc_iso(),int(pd["id"])])
+                        conn.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id=?",tuple(vals2))
+            warn=st["open_count"]>0 and (st["status"] in {"AMBER","RED","CRITICAL"} or st["giveback"]>=40 or st["r"]<0 or any(k in st["action"].upper() for k in ("PAUSE","CLOSE","REDUCE","DEFENCE","DEFENSE")))
+            if warn:
+                conn.execute("""INSERT INTO bco_focused_recovery
+                    (created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,trigger_status,trigger_action,trigger_open_count,trigger_r,trigger_hwm_r,trigger_giveback_pct,updated_at_utc)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+                    (now_utc_iso(),raw_signal_id,st["cycle_id"],sig,st["status"],st["action"],st["open_count"],st["r"],st["hwm"],st["giveback"],now_utc_iso()))
+            if st["cycle_id"] and st["open_count"]>0:
+                for th in BCO_FOCUSED_THRESHOLDS:
+                    if st["hwm"]>=th:
+                        conn.execute("""INSERT INTO bco_focused_highwater
+                            (created_at_utc,cycle_id,threshold_r,trigger_raw_signal_id,trigger_signal_time,trigger_r,trigger_hwm_r,trigger_giveback_pct,trigger_banked_r,updated_at_utc)
+                            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING""",
+                            (now_utc_iso(),st["cycle_id"],th,raw_signal_id,sig,st["r"],st["hwm"],st["giveback"],st["banked_r"],now_utc_iso()))
+        return {"ok":True,"research_only":True}
+    except Exception as exc:return {"ok":False,"research_only":True,"error":f"{type(exc).__name__}: {exc}"}
+
+def _bf_rows(table,limit=5000):
+    ensure_bco_focused_research_tables()
+    with get_conn() as conn:return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?",(max(1,min(int(limit),100000)),)).fetchall()]
+
+def _bf_table(title,rows,cols):
+    body="".join("<tr>"+"".join(f"<td>{esc(r.get(c))}</td>" for c in cols)+"</tr>" for r in rows[:50]) or f'<tr><td colspan="{len(cols)}">No research rows yet.</td></tr>'
+    head="".join(f"<th>{esc(c.replace('_',' ').title())}</th>" for c in cols)
+    return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
+
+def build_bco_focused_research_html():
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same four evidence themes as the Indices master. BCO alignment is the single-asset 4h/8h/24h equivalent. Research-only; no execution impact.</div>' + \
+      _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
+      _bf_table("BCO Multi-Horizon Alignment / Divergence",_bf_rows("bco_focused_alignment",100),["signal_time","state","return_4h","return_8h","return_24h","candidate"]) + \
+      _bf_table("Trend Efficiency / Chop Research",_bf_rows("bco_focused_efficiency",150),["signal_time","lookback_candles","efficiency","state","net_move_pct","path_travelled_pct"]) + \
+      _bf_table("Basket Recovery / Red-State Outcomes",_bf_rows("bco_focused_recovery",100),["trigger_signal_time","trigger_status","trigger_action","trigger_open_count","trigger_r","trigger_hwm_r","trigger_giveback_pct","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
+      '<details class="research-inner"><summary>Strategy Model Evidence</summary><div class="section-note small"><a href="/export/raw-signals.csv">Raw signals CSV</a> · <a href="/export/trades.csv">Trades CSV</a> · <a href="/export/basket-decisions.csv">Basket decisions CSV</a> · <a href="/export/protection-stages.csv">Protection stages CSV</a></div></details>'
+
+@app.get("/export/bco-focused-research.zip")
+def export_bco_focused_research_zip(limit:int=25000):
+    ensure_bco_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
+    tables={"highwater-banking-research.csv":"bco_focused_highwater","alignment-research.csv":"bco_focused_alignment","trend-efficiency-research.csv":"bco_focused_efficiency","basket-recovery-research.csv":"bco_focused_recovery"}
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        for fn,tbl in tables.items():
+            rows=_bf_rows(tbl,limit);out=io.StringIO()
+            if rows:
+                fields=[]
+                for r in rows:
+                    for k in r:
+                        if k not in fields:fields.append(k)
+                w=csv.DictWriter(out,fieldnames=fields);w.writeheader();w.writerows(rows)
+            z.writestr(fn,out.getvalue())
+        z.writestr("manifest.json",json.dumps({"project":"BCO","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)},indent=2))
+    return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-focused-research.zip"'})
+
 
 # ============================================================
 # BCO v0.2.0 — PROJECT EXIT PLAN STANDARD DASHBOARD
@@ -1543,74 +1691,21 @@ def _pnl_class(v):
     return "pos" if n > 0 else "neg"
 
 def _bco_standard_top_uncached():
-    s = snapshot()
-    basket = s.get("basket") or {}
-    acct = s.get("account") or {}
-    safety = s.get("broker_safety") or {}
-    latest = s.get("latest_signal") or {}
-    rows = s.get("open_trades") or []
-    closed = s.get("closed_summary") or {}
-
-    open_count = len(rows)
-    mature = sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0) >= BCO_MIN_HOLD_HOURS)
-    oldest = max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
-
-    basket_r = safe_float(basket.get("basket_R")) or 0.0
-    hwm_r = safe_float(basket.get("high_water_R")) or 0.0
-    giveback_pct = safe_float(basket.get("giveback_pct")) or 0.0
-    open_pnl = safe_float(basket.get("basket_pnl_gbp"))
-    if open_pnl is None:
-        open_pnl = basket_r * BCO_RISK_PER_TRADE_GBP
-
-    realized_pnl = safe_float(closed.get("p")) or 0.0
-    realized_r = safe_float(closed.get("r")) or 0.0
-
-    return {
-        "status": "ok",
-        "project": "BCO",
-        "mode": safe_str(OANDA_ENV).upper(),
-        "time_utc": now_utc_iso(),
-        "account": {
-            "nav": safe_float(acct.get("NAV")),
-            "balance": safe_float(acct.get("balance")),
-            "margin_available": safe_float(acct.get("marginAvailable")),
-            "currency": safe_str(acct.get("currency")),
-        },
-        "strategy": {
-            "open_pnl": open_pnl,
-            "realized_pnl": realized_pnl,
-            "realized_r": realized_r,
-            "total_pnl": open_pnl + realized_pnl,
-            "open_trades": open_count,
-            "mature_48h_plus": mature,
-            "oldest_hold": oldest,
-            "basket_r": basket_r,
-            "high_water_r": hwm_r,
-            "giveback_pct": giveback_pct,
-            "basket_phase": safe_str(basket.get("basket_phase") or "FLAT"),
-            "tide_status": safe_str(basket.get("tide_status") or "FLAT"),
-            "manager_action": safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),
-            "orders_allowed": bool(safety.get("orders_allowed")),
-            "auto_entry": bool(safety.get("auto_entry")),
-            "auto_management": bool(safety.get("auto_management")),
-            "banked_r_cycle": safe_float(basket.get("banked_R_cycle")) or 0.0,
-        },
-        "signals": {
-            "candidate": parse_bool(latest.get("candidate_8h"), False),
-            "latest_time": safe_str(latest.get("timestamp_readable")),
-            "latest_price": safe_float(latest.get("exec_close")),
-            "latest_signal_id": safe_str(latest.get("signal_id")),
-            "received_assets": 1 if safe_str(latest.get("signal_id")) else 0,
-            "expected_assets": 1,
-        },
-        "config": {
-            "risk_per_trade_gbp": BCO_RISK_PER_TRADE_GBP,
-            "sl_pct": BCO_SL_PCT,
-            "min_hold_hours": BCO_MIN_HOLD_HOURS,
-            "instrument": BCO_OANDA_INSTRUMENT,
-            "direction": BCO_DIRECTION,
-        },
-    }
+    s=snapshot();basket=s.get("basket") or {};acct=s.get("account") or {};safety=s.get("broker_safety") or {};latest=s.get("latest_signal") or {};rows=s.get("open_trades") or [];closed=s.get("closed_summary") or {}
+    open_count=len(rows);mature=sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0)>=BCO_MIN_HOLD_HOURS);oldest=max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
+    basket_r=safe_float(basket.get("basket_R")) or 0.0;hwm_r=safe_float(basket.get("high_water_R")) or 0.0;giveback_pct=safe_float(basket.get("giveback_pct")) or 0.0;open_pnl=safe_float(basket.get("basket_pnl_gbp"))
+    if open_pnl is None:open_pnl=basket_r*BCO_RISK_PER_TRADE_GBP
+    realized_pnl=safe_float(closed.get("p")) or 0.0;realized_r=safe_float(closed.get("r")) or 0.0
+    now=datetime.now(timezone.utc);week_start=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);month_start=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    with get_conn() as conn:
+        wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(week_start.isoformat(),)).fetchone()
+        mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(month_start.isoformat(),)).fetchone()
+    return {"status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
+      "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),"margin_available":safe_float(acct.get("marginAvailable")),"currency":safe_str(acct.get("currency"))},
+      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"This week","month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"This month"},
+      "strategy":{"open_pnl":open_pnl,"realized_pnl":realized_pnl,"realized_r":realized_r,"total_pnl":open_pnl+realized_pnl,"open_trades":open_count,"mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,"high_water_r":hwm_r,"giveback_pct":giveback_pct,"basket_phase":safe_str(basket.get("basket_phase") or "FLAT"),"tide_status":safe_str(basket.get("tide_status") or "FLAT"),"manager_action":safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),"orders_allowed":bool(safety.get("orders_allowed")),"auto_entry":bool(safety.get("auto_entry")),"auto_management":bool(safety.get("auto_management")),"banked_r_cycle":safe_float(basket.get("banked_R_cycle")) or 0.0},
+      "signals":{"candidate":parse_bool(latest.get("candidate_8h"),False),"latest_time":safe_str(latest.get("timestamp_readable")),"latest_price":safe_float(latest.get("exec_close")),"latest_signal_id":safe_str(latest.get("signal_id")),"received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1},
+      "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,"min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
 
 def bco_standard_top_snapshot(force=False):
     now_ts = time.time()
@@ -1762,7 +1857,7 @@ _BCO_STD_SECTIONS = {
     "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_html),
     "execution": ("Execution / Reconciliation", _bco_standard_execution_html),
     "signals": ("Signal State", _bco_standard_signal_html),
-    "research": ("Research / Evidence / Exports", _bco_standard_research_html),
+    "research": ("BCO Research / Evidence Lab", build_bco_focused_research_html),
 }
 
 @app.get("/dashboard/section/{section_key}", response_class=HTMLResponse)
@@ -1789,46 +1884,43 @@ def bco_standard_dashboard():
         _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO-only OANDA lane, account view and risk sizing."),
         _bco_std_placeholder("execution", "Execution / Reconciliation", "Audit, managed stops and ownership safety."),
         _bco_std_placeholder("signals", "Signal State", "Latest BCO candidate and recent signal history."),
-        _bco_std_placeholder("research", "Research / Evidence / Exports", "BCO evidence and downloads."),
+        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "High-water/banking outcomes, multi-horizon alignment, trend efficiency and basket recovery. Everything inside remains collapsed until opened."),
     ])
     env_label = "LIVE" if OANDA_ENV == "live" else "DEMO / PRACTICE"
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Exit Plan — BCO</title>
 <style>
 :root{{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#f3f4f6;--muted:#aab2bf;--green:#54d98c;--amber:#f7c65d;--red:#ff7b72;--blue:#58a6ff;--summary:#2a1114;--summary2:#3b1519}}
-*{{box-sizing:border-box}}body{{font-family:Arial,sans-serif;margin:0;padding:14px;background:var(--bg);color:var(--text)}}.page{{max-width:1900px;margin:auto}}h1{{margin:0 0 2px;font-size:clamp(28px,4vw,46px)}}h2{{margin:18px 0 10px}}h3{{padding:0 12px}}
+*{{box-sizing:border-box}}body{{font-family:Arial,sans-serif;margin:0;padding:12px;background:var(--bg);color:var(--text)}}.page{{max-width:1900px;margin:auto}}h1{{margin:0 0 2px;font-size:clamp(28px,3.2vw,44px)}}h2{{margin:18px 0 10px}}h3{{padding:0 12px}}
 .sub{{color:var(--muted);margin-bottom:10px;font-size:14px}}.banner{{padding:9px 12px;border-radius:9px;background:#12351f;border:1px solid #275c37;margin:8px 0;color:#d8ffe4;font-size:13px}}.top-status{{padding:9px 12px;border-radius:9px;background:#10263b;border:1px solid #1f4e73;margin:8px 0 12px;color:#d8ecff;font-size:14px}}
-.cards{{display:grid;gap:8px;margin-bottom:8px}}.cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{background:var(--panel);border:1px solid var(--border);padding:11px 12px;border-radius:10px;min-height:84px;overflow:hidden}}.label,.k{{color:var(--muted);font-size:12px}}.value,.v{{font-size:clamp(20px,2.2vw,29px);font-weight:800;margin-top:4px}}.small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}.pos{{color:var(--green)!important;font-weight:800}}.neg{{color:var(--red)!important;font-weight:800}}.warn{{color:var(--amber)!important;font-weight:800}}
+.cards{{display:grid;gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(4,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{background:var(--panel);border:1px solid var(--border);padding:9px 10px;border-radius:9px;min-height:75px;overflow:hidden}}.label,.k{{color:var(--muted);font-size:12px}}.value,.v{{font-size:clamp(18px,1.8vw,27px);font-weight:800;margin-top:4px}}.small{{color:var(--muted);font-size:11px;line-height:1.35;margin-top:3px}}.pos{{color:var(--green)!important;font-weight:800}}.neg{{color:var(--red)!important;font-weight:800}}.warn{{color:var(--amber)!important;font-weight:800}}
 details{{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:9px;overflow:hidden}}details>summary{{cursor:pointer;padding:11px 13px;font-weight:800;font-size:15px;background:var(--summary);color:white;border-left:5px solid #6f1d27}}details>summary:hover{{background:var(--summary2)}}.lazy-placeholder,.section-note{{padding:12px;color:var(--muted);background:#11161d;line-height:1.5;border-bottom:1px solid var(--border)}}.lazy-loading{{padding:14px;color:#8ecbff;font-weight:700}}.lazy-error{{margin:10px;padding:12px;background:#2b1113;border:1px solid #5f2329;border-radius:8px;color:#ffb4ad}}.lazy-meta{{padding:7px 12px;background:#11161d;border-bottom:1px solid var(--border);color:var(--muted);font-size:11px}}
 .metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}}.mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}table{{width:100%;border-collapse:collapse;background:var(--panel)}}th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}}th{{background:#0f141a;color:white}}.table-scroll{{width:100%;overflow-x:auto}}a{{color:var(--blue);text-decoration:none}}.links{{margin:9px 0 14px;font-size:12px}}
 @media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
 </style></head><body><div class="page">
-<h1>Project Exit Plan — BCO</h1><div class="sub">v0.2.1 Project Standard · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
+<h1>Project Exit Plan — BCO</h1><div class="sub">v0.3.0 Master Parity · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div><div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">BCO P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
-<div class="links"><a href="/dashboard-full">Full legacy dashboard</a> · <a href="/health">Health</a> · <a href="/snapshot">Snapshot JSON</a> · <a href="/export/all.zip">BCO analysis ZIP</a></div><h2>Details</h2>{sections}</div>
+<div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/snapshot">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/all.zip">⬇ BCO Analysis ZIP</a><a class="export-btn research" href="/export/bco-focused-research.zip">⬇ BCO Research ZIP</a></div><h2>Details</h2>{sections}</div>
 <script>
 function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}function money(v){{const n=Number(v);if(!Number.isFinite(n))return'n/a';return(n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}function cls(v){{const n=Number(v);return!Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}function card(l,v,s='',c=''){{return`<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}function localTime(iso){{if(!iso)return'';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
 async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
-   <div class="cards four">
-    ${{card('Account NAV',money(a.nav),`Balance ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
-    ${{card('BCO P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
-    ${{card('Basket High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
-    ${{card('Giveback',`${{gb.toFixed(1)}}%`,`Basket state ${{eh(s.basket_phase||'FLAT')}}`,gbc)}}
-   </div>
-   <div class="cards four">
-    ${{card('Open Trades',eh(s.open_trades||0),'BCO long basket')}}
-    ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}
-    ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,g.latest_time?'Latest BCO signal received':'Waiting for BCO signal',Number(g.received_assets||0)===Number(g.expected_assets||1)?'pos':'warn')}}
-    ${{card('Candidate Support',g.candidate?'1/1':'0/1',g.candidate?'Current BCO candidate':'No current candidate',g.candidate?'pos':'neg')}}
-   </div>
-   <div class="cards three">
-    ${{card('Lane',s.orders_allowed?'ENABLED':'LOCKED',`${{eh(d.mode)}} · manager ${{s.auto_management?'ON':'OFF'}}`,s.orders_allowed?'pos':'warn')}}
-    ${{card('Risk / Trade',money(c.risk_per_trade_gbp),`${{Number(c.sl_pct||0).toFixed(2)}}% SL · ${{eh(c.direction||'')}}`)}}
-    ${{card('Scope',eh(c.instrument||'BCO'),'Standalone BCO project')}}
-   </div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
+<div class="cards four">
+${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
+${{card('Broker P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_phase||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
+<div class="cards four">
+${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
+${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
+${{card('Open Trades',eh(s.open_trades||0),'BCO long basket')}}
+${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
+<div class="cards three">
+${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,g.latest_time?'Latest BCO signal received':'Waiting for BCO signal',Number(g.received_assets||0)===1?'pos':'warn')}}
+${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?'Missing none':'Waiting')}}
+${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
 </script></body></html>'''
 
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
-    return {"status":"ok","version":"0.2.1","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
+    return {"status":"ok","version":"0.3.0","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
 
