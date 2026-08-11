@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.3.1 — Master Parity Fix"
-APP_VERSION = "0.3.1"
-POLICY_VERSION = "bco_v0.3.1_master_parity_focused_research"
+APP_NAME = "Project Exit Plan — BCO v0.3.2 — Rich Dashboard + Postgres R Fix"
+APP_VERSION = "0.3.2"
+POLICY_VERSION = "bco_v0.3.2_rich_dashboard_postgres_r_fix"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -209,13 +209,36 @@ def get_conn():
         conn.close()
 
 
+_BCO_DB_COMPAT_ALIASES = {
+    "current_r": "current_R",
+    "realized_r": "realized_R",
+    "basket_r": "basket_R",
+    "high_water_r": "high_water_R",
+    "realized_r_cycle": "realized_R_cycle",
+    "banked_r_cycle": "banked_R_cycle",
+    "threshold_r": "threshold_R",
+    "target_bank_r": "target_bank_R",
+    "executed_r": "executed_R",
+    "protected_r": "protected_R",
+    "basket_r_before": "basket_R_before",
+    "basket_r_after": "basket_R_after",
+}
+
+def _bco_row_compat(row: Any) -> Dict[str, Any]:
+    d = dict(row) if row is not None else {}
+    for lower_key, legacy_key in _BCO_DB_COMPAT_ALIASES.items():
+        if lower_key in d and legacy_key not in d:
+            d[legacy_key] = d.get(lower_key)
+        elif legacy_key in d and lower_key not in d:
+            d[lower_key] = d.get(legacy_key)
+    return d
+
 def fetchone_dict(cur: Any) -> Optional[Dict[str, Any]]:
     row = cur.fetchone()
-    return dict(row) if row is not None else None
-
+    return _bco_row_compat(row) if row is not None else None
 
 def fetchall_dict(cur: Any) -> List[Dict[str, Any]]:
-    return [dict(r) for r in cur.fetchall()]
+    return [_bco_row_compat(r) for r in cur.fetchall()]
 
 
 def db_insert_id(conn: DBConn, sql: str, params: Sequence[Any]) -> int:
@@ -1300,38 +1323,107 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
 # -----------------------------------------------------------------------------
 # Reconciliation — only local BCO broker IDs; never touches foreign trades.
 # -----------------------------------------------------------------------------
+
+def bco_broker_live_snapshot() -> Dict[str, Any]:
+    """Fresh read-only BCO-only broker view for dashboard/accounting."""
+    account = account_summary() if OANDA_ENABLED and OANDA_ACCOUNT_ID else {"ok": False}
+    if not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
+        return {"ok":False,"account":account,"owned_open_trades":[],"owned_open_count":0,
+                "owned_unrealized_pl":0.0,"owned_margin_used":0.0,"account_open_count":0,
+                "error":"OANDA not configured"}
+    resp = oanda_request(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades")
+    if not resp.get("ok"):
+        return {"ok":False,"account":account,"owned_open_trades":[],"owned_open_count":0,
+                "owned_unrealized_pl":0.0,"owned_margin_used":0.0,"account_open_count":0,
+                "error":resp.get("error")}
+    all_trades=(resp.get("data") or {}).get("trades",[]) or []
+    owned=[t for t in all_trades if safe_str(t.get("instrument")).upper()==safe_str(BCO_OANDA_INSTRUMENT).upper()]
+    return {
+        "ok":True,"account":account,"owned_open_trades":owned,"owned_open_count":len(owned),
+        "owned_unrealized_pl":sum(float(safe_float(t.get("unrealizedPL")) or 0.0) for t in owned),
+        "owned_margin_used":sum(float(safe_float(t.get("marginUsed")) or 0.0) for t in owned),
+        "account_open_count":len(all_trades),"time_utc":now_utc_iso()
+    }
+
 def reconcile_broker() -> Dict[str,Any]:
     if not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
         return {"ok":False,"skipped":True,"reason":"OANDA not configured"}
-    r=oanda_request(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades")
-    if not r.get("ok"): return {"ok":False,"error":r.get("error")}
-    all_open=(r.get("data") or {}).get("trades",[]) or []
-    owned=[t for t in all_open if safe_str(t.get("instrument")).upper()==BCO_OANDA_INSTRUMENT] if BCO_OANDA_INSTRUMENT else []
+    live=bco_broker_live_snapshot()
+    if not live.get("ok"):
+        return {"ok":False,"error":live.get("error")}
+    owned=live.get("owned_open_trades") or []
     by_id={safe_str(t.get("id")):t for t in owned}
-    updates=[]
+    updates=[]; local_only_cleaned=[]
     with _db_lock,get_conn() as conn:
-        locals=fetchall_dict(conn.execute("SELECT * FROM trades WHERE broker_trade_id IS NOT NULL AND broker_trade_id<>'' AND status='OPEN'"))
-        for t in locals:
+        locals_linked=fetchall_dict(conn.execute(
+            "SELECT * FROM trades WHERE broker_trade_id IS NOT NULL AND broker_trade_id<>'' AND status='OPEN'"
+        ))
+        local_ids={safe_str(t.get("broker_trade_id")) for t in locals_linked}
+        for t in locals_linked:
             bid=safe_str(t.get("broker_trade_id")); match=by_id.get(bid)
             if match:
-                price=safe_float(match.get("price")); upl=safe_float(match.get("unrealizedPL"))
-                updates.append({"trade_id":t.get("trade_id"),"broker_trade_id":bid,"status":"OPEN","unrealizedPL":upl,"price":price})
+                updates.append({"trade_id":t.get("trade_id"),"broker_trade_id":bid,"status":"OPEN",
+                                "unrealizedPL":safe_float(match.get("unrealizedPL")),
+                                "broker_entry_price":safe_float(match.get("price")),
+                                "currentUnits":safe_float(match.get("currentUnits"))})
             else:
-                # Broker is authoritative: mark local trade externally closed. We do not
-                # guess final P&L here; transaction/financing sync can be added after smoke test.
-                conn.execute("UPDATE trades SET status='BROKER_CLOSED',exit_reason='broker_reconciliation_not_open',exit_time=?,updated_at_utc=? WHERE trade_id=?",
-                             (now_utc_iso(),now_utc_iso(),t.get("trade_id")))
+                conn.execute("""UPDATE trades SET status='BROKER_CLOSED',
+                              exit_reason='broker_reconciliation_not_open',exit_time=?,updated_at_utc=?
+                              WHERE trade_id=?""",(now_utc_iso(),now_utc_iso(),t.get("trade_id")))
                 updates.append({"trade_id":t.get("trade_id"),"broker_trade_id":bid,"status":"BROKER_CLOSED"})
-    return {"ok":True,"owned_open_count":len(owned),"account_open_count":len(all_open),"updates":updates,"time_utc":now_utc_iso()}
+
+        if BCO_AUTO_ENTRY_ENABLED and oanda_orders_allowed()[0]:
+            local_only=fetchall_dict(conn.execute(
+                "SELECT * FROM trades WHERE status='OPEN' AND (broker_trade_id IS NULL OR broker_trade_id='')"
+            ))
+            for t in local_only:
+                conn.execute("""UPDATE trades SET status='ENTRY_FAILED',
+                              exit_reason='reconcile_local_open_without_broker_link',updated_at_utc=?
+                              WHERE trade_id=?""",(now_utc_iso(),t.get("trade_id")))
+                local_only_cleaned.append(safe_str(t.get("trade_id")))
+
+        unlinked_broker=[
+            {"broker_trade_id":safe_str(t.get("id")),"instrument":safe_str(t.get("instrument")),
+             "units":safe_float(t.get("currentUnits")),"price":safe_float(t.get("price")),
+             "unrealizedPL":safe_float(t.get("unrealizedPL"))}
+            for t in owned if safe_str(t.get("id")) not in local_ids
+        ]
+    return {"ok":True,"owned_open_count":len(owned),
+            "owned_unrealized_pl":live.get("owned_unrealized_pl"),
+            "owned_margin_used":live.get("owned_margin_used"),
+            "account_open_count":live.get("account_open_count"),
+            "updates":updates,"local_only_cleaned":local_only_cleaned,
+            "unlinked_broker_trades":unlinked_broker,"time_utc":now_utc_iso()}
 
 
 def snapshot() -> Dict[str,Any]:
     with get_conn() as conn:
         state=fetchone_dict(conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'")) or {}
         open_rows=fetchall_dict(conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY entry_time ASC,id ASC"))
-        closed=fetchone_dict(conn.execute("SELECT COUNT(*) AS c, COALESCE(SUM(realized_R),0) AS r, COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE status IN ('CLOSED','BROKER_CLOSED')")) or {}
-        latest=fetchone_dict(conn.execute("SELECT id,received_at_utc,signal_id,timestamp_readable,candidate_8h,signal_side,exec_close FROM raw_signals ORDER BY id DESC LIMIT 1")) or {}
-        return {"status":"ok","app":APP_NAME,"policy_version":POLICY_VERSION,"strategy":{"asset":BCO_ASSET,"direction":BCO_DIRECTION,"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,"min_hold_hours":BCO_MIN_HOLD_HOURS,"execution_multiplier":BCO_EXECUTION_MULTIPLIER},"basket":state,"open_trades":open_rows,"closed_summary":closed,"latest_signal":latest,"broker_safety":safety_status(),"account":account_summary() if OANDA_ENABLED and OANDA_ACCOUNT_ID else {"ok":False,"error":"not configured"},"time_utc":now_utc_iso()}
+        closed=fetchone_dict(conn.execute("""SELECT COUNT(*) AS c,COALESCE(SUM(realized_R),0) AS r,
+                                         COALESCE(SUM(realized_pnl_gbp),0) AS p
+                                         FROM trades WHERE status IN ('CLOSED','BROKER_CLOSED')""")) or {}
+        latest=fetchone_dict(conn.execute("""SELECT id,received_at_utc,signal_id,timestamp_readable,
+                                         candidate_8h,signal_side,exec_close
+                                         FROM raw_signals ORDER BY id DESC LIMIT 1""")) or {}
+    local_basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows)
+    local_pnl=sum(
+        float(safe_float(t.get("current_R")) or 0.0) *
+        float(safe_float(t.get("effective_risk_gbp")) or safe_float(t.get("requested_risk_gbp")) or BCO_RISK_PER_TRADE_GBP)
+        for t in open_rows
+    )
+    broker=bco_broker_live_snapshot()
+    return {
+        "status":"ok","app":APP_NAME,"policy_version":POLICY_VERSION,
+        "strategy":{"asset":BCO_ASSET,"direction":BCO_DIRECTION,"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,
+                    "sl_pct":BCO_SL_PCT,"min_hold_hours":BCO_MIN_HOLD_HOURS,
+                    "execution_multiplier":BCO_EXECUTION_MULTIPLIER},
+        "basket":state,
+        "live_local_basket":{"open_count":len(open_rows),"basket_R":local_basket_r,"basket_pnl_gbp":local_pnl},
+        "open_trades":open_rows,"closed_summary":closed,"latest_signal":latest,
+        "broker_safety":safety_status(),"account":broker.get("account") or {},
+        "broker_live":broker,"time_utc":now_utc_iso()
+    }
 
 
 def safety_status() -> Dict[str,Any]:
@@ -1691,21 +1783,48 @@ def _pnl_class(v):
     return "pos" if n > 0 else "neg"
 
 def _bco_standard_top_uncached():
-    s=snapshot();basket=s.get("basket") or {};acct=s.get("account") or {};safety=s.get("broker_safety") or {};latest=s.get("latest_signal") or {};rows=s.get("open_trades") or [];closed=s.get("closed_summary") or {}
-    open_count=len(rows);mature=sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0)>=BCO_MIN_HOLD_HOURS);oldest=max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
-    basket_r=safe_float(basket.get("basket_R")) or 0.0;hwm_r=safe_float(basket.get("high_water_R")) or 0.0;giveback_pct=safe_float(basket.get("giveback_pct")) or 0.0;open_pnl=safe_float(basket.get("basket_pnl_gbp"))
-    if open_pnl is None:open_pnl=basket_r*BCO_RISK_PER_TRADE_GBP
+    s=snapshot();basket=s.get("basket") or {};lm=s.get("live_local_basket") or {}
+    acct=s.get("account") or {};broker=s.get("broker_live") or {};safety=s.get("broker_safety") or {}
+    latest=s.get("latest_signal") or {};rows=s.get("open_trades") or [];closed=s.get("closed_summary") or {}
+    local_open=len(rows);broker_open=int(broker.get("owned_open_count") or 0)
+    mature=sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0)>=BCO_MIN_HOLD_HOURS)
+    oldest=max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
+    basket_r=safe_float(lm.get("basket_R")) or 0.0
+    model_open=safe_float(lm.get("basket_pnl_gbp")) or 0.0
+    broker_open_pnl=safe_float(broker.get("owned_unrealized_pl")) or 0.0
+    hwm=safe_float(basket.get("high_water_R")) or 0.0
+    give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     realized_pnl=safe_float(closed.get("p")) or 0.0;realized_r=safe_float(closed.get("r")) or 0.0
-    now=datetime.now(timezone.utc);week_start=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);month_start=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    now=datetime.now(timezone.utc);ws=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
     with get_conn() as conn:
-        wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(week_start.isoformat(),)).fetchone()
-        mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(month_start.isoformat(),)).fetchone()
-    return {"status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
-      "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),"margin_available":safe_float(acct.get("marginAvailable")),"currency":safe_str(acct.get("currency"))},
-      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"This week","month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"This month"},
-      "strategy":{"open_pnl":open_pnl,"realized_pnl":realized_pnl,"realized_r":realized_r,"total_pnl":open_pnl+realized_pnl,"open_trades":open_count,"mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,"high_water_r":hwm_r,"giveback_pct":giveback_pct,"basket_phase":safe_str(basket.get("basket_phase") or "FLAT"),"tide_status":safe_str(basket.get("tide_status") or "FLAT"),"manager_action":safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),"orders_allowed":bool(safety.get("orders_allowed")),"auto_entry":bool(safety.get("auto_entry")),"auto_management":bool(safety.get("auto_management")),"banked_r_cycle":safe_float(basket.get("banked_R_cycle")) or 0.0},
-      "signals":{"candidate":parse_bool(latest.get("candidate_8h"),False),"latest_time":safe_str(latest.get("timestamp_readable")),"latest_price":safe_float(latest.get("exec_close")),"latest_signal_id":safe_str(latest.get("signal_id")),"received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1},
-      "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,"min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
+        wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ws.isoformat(),)).fetchone()
+        mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ms.isoformat(),)).fetchone()
+    return {
+      "status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
+      "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),
+                 "margin_available":safe_float(acct.get("marginAvailable")),"currency":safe_str(acct.get("currency"))},
+      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"Realised this week",
+                    "month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"Realised this month"},
+      "strategy":{"open_pnl":broker_open_pnl,"model_open_pnl":model_open,"realized_pnl":realized_pnl,
+                  "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
+                  "open_trades":broker_open,"local_open_trades":local_open,
+                  "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
+                  "high_water_r":hwm,"giveback_pct":give,
+                  "basket_phase":safe_str(basket.get("basket_phase") or "FLAT"),
+                  "tide_status":safe_str(basket.get("tide_status") or "FLAT"),
+                  "manager_action":safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),
+                  "orders_allowed":bool(safety.get("orders_allowed")),
+                  "auto_entry":bool(safety.get("auto_entry")),"auto_management":bool(safety.get("auto_management")),
+                  "banked_r_cycle":safe_float(basket.get("banked_R_cycle")) or 0.0,
+                  "broker_margin_used":safe_float(broker.get("owned_margin_used")) or 0.0,
+                  "broker_account_open_count":int(broker.get("account_open_count") or 0)},
+      "signals":{"candidate":parse_bool(latest.get("candidate_8h"),False),
+                 "latest_time":safe_str(latest.get("timestamp_readable")),
+                 "latest_price":safe_float(latest.get("exec_close")),
+                 "latest_signal_id":safe_str(latest.get("signal_id")),
+                 "received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1},
+      "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
+                "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
 
 def bco_standard_top_snapshot(force=False):
     now_ts = time.time()
@@ -1851,8 +1970,121 @@ def _bco_standard_research_html():
       <div class="section-note small"><a href="/export/raw-signals.csv">raw signals CSV</a> · <a href="/export/trades.csv">trades CSV</a> · <a href="/export/basket-decisions.csv">basket decisions CSV</a> · <a href="/export/protection-stages.csv">protection stages CSV</a> · <a href="/export/all.zip">full BCO analysis ZIP</a></div>
     '''
 
+
+def _bco_age_zone(hold):
+    h=int(safe_float(hold) or 0)
+    if h<48:return "YOUNG"
+    if h<72:return "48–72 EARLY"
+    if h<96:return "72–96 STRONG"
+    if h<120:return "96–120 MATURE"
+    return "120+ LATE"
+
+def _bco_standard_open_trades_html():
+    s=snapshot();local=s.get("open_trades") or [];live=s.get("broker_live") or {}
+    broker_map={safe_str(t.get("id")):t for t in (live.get("owned_open_trades") or [])}
+    local_bids={safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
+    rows="";linked=local_only=0
+    for t in local:
+        bid=safe_str(t.get("broker_trade_id"));bt=broker_map.get(bid) if bid else None
+        if bt:linked+=1
+        else:local_only+=1
+        rr=safe_float(t.get("current_R")) or 0.0
+        eff=safe_float(t.get("effective_risk_gbp")) or safe_float(t.get("requested_risk_gbp")) or BCO_RISK_PER_TRADE_GBP
+        model_pnl=rr*eff;upl=safe_float((bt or {}).get("unrealizedPL"))
+        rows+=f"""<tr><td>{esc(t.get('trade_id'))}</td><td>{esc(bid or 'LOCAL ONLY')}</td>
+        <td>{esc(t.get('entry_time'))}</td><td>{safe_float(t.get('entry_price')) or 0:.3f}</td>
+        <td>{safe_float(t.get('current_price')) or 0:.3f}</td><td>{int(safe_float(t.get('hold_candles')) or 0)}h</td>
+        <td>{esc(_bco_age_zone(t.get('hold_candles')))}</td><td class="{_pnl_class(rr)}">{rr:.3f}R</td>
+        <td class="{_pnl_class(model_pnl)}">{_money(model_pnl)}</td><td class="{_pnl_class(upl)}">{_money(upl)}</td>
+        <td>{safe_float(t.get('mfe_pct')) or 0:.3f}%</td><td>{safe_float(t.get('mae_pct')) or 0:.3f}%</td>
+        <td>{safe_float(t.get('hard_sl_price')) or 0:.3f}</td><td>{esc(t.get('managed_stop_stage') or '-')}</td>
+        <td>{_money(eff)}</td></tr>"""
+    broker_only=[t for t in (live.get("owned_open_trades") or []) if safe_str(t.get("id")) not in local_bids]
+    borows="".join(f"""<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
+        <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
+        <td class="{_pnl_class(t.get('unrealizedPL'))}">{_money(t.get('unrealizedPL'))}</td>
+        <td>{_money(t.get('marginUsed'))}</td><td>{esc(t.get('openTime'))}</td></tr>""" for t in broker_only)
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">OANDA BCO Trades</div><div class="v">{int(live.get('owned_open_count') or 0)}</div><div class="small">Actual broker positions</div></div>
+        <div class="mini-card"><div class="k">Linked Local Trades</div><div class="v {'pos' if linked==int(live.get('owned_open_count') or 0) else 'warn'}">{linked}</div><div class="small">Local ↔ broker IDs matched</div></div>
+        <div class="mini-card"><div class="k">Local-Only OPEN</div><div class="v {'neg' if local_only else 'pos'}">{local_only}</div><div class="small">Should be zero in auto-entry mode</div></div>
+        <div class="mini-card"><div class="k">BCO Broker UPL</div><div class="v {_pnl_class(live.get('owned_unrealized_pl'))}">{_money(live.get('owned_unrealized_pl'))}</div><div class="small">Fresh OANDA unrealised P&amp;L</div></div>
+      </div>
+      <h3>Open BCO Trades — Local Manager + OANDA</h3>
+      <div class="table-scroll"><table><thead><tr>
+        <th>Local Trade</th><th>Broker ID</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>Age</th><th>Zone</th>
+        <th>Model R</th><th>Model £</th><th>OANDA UPL</th><th>MFE</th><th>MAE</th><th>Hard SL</th><th>Protection</th><th>Effective Risk</th>
+      </tr></thead><tbody>{rows or '<tr><td colspan="15">No local open BCO trades.</td></tr>'}</tbody></table></div>
+      {f'<h3>Broker-Only BCO Trades — Attention Required</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{borows}</tbody></table></div>' if borows else ''}
+    """
+
+def _bco_standard_basket_manager_html():
+    s=snapshot();b=s.get("basket") or {};lm=s.get("live_local_basket") or {};rows=s.get("open_trades") or []
+    with get_conn() as conn:
+        support=candidate_support(conn);reg=regime(conn)
+    rr=safe_float(lm.get("basket_R")) or 0.0;pnl=safe_float(lm.get("basket_pnl_gbp")) or 0.0
+    hwm=safe_float(b.get("high_water_R")) or 0.0;give=((hwm-rr)/hwm*100.0) if hwm>0 and rr<hwm else 0.0
+    losing=sum(1 for t in rows if (safe_float(t.get("current_R")) or 0)<0);lp=losing/len(rows)*100 if rows else 0.0
+    return f"""
+      <div class="section-note"><strong>BCO Basket Manager.</strong> 48h minimum normal hold; hourly review thereafter; staged defence; tighten-only runner protection; immediate profit harvesting at configured R levels.</div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(rr)}">{rr:.2f}R</div><div class="small">{_money(pnl)} model P&amp;L</div></div>
+        <div class="mini-card"><div class="k">High-Water</div><div class="v {_pnl_class(hwm)}">{hwm:.2f}R</div><div class="small">Giveback {give:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Basket Phase</div><div class="v">{esc(b.get('basket_phase') or basket_phase_from_count(len(rows)))}</div><div class="small">{len(rows)} managed trades</div></div>
+        <div class="mini-card"><div class="k">Tide</div><div class="v">{esc(b.get('tide_status') or 'FLAT')}</div><div class="small">Score {esc(b.get('tide_score') or 0)}</div></div>
+        <div class="mini-card"><div class="k">Manager Action</div><div class="v small">{esc(b.get('manager_action') or 'NO_OPEN_BASKET')}</div><div class="small">{esc(b.get('manager_detail') or '')}</div></div>
+        <div class="mini-card"><div class="k">Losing Trades</div><div class="v {'neg' if lp>=60 else 'warn' if lp>=40 else 'pos'}">{lp:.1f}%</div><div class="small">{losing} / {len(rows)}</div></div>
+        <div class="mini-card"><div class="k">Regime</div><div class="v">{esc(reg)}</div><div class="small">120h directional context</div></div>
+        <div class="mini-card"><div class="k">Candidate Support</div><div class="v {'pos' if support.get('supported') else 'warn'}">{esc(support.get('candidate_true_last_3') or 0)}/3</div><div class="small">Latest {esc(support.get('latest_candidate'))}</div></div>
+      </div>
+      {_bco_standard_open_trades_html()}
+    """
+
+def _bco_standard_broker_html():
+    s=snapshot();safety=s.get("broker_safety") or {};live=s.get("broker_live") or {};acct=live.get("account") or {};preview=risk_preview()
+    rows="".join(f"""<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td><td>{esc(t.get('currentUnits'))}</td>
+      <td>{safe_float(t.get('price')) or 0:.3f}</td><td class="{_pnl_class(t.get('unrealizedPL'))}">{_money(t.get('unrealizedPL'))}</td>
+      <td>{_money(t.get('marginUsed'))}</td><td>{esc(t.get('openTime'))}</td></tr>""" for t in (live.get("owned_open_trades") or []))
+    return f"""
+      <div class="section-note warn"><strong>{'LIVE' if OANDA_ENV=='live' else 'DEMO / PRACTICE'} BROKER LANE.</strong> Only {esc(BCO_OANDA_INSTRUMENT)} is owned here. Account NAV is shared; BCO P&amp;L is filtered to BCO only.</div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{_money(acct.get('NAV'))}</div><div class="small">Balance {_money(acct.get('balance'))}</div></div>
+        <div class="mini-card"><div class="k">BCO Open P&amp;L</div><div class="v {_pnl_class(live.get('owned_unrealized_pl'))}">{_money(live.get('owned_unrealized_pl'))}</div><div class="small">Fresh OANDA BCO-only UPL</div></div>
+        <div class="mini-card"><div class="k">BCO Broker Trades</div><div class="v">{int(live.get('owned_open_count') or 0)}</div><div class="small">Account total {int(live.get('account_open_count') or 0)}</div></div>
+        <div class="mini-card"><div class="k">BCO Margin Used</div><div class="v">{_money(live.get('owned_margin_used'))}</div></div>
+        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {'pos' if safety.get('orders_allowed') else 'warn'}">{'ENABLED' if safety.get('orders_allowed') else 'LOCKED'}</div><div class="small">{esc(safety.get('reason'))}</div></div>
+        <div class="mini-card"><div class="k">Auto Entry</div><div class="v {'pos' if safety.get('auto_entry') else 'warn'}">{'ON' if safety.get('auto_entry') else 'OFF'}</div></div>
+        <div class="mini-card"><div class="k">Auto Management</div><div class="v {'pos' if safety.get('auto_management') else 'warn'}">{'ON' if safety.get('auto_management') else 'OFF'}</div></div>
+        <div class="mini-card"><div class="k">Risk Preview</div><div class="v">{_money(preview.get('effective_risk_gbp'))}</div><div class="small">Target {_money(preview.get('target_risk_gbp'))} · {esc(preview.get('units') or '-')} units</div></div>
+      </div>
+      <h3>Actual OANDA BCO Open Trades</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
+      <tbody>{rows or '<tr><td colspan="7">No OANDA BCO trades open.</td></tr>'}</tbody></table></div>
+      <div class="section-note small"><strong>Balance vs NAV:</strong> balance moves when P&amp;L is realised; NAV moves with open unrealised P&amp;L. <a href="/broker/risk-preview">risk preview</a> · <a href="/snapshot">full snapshot JSON</a></div>
+    """
+
+def _bco_standard_execution_html():
+    rec=reconcile_broker()
+    with get_conn() as conn:
+        audits=fetchall_dict(conn.execute("SELECT * FROM execution_audit ORDER BY id DESC LIMIT 30"))
+        stops=fetchall_dict(conn.execute("SELECT * FROM managed_stop_events ORDER BY id DESC LIMIT 30"))
+        events=fetchall_dict(conn.execute("SELECT * FROM system_events ORDER BY id DESC LIMIT 30"))
+    ar="".join(f"<tr><td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td><td>{esc(a.get('success'))}</td><td>{esc(a.get('trade_id'))}</td><td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td></tr>" for a in audits)
+    er="".join(f"<tr><td>{esc(x.get('created_at_utc'))}</td><td>{esc(x.get('event_type'))}</td><td>{esc(x.get('message'))}</td></tr>" for x in events)
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if rec.get('ok') else 'neg'}">{'SAFE' if rec.get('ok') else 'ERROR'}</div><div class="small">{int(rec.get('owned_open_count') or 0)} OANDA BCO trades</div></div>
+        <div class="mini-card"><div class="k">Local-only Cleaned</div><div class="v {'warn' if rec.get('local_only_cleaned') else 'pos'}">{len(rec.get('local_only_cleaned') or [])}</div><div class="small">{esc(', '.join(rec.get('local_only_cleaned') or []) or 'none')}</div></div>
+        <div class="mini-card"><div class="k">Unlinked Broker Trades</div><div class="v {'neg' if rec.get('unlinked_broker_trades') else 'pos'}">{len(rec.get('unlinked_broker_trades') or [])}</div></div>
+        <div class="mini-card"><div class="k">Managed Stop Events</div><div class="v">{len(stops)}</div></div>
+      </div>
+      <h3>Recent Execution Audit</h3><div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Success</th><th>Local Trade</th><th>Broker ID</th><th>Message</th></tr></thead><tbody>{ar or '<tr><td colspan="6">No audit rows.</td></tr>'}</tbody></table></div>
+      <h3>Recent System Events</h3><div class="table-scroll"><table><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody>{er or '<tr><td colspan="3">No events.</td></tr>'}</tbody></table></div>
+    """
+
 _BCO_STD_SECTIONS = {
     "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
+    "open-trades": ("Open Trades / Positions", _bco_standard_open_trades_html),
     "profit-harvesting": ("Profit Harvesting / Protection Plan", _bco_standard_profit_harvesting_html),
     "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_html),
     "execution": ("Execution / Reconciliation", _bco_standard_execution_html),
@@ -1880,6 +2112,7 @@ def _bco_std_placeholder(key, title, note=""):
 def bco_standard_dashboard():
     sections = "".join([
         _bco_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48h management and staged defence."),
+        _bco_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA BCO positions with local R, MFE/MAE, age, stops and effective risk."),
         _bco_std_placeholder("profit-harvesting", "Profit Harvesting / Protection Plan", "100R / 200R / 300R immediate banking and exceptional cohort ratchets."),
         _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO-only OANDA lane, account view and risk sizing."),
         _bco_std_placeholder("execution", "Execution / Reconciliation", "Audit, managed stops and ownership safety."),
@@ -1905,13 +2138,13 @@ function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt
 async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}},ac=d.accounting||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
-${{card('Broker P&L',money(s.total_pnl),`Open ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+${{card('Broker P&L',money(s.total_pnl),`BCO UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
 ${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
 ${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_phase||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
-${{card('Open Trades',eh(s.open_trades||0),'BCO long basket')}}
+${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
 ${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,g.latest_time?'Latest BCO signal received':'Waiting for BCO signal',Number(g.received_assets||0)===1?'pos':'warn')}}
