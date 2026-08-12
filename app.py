@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.2 — High-Water Cash Tile"
-APP_VERSION = "0.4.2"
-POLICY_VERSION = "bco_v0.4.2_highwater_cash_tile"
+APP_NAME = "Project Exit Plan — BCO v0.4.3 — Railway Health Fix"
+APP_VERSION = "0.4.3"
+POLICY_VERSION = "bco_v0.4.3_railway_health_fix"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2169,14 +2169,14 @@ def start_worker() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    # Keep Railway startup local and fast. OANDA/accounting work is handled
+    # by the existing background worker after the service is already live.
     init_db()
-    try:
-        sync_broker_transactions()
-        record_accounting_snapshot()
-    except Exception as exc:
-        log_event("startup_sync_warning", str(exc))
     start_worker()
-    log_event("startup", APP_NAME, {"safety":safety_status()})
+    try:
+        log_event("startup", APP_NAME, {"safety":safety_status()})
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -2297,10 +2297,22 @@ def operational_health() -> Dict[str, Any]:
 
 @app.get("/health")
 def health():
-    op=operational_health()
-    return {"status":op.get("status"),"app":APP_NAME,"version":APP_VERSION,
-            "database":{"postgres":USE_POSTGRES},"safety":safety_status(),
-            "operational":op,"time_utc":now_utc_iso()}
+    """Fast Railway liveness check. No OANDA/network calls."""
+    db_ok=True
+    db_error=""
+    try:
+        with get_conn() as conn:
+            fetchone_dict(conn.execute("SELECT 1 AS ok"))
+    except Exception as exc:
+        db_ok=False
+        db_error=str(exc)
+    return {
+        "status":"ok" if db_ok else "degraded",
+        "app":APP_NAME,
+        "version":APP_VERSION,
+        "database":{"ok":db_ok,"postgres":USE_POSTGRES,"error":db_error},
+        "time_utc":now_utc_iso()
+    }
 
 
 @app.post("/webhook/tradingview")
@@ -2885,6 +2897,11 @@ def _bco_standard_execution_html():
     """
 
 
+@app.get("/operational-health")
+def operational_health_endpoint():
+    return operational_health()
+
+
 def _bco_standard_health_html():
     h = operational_health()
     checks = h.get("checks") or {}
@@ -2896,7 +2913,7 @@ def _bco_standard_health_html():
     return f"""
       <div class="section-note"><strong>Operational Health.</strong> Signal freshness, OANDA read access, local↔broker parity, durable retry queue, transaction sync and reconciliation freshness.</div>
       <div class="metric-grid">{cards}</div>
-      <div class="section-note small"><a href="/health">full health JSON</a></div>
+      <div class="section-note small"><a href="/operational-health">full operational health JSON</a> · <a href="/health">Railway liveness</a></div>
     """
 
 
