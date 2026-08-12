@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.1 — Live-Grade Parity"
-APP_VERSION = "0.4.1"
-POLICY_VERSION = "bco_v0.4.1_live_grade_parity"
+APP_NAME = "Project Exit Plan — BCO v0.4.2 — High-Water Cash Tile"
+APP_VERSION = "0.4.2"
+POLICY_VERSION = "bco_v0.4.2_highwater_cash_tile"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2658,6 +2658,21 @@ def _bco_standard_top_uncached():
     model_open=safe_float(lm.get("basket_pnl_gbp")) or 0.0
     broker_open_pnl=safe_float(broker.get("owned_unrealized_pl")) or 0.0
     hwm=safe_float(basket.get("high_water_R")) or 0.0
+    hwm_time=safe_str(basket.get("high_water_seen_at"))
+    hwm_gbp=None
+    if hwm > 0:
+        with get_conn() as _hwm_conn:
+            _hrow=fetchone_dict(_hwm_conn.execute("""
+                SELECT basket_pnl_gbp,signal_time,created_at_utc
+                FROM basket_snapshots
+                WHERE high_water_R>=? AND basket_R>=?
+                ORDER BY id ASC LIMIT 1
+            """,(hwm-0.000001,hwm-0.000001))) or {}
+        hwm_gbp=safe_float(_hrow.get("basket_pnl_gbp"))
+        if not hwm_time:
+            hwm_time=safe_str(_hrow.get("signal_time") or _hrow.get("created_at_utc"))
+    if hwm_gbp is None:
+        hwm_gbp=hwm*float(BCO_RISK_PER_TRADE_GBP)
     give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     realized_pnl=safe_float(closed.get("p")) or 0.0;realized_r=safe_float(closed.get("r")) or 0.0
     now=datetime.now(timezone.utc);ws=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
@@ -2674,7 +2689,7 @@ def _bco_standard_top_uncached():
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
                   "open_trades":broker_open,"local_open_trades":local_open,
                   "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
-                  "high_water_r":hwm,"giveback_pct":give,
+                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"giveback_pct":give,
                   "basket_phase":safe_str(basket.get("basket_phase") or "FLAT"),
                   "tide_status":safe_str(basket.get("tide_status") or "FLAT"),
                   "manager_action":safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),
@@ -2944,7 +2959,7 @@ async function loadTop(force=false){{const st=document.getElementById('topStatus
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
 ${{card('Broker P&L',money(s.total_pnl),`BCO UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
-${{card('High-Water',`${{Number(s.high_water_r||0).toFixed(2)}}R`,`Current basket ${{Number(s.basket_r||0).toFixed(2)}}R`,cls(s.high_water_r))}}
+${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{Number(s.giveback_pct||0).toFixed(1)}}%`,`Basket state ${{eh(s.basket_phase||'FLAT')}}`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
