@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.3.2 — Rich Dashboard + Postgres R Fix"
-APP_VERSION = "0.3.2"
-POLICY_VERSION = "bco_v0.3.2_rich_dashboard_postgres_r_fix"
+APP_NAME = "Project Exit Plan — BCO v0.4.1 — Live-Grade Parity"
+APP_VERSION = "0.4.1"
+POLICY_VERSION = "bco_v0.4.1_live_grade_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -139,6 +139,12 @@ BCO_PRACTICE_SMOKE_TEST_ENABLED = env_bool("BCO_PRACTICE_SMOKE_TEST_ENABLED", Fa
 BROKER_MAX_SPREAD_PCT = max(0.0, float(os.getenv("BROKER_MAX_SPREAD_PCT", "0.20")))
 BROKER_MAX_RISK_OVERAGE_PCT = max(0.0, float(os.getenv("BROKER_MAX_RISK_OVERAGE_PCT", "25")))
 BROKER_RECONCILE_INTERVAL_SECONDS = max(15, min(int(float(os.getenv("BROKER_RECONCILE_INTERVAL_SECONDS", "60"))), 300))
+BCO_ACTION_RETRY_MAX_ATTEMPTS = max(3, int(float(os.getenv("BCO_ACTION_RETRY_MAX_ATTEMPTS", "1000"))))
+BCO_TRANSACTION_SYNC_ENABLED = env_bool("BCO_TRANSACTION_SYNC_ENABLED", True)
+BCO_TRANSACTION_SYNC_PAGE_LIMIT = max(100, min(int(float(os.getenv("BCO_TRANSACTION_SYNC_PAGE_LIMIT", "1000"))), 5000))
+BCO_HEALTH_SIGNAL_STALE_SECONDS = max(3600, int(float(os.getenv("BCO_HEALTH_SIGNAL_STALE_SECONDS", "10800"))))
+BCO_HEALTH_RECONCILE_STALE_SECONDS = max(60, int(float(os.getenv("BCO_HEALTH_RECONCILE_STALE_SECONDS", "180"))))
+
 
 # Shared-account guard. This service may read account-wide NAV/margin, but all
 # writes and strategy P&L are restricted to BCO-owned trades only.
@@ -458,6 +464,145 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 updated_at_utc TEXT
+            )
+        """)
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS broker_action_queue (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                local_trade_id TEXT,
+                broker_trade_id TEXT,
+                reason TEXT,
+                desired_stop_price DOUBLE PRECISION,
+                attempts BIGINT DEFAULT 0,
+                last_attempt_at_utc TEXT,
+                last_error TEXT,
+                broker_response_json TEXT,
+                completed_at_utc TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_action_queue_status ON broker_action_queue(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_action_queue_trade ON broker_action_queue(local_trade_id)")
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS broker_transactions (
+                id {id_type},
+                synced_at_utc TEXT NOT NULL,
+                transaction_id TEXT NOT NULL UNIQUE,
+                transaction_type TEXT,
+                transaction_time TEXT,
+                account_balance DOUBLE PRECISION,
+                pl_home DOUBLE PRECISION DEFAULT 0,
+                financing_home DOUBLE PRECISION DEFAULT 0,
+                capital_movement_home DOUBLE PRECISION DEFAULT 0,
+                raw_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_broker_tx_time ON broker_transactions(transaction_time)")
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS fixed_48_outcomes (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                trade_id TEXT NOT NULL UNIQUE,
+                broker_trade_id TEXT,
+                cycle_id TEXT,
+                signal_time TEXT,
+                hold_candles BIGINT,
+                entry_price DOUBLE PRECISION,
+                control_exit_price DOUBLE PRECISION,
+                fixed_48_R DOUBLE PRECISION,
+                fixed_48_pnl_gbp DOUBLE PRECISION,
+                mfe_pct DOUBLE PRECISION,
+                mae_pct DOUBLE PRECISION,
+                note TEXT
+            )
+        """)
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS trade_manager_reviews (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                signal_time TEXT,
+                raw_signal_id BIGINT,
+                cycle_id TEXT,
+                trade_id TEXT NOT NULL,
+                broker_trade_id TEXT,
+                hold_candles BIGINT,
+                age_zone TEXT,
+                current_price DOUBLE PRECISION,
+                current_R DOUBLE PRECISION,
+                mfe_pct DOUBLE PRECISION,
+                mae_pct DOUBLE PRECISION,
+                regime TEXT,
+                candidate_supported {bool_type},
+                decision_48 TEXT,
+                decision_72 TEXT,
+                manager_decision TEXT,
+                manager_reason TEXT,
+                managed_stop_price DOUBLE PRECISION,
+                managed_stop_stage TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_mgr_reviews_trade ON trade_manager_reviews(trade_id,id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_mgr_reviews_signal ON trade_manager_reviews(raw_signal_id)")
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS basket_snapshots (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                raw_signal_id BIGINT,
+                signal_time TEXT,
+                cycle_id TEXT,
+                open_count BIGINT,
+                basket_R DOUBLE PRECISION,
+                basket_pnl_gbp DOUBLE PRECISION,
+                high_water_R DOUBLE PRECISION,
+                giveback_pct DOUBLE PRECISION,
+                losing_pct DOUBLE PRECISION,
+                basket_phase TEXT,
+                tide_score BIGINT,
+                tide_status TEXT,
+                manager_action TEXT,
+                manager_detail TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_basket_snapshots_cycle ON basket_snapshots(cycle_id,id)")
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS harvest_execution_outcomes (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                protection_stage_id BIGINT NOT NULL UNIQUE,
+                cycle_id TEXT,
+                threshold_R DOUBLE PRECISION,
+                selected_trade_ids TEXT,
+                model_realized_R DOUBLE PRECISION DEFAULT 0,
+                broker_realized_pl_gbp DOUBLE PRECISION DEFAULT 0,
+                financing_gbp DOUBLE PRECISION DEFAULT 0,
+                net_realized_gbp DOUBLE PRECISION DEFAULT 0,
+                sync_status TEXT,
+                note TEXT
+            )
+        """)
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS accounting_snapshots (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                account_nav DOUBLE PRECISION,
+                account_balance DOUBLE PRECISION,
+                bco_open_pl DOUBLE PRECISION,
+                bco_realized_pl DOUBLE PRECISION,
+                bco_financing DOUBLE PRECISION,
+                capital_movements DOUBLE PRECISION,
+                broker_last_transaction_id TEXT,
+                note TEXT
             )
         """)
 
@@ -796,7 +941,8 @@ def account_summary() -> Dict[str, Any]:
     return {
         "ok": bool(r.get("ok")), "NAV": safe_float(acct.get("NAV")), "balance": safe_float(acct.get("balance")),
         "marginUsed": safe_float(acct.get("marginUsed")), "marginAvailable": safe_float(acct.get("marginAvailable")),
-        "currency": safe_str(acct.get("currency")), "error": r.get("error")
+        "currency": safe_str(acct.get("currency")), "lastTransactionID": safe_str(acct.get("lastTransactionID") or (r.get("data") or {}).get("lastTransactionID")),
+        "error": r.get("error")
     }
 
 
@@ -902,6 +1048,533 @@ def extract_fill(resp: Dict[str, Any]) -> Dict[str, Any]:
         "transaction_id": safe_str(fill.get("id")),
     }
 
+
+
+def runtime_get(conn: DBConn, key: str, default: str = "") -> str:
+    row = fetchone_dict(conn.execute("SELECT value FROM runtime_state WHERE key=? LIMIT 1", (key,)))
+    return safe_str((row or {}).get("value")) or default
+
+
+def runtime_set(conn: DBConn, key: str, value: Any) -> None:
+    val = safe_str(value)
+    if conn.postgres:
+        conn.execute("""
+            INSERT INTO runtime_state(key,value,updated_at_utc) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at_utc=EXCLUDED.updated_at_utc
+        """, (key, val, now_utc_iso()))
+    else:
+        conn.execute("""
+            INSERT INTO runtime_state(key,value,updated_at_utc) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
+        """, (key, val, now_utc_iso()))
+
+
+def _iso_age_seconds(value: Any) -> Optional[float]:
+    s = safe_str(value)
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _broker_close_fill(resp: Dict[str, Any]) -> Dict[str, Any]:
+    data = resp.get("data") or {}
+    fill = data.get("orderFillTransaction") or {}
+    closed = fill.get("tradesClosed") or []
+    reduced = fill.get("tradeReduced")
+    if isinstance(reduced, dict):
+        closed = list(closed) + [reduced]
+    tc = fill.get("tradeClosed")
+    if isinstance(tc, dict):
+        closed = list(closed) + [tc]
+    pl = safe_float(fill.get("pl"))
+    financing = safe_float(fill.get("financing"))
+    if pl is None:
+        pl = sum(float(safe_float(x.get("realizedPL")) or safe_float(x.get("pl")) or 0.0) for x in closed if isinstance(x, dict))
+    if financing is None:
+        financing = sum(float(safe_float(x.get("financing")) or 0.0) for x in closed if isinstance(x, dict))
+    return {
+        "transaction_id": safe_str(fill.get("id")),
+        "price": safe_float(fill.get("price")),
+        "pl_home": float(pl or 0.0),
+        "financing_home": float(financing or 0.0),
+        "account_balance": safe_float(fill.get("accountBalance")),
+        "raw_fill": fill,
+    }
+
+
+def mark_trade_closed_from_broker(
+    conn: DBConn,
+    trade: Dict[str, Any],
+    signal_time: str,
+    reason: str,
+    broker_close: Dict[str, Any],
+) -> float:
+    effective = float(
+        safe_float(trade.get("effective_risk_gbp"))
+        or safe_float(trade.get("requested_risk_gbp"))
+        or BCO_RISK_PER_TRADE_GBP
+    )
+    broker_pl = float(safe_float(broker_close.get("pl_home")) or 0.0)
+    financing = float(safe_float(broker_close.get("financing_home")) or 0.0)
+    net = broker_pl + financing
+    rr = (net / effective) if effective > 0 else 0.0
+    exit_price = safe_float(broker_close.get("price")) or safe_float(trade.get("current_price")) or safe_float(trade.get("entry_price")) or 0.0
+    conn.execute("""
+        UPDATE trades SET
+            status='CLOSED',exit_time=?,exit_price=?,exit_reason=?,
+            realized_R=?,realized_pnl_gbp=?,broker_realized_pl_home=?,financing_home=?,
+            current_R=?,current_price=?,updated_at_utc=?
+        WHERE trade_id=?
+    """, (
+        signal_time or now_utc_iso(), exit_price, reason,
+        rr, net, broker_pl, financing,
+        rr, exit_price, now_utc_iso(), trade.get("trade_id")
+    ))
+    audit(
+        "BROKER_CLOSE_ACCOUNTED", True,
+        trade_id=trade.get("trade_id"),
+        broker_trade_id=trade.get("broker_trade_id"),
+        instrument=BCO_OANDA_INSTRUMENT,
+        actual_price=exit_price,
+        effective_risk_gbp=effective,
+        message=f"Broker authoritative close: pl={broker_pl:.6f}, financing={financing:.6f}, net={net:.6f}, R={rr:.6f}",
+        raw=broker_close.get("raw_fill") or broker_close,
+    )
+    return rr
+
+
+def enqueue_broker_action(
+    conn: DBConn,
+    action_type: str,
+    trade: Dict[str, Any],
+    reason: str,
+    desired_stop_price: Optional[float] = None,
+    error: str = "",
+) -> int:
+    action_type = safe_str(action_type).upper()
+    local_id = safe_str(trade.get("trade_id"))
+    broker_id = safe_str(trade.get("broker_trade_id"))
+    existing = fetchone_dict(conn.execute("""
+        SELECT * FROM broker_action_queue
+        WHERE action_type=? AND local_trade_id=? AND status IN ('PENDING','RETRY')
+        ORDER BY id DESC LIMIT 1
+    """, (action_type, local_id)))
+    if existing:
+        conn.execute("""
+            UPDATE broker_action_queue
+            SET updated_at_utc=?,reason=?,desired_stop_price=COALESCE(?,desired_stop_price),
+                last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END
+            WHERE id=?
+        """, (now_utc_iso(), reason, desired_stop_price, error, error, existing.get("id")))
+        return int(existing.get("id") or 0)
+    return db_insert_id(conn, """
+        INSERT INTO broker_action_queue(
+            created_at_utc,updated_at_utc,action_type,status,local_trade_id,broker_trade_id,
+            reason,desired_stop_price,attempts,last_error
+        ) VALUES(?,?,?,'PENDING',?,?,?,?,0,?)
+    """, (
+        now_utc_iso(), now_utc_iso(), action_type, local_id, broker_id,
+        reason, desired_stop_price, error
+    ))
+
+
+def record_fixed_48_outcome(
+    conn: DBConn,
+    trade: Dict[str, Any],
+    signal_time: str,
+    current_price: float,
+    rr: float,
+    mfe_pct: float,
+    mae_pct: float,
+    hold: int,
+) -> None:
+    if hold < 48:
+        return
+    existing = fetchone_dict(conn.execute(
+        "SELECT id FROM fixed_48_outcomes WHERE trade_id=? LIMIT 1",
+        (trade.get("trade_id"),)
+    ))
+    if existing:
+        return
+    risk = float(
+        safe_float(trade.get("effective_risk_gbp"))
+        or safe_float(trade.get("requested_risk_gbp"))
+        or BCO_RISK_PER_TRADE_GBP
+    )
+    conn.execute("""
+        INSERT INTO fixed_48_outcomes(
+            created_at_utc,trade_id,broker_trade_id,cycle_id,signal_time,hold_candles,
+            entry_price,control_exit_price,fixed_48_R,fixed_48_pnl_gbp,mfe_pct,mae_pct,note
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), trade.get("trade_id"), trade.get("broker_trade_id"), trade.get("cycle_id"),
+        signal_time, hold, trade.get("entry_price"), current_price, rr, rr*risk, mfe_pct, mae_pct,
+        "Frozen 48h control. Managed trade may continue independently."
+    ))
+
+
+def record_manager_review(
+    conn: DBConn,
+    raw_signal_id: Optional[int],
+    trade: Dict[str, Any],
+    signal_time: str,
+    hold: int,
+    current_price: float,
+    rr: float,
+    mfe_pct: float,
+    mae_pct: float,
+    regime_name: str,
+    support: Dict[str, Any],
+    manager_decision: str,
+    manager_reason: str,
+    d48: str,
+    d72: str,
+) -> None:
+    if hold < 48:
+        return
+    conn.execute("""
+        INSERT INTO trade_manager_reviews(
+            created_at_utc,signal_time,raw_signal_id,cycle_id,trade_id,broker_trade_id,
+            hold_candles,age_zone,current_price,current_R,mfe_pct,mae_pct,regime,
+            candidate_supported,decision_48,decision_72,manager_decision,manager_reason,
+            managed_stop_price,managed_stop_stage
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), signal_time, raw_signal_id, trade.get("cycle_id"), trade.get("trade_id"),
+        trade.get("broker_trade_id"), hold, _bco_age_zone(hold), current_price, rr, mfe_pct, mae_pct,
+        regime_name, bool(support.get("supported")), d48, d72, manager_decision, manager_reason,
+        trade.get("managed_stop_price"), trade.get("managed_stop_stage")
+    ))
+
+
+def record_basket_snapshot(
+    conn: DBConn,
+    raw_signal_id: int,
+    signal_time: str,
+    state: Dict[str, Any],
+    metrics: Dict[str, Any],
+) -> None:
+    conn.execute("""
+        INSERT INTO basket_snapshots(
+            created_at_utc,raw_signal_id,signal_time,cycle_id,open_count,basket_R,basket_pnl_gbp,
+            high_water_R,giveback_pct,losing_pct,basket_phase,tide_score,tide_status,
+            manager_action,manager_detail
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), raw_signal_id, signal_time, state.get("cycle_id"), metrics.get("open_count"),
+        metrics.get("basket_R"), metrics.get("basket_pnl_gbp"), state.get("high_water_R"),
+        state.get("giveback_pct"), metrics.get("losing_pct"), metrics.get("phase"),
+        state.get("tide_score"), state.get("tide_status"), state.get("manager_action"),
+        state.get("manager_detail")
+    ))
+
+
+def finalize_harvest_stage(conn: DBConn, stage_id: int, signal_time: str = "") -> Dict[str, Any]:
+    stage = fetchone_dict(conn.execute("SELECT * FROM protection_stages WHERE id=? LIMIT 1", (stage_id,))) or {}
+    ids = [x for x in safe_str(stage.get("selected_trade_ids")).split(",") if x]
+    if not ids:
+        return {"ok": False, "reason": "no_selected_trade_ids"}
+    closed_rows = []
+    all_closed = True
+    for trade_id in ids:
+        tr = fetchone_dict(conn.execute("SELECT * FROM trades WHERE trade_id=? LIMIT 1", (trade_id,))) or {}
+        if safe_str(tr.get("status")).upper() not in {"CLOSED","BROKER_CLOSED"}:
+            all_closed = False
+        else:
+            closed_rows.append(tr)
+    model_r = sum(float(safe_float(t.get("realized_R")) or 0.0) for t in closed_rows)
+    broker_pl = sum(float(safe_float(t.get("broker_realized_pl_home")) or 0.0) for t in closed_rows)
+    financing = sum(float(safe_float(t.get("financing_home")) or 0.0) for t in closed_rows)
+    net = sum(float(safe_float(t.get("realized_pnl_gbp")) or 0.0) for t in closed_rows)
+    status = "EXECUTED" if all_closed and len(closed_rows) == len(ids) else "EXECUTING_RETRY"
+    conn.execute("""
+        UPDATE protection_stages SET status=?,executed_R=?,executed_at_signal_time=CASE WHEN ?='EXECUTED' THEN ? ELSE executed_at_signal_time END,
+            updated_at_utc=?,reason=?
+        WHERE id=?
+    """, (
+        status, model_r, status, signal_time or now_utc_iso(), now_utc_iso(),
+        f"Selected {len(ids)} whole trade(s); broker-net GBP {net:.6f}; financing {financing:.6f}.",
+        stage_id
+    ))
+    if conn.postgres:
+        conn.execute("""
+            INSERT INTO harvest_execution_outcomes(
+                created_at_utc,updated_at_utc,protection_stage_id,cycle_id,threshold_R,selected_trade_ids,
+                model_realized_R,broker_realized_pl_gbp,financing_gbp,net_realized_gbp,sync_status,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(protection_stage_id) DO UPDATE SET
+                updated_at_utc=EXCLUDED.updated_at_utc,model_realized_R=EXCLUDED.model_realized_R,
+                broker_realized_pl_gbp=EXCLUDED.broker_realized_pl_gbp,financing_gbp=EXCLUDED.financing_gbp,
+                net_realized_gbp=EXCLUDED.net_realized_gbp,sync_status=EXCLUDED.sync_status,note=EXCLUDED.note
+        """, (
+            now_utc_iso(), now_utc_iso(), stage_id, stage.get("cycle_id"), stage.get("threshold_R"),
+            ",".join(ids), model_r, broker_pl, financing, net, status,
+            "Authoritative GBP comes from broker-close accounting where available."
+        ))
+    else:
+        conn.execute("""
+            INSERT INTO harvest_execution_outcomes(
+                created_at_utc,updated_at_utc,protection_stage_id,cycle_id,threshold_R,selected_trade_ids,
+                model_realized_R,broker_realized_pl_gbp,financing_gbp,net_realized_gbp,sync_status,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(protection_stage_id) DO UPDATE SET
+                updated_at_utc=excluded.updated_at_utc,model_realized_R=excluded.model_realized_R,
+                broker_realized_pl_gbp=excluded.broker_realized_pl_gbp,financing_gbp=excluded.financing_gbp,
+                net_realized_gbp=excluded.net_realized_gbp,sync_status=excluded.sync_status,note=excluded.note
+        """, (
+            now_utc_iso(), now_utc_iso(), stage_id, stage.get("cycle_id"), stage.get("threshold_R"),
+            ",".join(ids), model_r, broker_pl, financing, net, status,
+            "Authoritative GBP comes from broker-close accounting where available."
+        ))
+    return {"ok": True, "status": status, "model_R": model_r, "net_realized_gbp": net}
+
+
+def finalize_pending_harvest_stages(conn: DBConn) -> None:
+    stages = fetchall_dict(conn.execute("""
+        SELECT id FROM protection_stages
+        WHERE stage_type='BANK' AND status IN ('EXECUTING','EXECUTING_RETRY')
+        ORDER BY id ASC
+    """))
+    for st in stages:
+        finalize_harvest_stage(conn, int(st.get("id") or 0), now_utc_iso())
+
+
+def sync_broker_transactions() -> Dict[str, Any]:
+    """
+    Incremental OANDA transaction sync.
+    Captures close fills, daily financing, and explicit capital movements without
+    importing unrelated historical strategy performance.
+    """
+    if not BCO_TRANSACTION_SYNC_ENABLED or not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
+        return {"ok": False, "skipped": True, "reason": "transaction sync disabled/unconfigured"}
+
+    with _db_lock, get_conn() as conn:
+        cursor = runtime_get(conn, "broker_transaction_cursor", "")
+        if not cursor:
+            summary = account_summary()
+            last_id = safe_str(summary.get("lastTransactionID"))
+            if not last_id:
+                return {"ok": False, "error": "unable to initialize transaction cursor"}
+            try:
+                # Small recent lookback catches closes/financing around an upgrade
+                # without importing the account's full historic transaction ledger.
+                cursor = str(max(0, int(float(last_id)) - 500))
+            except Exception:
+                cursor = last_id
+            runtime_set(conn, "broker_transaction_cursor", cursor)
+
+    resp = oanda_request(
+        f"/v3/accounts/{OANDA_ACCOUNT_ID}/transactions/sinceid",
+        "GET",
+        params={"id": cursor}
+    )
+    if not resp.get("ok"):
+        return {"ok": False, "error": resp.get("error"), "cursor": cursor}
+
+    data = resp.get("data") or {}
+    transactions = data.get("transactions") or []
+    processed = 0
+    matched_closes = 0
+    financing_updates = 0
+    capital_movements = 0.0
+
+    with _db_lock, get_conn() as conn:
+        for tx in transactions[:BCO_TRANSACTION_SYNC_PAGE_LIMIT]:
+            txid = safe_str(tx.get("id"))
+            if not txid:
+                continue
+            tx_type = safe_str(tx.get("type")).upper()
+            tx_time = safe_str(tx.get("time"))
+            pl = float(safe_float(tx.get("pl")) or 0.0)
+            financing = float(safe_float(tx.get("financing")) or 0.0)
+            account_balance = safe_float(tx.get("accountBalance"))
+            capital = 0.0
+            if tx_type in {"TRANSFER_FUNDS","DIVIDEND_ADJUSTMENT"}:
+                capital = float(safe_float(tx.get("amount")) or 0.0)
+                capital_movements += capital
+
+            # Store transaction idempotently.
+            try:
+                conn.execute("""
+                    INSERT INTO broker_transactions(
+                        synced_at_utc,transaction_id,transaction_type,transaction_time,account_balance,
+                        pl_home,financing_home,capital_movement_home,raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                """, (
+                    now_utc_iso(), txid, tx_type, tx_time, account_balance,
+                    pl, financing, capital, json.dumps(tx)[:50000]
+                ))
+            except Exception:
+                # Already synced transaction.
+                pass
+
+            # Daily financing may contain per-trade financing records.
+            if tx_type == "DAILY_FINANCING":
+                for pos in (tx.get("positionFinancings") or []):
+                    for tf in (pos.get("tradeFinancings") or []):
+                        bid = safe_str(tf.get("tradeID"))
+                        fin = float(safe_float(tf.get("financing")) or 0.0)
+                        if bid and fin:
+                            conn.execute("""
+                                UPDATE trades
+                                SET financing_home=COALESCE(financing_home,0)+?,updated_at_utc=?
+                                WHERE broker_trade_id=?
+                            """, (fin, now_utc_iso(), bid))
+                            financing_updates += 1
+
+            # ORDER_FILL closure components.
+            if tx_type == "ORDER_FILL":
+                components = []
+                if isinstance(tx.get("tradeClosed"), dict):
+                    components.append(tx.get("tradeClosed"))
+                components.extend([x for x in (tx.get("tradesClosed") or []) if isinstance(x, dict)])
+                if isinstance(tx.get("tradeReduced"), dict):
+                    components.append(tx.get("tradeReduced"))
+                for comp in components:
+                    bid = safe_str(comp.get("tradeID"))
+                    if not bid:
+                        continue
+                    tr = fetchone_dict(conn.execute(
+                        "SELECT * FROM trades WHERE broker_trade_id=? LIMIT 1",
+                        (bid,)
+                    ))
+                    if not tr:
+                        continue
+                    cpl = float(safe_float(comp.get("realizedPL")) or safe_float(comp.get("pl")) or pl or 0.0)
+                    cfin = float(safe_float(comp.get("financing")) or financing or 0.0)
+                    close_info = {
+                        "transaction_id": txid,
+                        "price": safe_float(tx.get("price")) or safe_float(comp.get("price")),
+                        "pl_home": cpl,
+                        "financing_home": cfin,
+                        "account_balance": account_balance,
+                        "raw_fill": tx,
+                    }
+                    if safe_str(tr.get("status")).upper() not in {"CLOSED"} or safe_float(tr.get("broker_realized_pl_home")) is None:
+                        mark_trade_closed_from_broker(
+                            conn, tr, tx_time or now_utc_iso(),
+                            safe_str(tr.get("exit_reason") or "broker_transaction_sync"),
+                            close_info
+                        )
+                        matched_closes += 1
+
+            processed += 1
+
+        new_cursor = safe_str(data.get("lastTransactionID"))
+        if not new_cursor and transactions:
+            new_cursor = safe_str(transactions[-1].get("id"))
+        if new_cursor:
+            runtime_set(conn, "broker_transaction_cursor", new_cursor)
+        runtime_set(conn, "broker_transaction_sync_at", now_utc_iso())
+        runtime_set(conn, "broker_capital_movements_total", str(
+            float(runtime_get(conn, "broker_capital_movements_total", "0") or 0.0) + capital_movements
+        ))
+        finalize_pending_harvest_stages(conn)
+
+    return {
+        "ok": True, "processed": processed, "matched_closes": matched_closes,
+        "financing_updates": financing_updates, "capital_movements": capital_movements,
+        "cursor": new_cursor or cursor, "time_utc": now_utc_iso()
+    }
+
+
+def process_broker_action_queue(limit: int = 50) -> Dict[str, Any]:
+    if not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
+        return {"ok": False, "skipped": True, "reason": "OANDA unavailable"}
+    processed = success = failed = 0
+    with _db_lock, get_conn() as conn:
+        rows = fetchall_dict(conn.execute("""
+            SELECT * FROM broker_action_queue
+            WHERE status IN ('PENDING','RETRY')
+            ORDER BY id ASC LIMIT ?
+        """, (max(1, min(int(limit), 500)),)))
+        for row in rows:
+            qid = int(row.get("id") or 0)
+            trade = fetchone_dict(conn.execute(
+                "SELECT * FROM trades WHERE trade_id=? LIMIT 1",
+                (row.get("local_trade_id"),)
+            )) or {}
+            if not trade:
+                conn.execute("""
+                    UPDATE broker_action_queue SET status='FAILED_FINAL',updated_at_utc=?,completed_at_utc=?,
+                        last_error='local trade missing' WHERE id=?
+                """, (now_utc_iso(), now_utc_iso(), qid))
+                failed += 1
+                continue
+            if safe_str(trade.get("status")).upper() != "OPEN":
+                conn.execute("""
+                    UPDATE broker_action_queue SET status='DONE',updated_at_utc=?,completed_at_utc=?,
+                        last_error='' WHERE id=?
+                """, (now_utc_iso(), now_utc_iso(), qid))
+                success += 1
+                continue
+
+            attempts = int(safe_float(row.get("attempts")) or 0) + 1
+            action = safe_str(row.get("action_type")).upper()
+            resp = {}
+            if action == "CLOSE":
+                resp = close_broker_trade(
+                    safe_str(trade.get("broker_trade_id")),
+                    safe_str(trade.get("trade_id")),
+                    safe_str(row.get("reason") or "queued_close")
+                )
+                if resp.get("ok"):
+                    info = _broker_close_fill(resp)
+                    mark_trade_closed_from_broker(
+                        conn, trade, now_utc_iso(),
+                        safe_str(row.get("reason") or "queued_close"), info
+                    )
+            elif action == "UPDATE_STOP":
+                desired = safe_float(row.get("desired_stop_price"))
+                if desired is None:
+                    resp = {"ok": False, "error": "missing desired stop price"}
+                else:
+                    resp = update_broker_stop(
+                        safe_str(trade.get("broker_trade_id")),
+                        desired, safe_str(trade.get("trade_id"))
+                    )
+                    if resp.get("ok"):
+                        conn.execute("""
+                            UPDATE trades SET managed_stop_price=?,updated_at_utc=? WHERE trade_id=?
+                        """, (desired, now_utc_iso(), trade.get("trade_id")))
+            else:
+                resp = {"ok": False, "error": f"unsupported action {action}"}
+
+            if resp.get("ok"):
+                conn.execute("""
+                    UPDATE broker_action_queue
+                    SET status='DONE',attempts=?,last_attempt_at_utc=?,last_error='',
+                        broker_response_json=?,updated_at_utc=?,completed_at_utc=?
+                    WHERE id=?
+                """, (
+                    attempts, now_utc_iso(), json.dumps(resp.get("data") or resp)[:50000],
+                    now_utc_iso(), now_utc_iso(), qid
+                ))
+                success += 1
+            else:
+                final = attempts >= BCO_ACTION_RETRY_MAX_ATTEMPTS
+                conn.execute("""
+                    UPDATE broker_action_queue
+                    SET status=?,attempts=?,last_attempt_at_utc=?,last_error=?,
+                        broker_response_json=?,updated_at_utc=?
+                    WHERE id=?
+                """, (
+                    "FAILED_FINAL" if final else "RETRY", attempts, now_utc_iso(),
+                    safe_str(resp.get("error") or resp.get("response") or "broker action failed")[:3000],
+                    json.dumps(resp.get("data") or resp)[:50000], now_utc_iso(), qid
+                ))
+                failed += 1
+            processed += 1
+
+        finalize_pending_harvest_stages(conn)
+        runtime_set(conn, "broker_action_queue_last_run", now_utc_iso())
+    return {"ok": True, "processed": processed, "success": success, "failed": failed, "time_utc": now_utc_iso()}
 
 def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
     preview = risk_preview(BCO_RISK_PER_TRADE_GBP)
@@ -1036,13 +1709,16 @@ def mark_trade_closed(conn: DBConn, trade: Dict[str, Any], signal_time: str, exi
 def execute_or_sim_close(conn: DBConn, trade: Dict[str, Any], signal_time: str, exit_price: float, reason: str, rr: Optional[float] = None) -> Tuple[bool, float]:
     broker_id = safe_str(trade.get("broker_trade_id"))
     if broker_id:
-        # A broker-linked trade must never be marked locally closed unless this
-        # service is explicitly authorised to manage it and OANDA confirms the close.
         if not BCO_AUTO_MANAGEMENT_ENABLED:
+            enqueue_broker_action(conn, "CLOSE", trade, reason, error="auto management disabled")
             return False, 0.0
         resp = close_broker_trade(broker_id, safe_str(trade.get("trade_id")), reason)
         if not resp.get("ok"):
+            enqueue_broker_action(conn, "CLOSE", trade, reason, error=safe_str(resp.get("error") or "close failed"))
             return False, 0.0
+        info = _broker_close_fill(resp)
+        realized = mark_trade_closed_from_broker(conn, trade, signal_time, reason, info)
+        return True, realized
     realized = mark_trade_closed(conn, trade, signal_time, exit_price, reason, rr)
     return True, realized
 
@@ -1068,7 +1744,9 @@ def set_managed_stop(conn: DBConn, trade: Dict[str, Any], current: float, fracti
                     rule_stage,old_stop_price,new_stop_price,protect_fraction,protected_R,broker_write_success,note)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (now_utc_iso(),signal_time,trade.get("cycle_id"),trade.get("trade_id"),broker_id,trade.get("hold_candles"),event_type,
-                  stage,old,new,fraction,((new-entry)/entry*100.0)/BCO_SL_PCT,False,"Broker stop write failed; local stop NOT advanced."))
+                  stage,old,new,fraction,((new-entry)/entry*100.0)/BCO_SL_PCT,False,"Broker stop write failed; queued for durable retry; local stop NOT advanced."))
+            enqueue_broker_action(conn, "UPDATE_STOP", trade, f"{event_type}:{stage}", desired_stop_price=new,
+                                  error=safe_str(wr.get("error") or "stop write failed"))
             return False
     conn.execute("UPDATE trades SET managed_stop_price=?,managed_stop_stage=?,updated_at_utc=? WHERE trade_id=?", (new,stage,now_utc_iso(),trade.get("trade_id")))
     conn.execute("""
@@ -1080,7 +1758,7 @@ def set_managed_stop(conn: DBConn, trade: Dict[str, Any], current: float, fracti
     return True
 
 
-def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str, Any], support: Dict[str, Any]) -> Dict[str, Any]:
+def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str, Any], support: Dict[str, Any], raw_signal_id: Optional[int] = None) -> Dict[str, Any]:
     signal_time = safe_str(signal.get("timestamp_readable")); current = safe_float(signal.get("exec_close")); hi = safe_float(signal.get("exec_high")); lo = safe_float(signal.get("exec_low"))
     entry = safe_float(trade.get("entry_price"))
     if current is None or entry is None or entry <= 0: return {"closed":False}
@@ -1102,6 +1780,7 @@ def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str
     highest = max(float(safe_float(trade.get("highest_high")) or entry), hi)
     lowest = min(float(safe_float(trade.get("lowest_low")) or entry), lo)
     ret = (current-entry)/entry*100.0; mfe=max(0.0,(highest-entry)/entry*100.0); mae=min(0.0,(lowest-entry)/entry*100.0); rr=ret/BCO_SL_PCT
+    record_fixed_48_outcome(conn, trade, signal_time, float(current), rr, mfe, mae, hold)
     d48=safe_str(trade.get("decision_48")); d72=safe_str(trade.get("decision_72")); exit_now=False; reason=""
     reg=regime(conn)
     if hold >= 48 and not d48:
@@ -1121,12 +1800,20 @@ def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str
     """, (current,hold,highest,lowest,ret,mfe,mae,rr,d48,d72,now_utc_iso(),trade.get("trade_id")))
     if exit_now:
         refreshed=dict(trade); refreshed.update({"current_R":rr,"current_price":current,"hold_candles":hold,"decision_48":d48,"decision_72":d72})
+        record_manager_review(conn, raw_signal_id, refreshed, signal_time, hold, float(current), rr, mfe, mae, reg, support,
+                              "CLOSE_REQUESTED", reason, d48, d72)
         ok,_=execute_or_sim_close(conn,refreshed,signal_time,current,reason,rr)
         return {"closed":ok,"reason":reason,"R":rr}
     if hold >= BCO_MIN_HOLD_HOURS and rr > 0:
         fraction,stage=protect_fraction(hold)
         refreshed=dict(trade); refreshed.update({"current_price":current,"hold_candles":hold,"managed_stop_price":managed})
         set_managed_stop(conn,refreshed,float(current),fraction,stage,signal_time,"POST48_MANAGED_STOP")
+    if hold >= 48:
+        refreshed=dict(trade); refreshed.update({"current_R":rr,"current_price":current,"hold_candles":hold,
+                                                "decision_48":d48,"decision_72":d72})
+        record_manager_review(conn, raw_signal_id, refreshed, signal_time, hold, float(current), rr, mfe, mae, reg, support,
+                              "EXTEND" if not exit_now else "CLOSE_REQUESTED",
+                              "hourly_post48_review", d48, d72)
     return {"closed":False,"R":rr,"hold":hold}
 
 
@@ -1218,15 +1905,22 @@ def execute_protection(conn: DBConn, signal_time: str) -> Dict[str, Any]:
         if not selected:
             conn.execute("UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',updated_at_utc=? WHERE id=?",(now_utc_iso(),stage.get("id")))
             continue
+        selected_ids=[safe_str(t.get("trade_id")) for t in selected]
+        conn.execute("""UPDATE protection_stages
+                        SET status='EXECUTING',selected_trade_ids=?,updated_at_utc=?,reason=?
+                        WHERE id=?""",
+                     (",".join(selected_ids),now_utc_iso(),
+                      f"Closing whole trades against fixed target {target:.2f}R; durable retry active.",
+                      stage.get("id")))
         ids=[]; actual=0.0
         for t in selected:
             rr=float(safe_float(t.get("current_R")) or 0.0); px=float(safe_float(t.get("current_price")) or safe_float(t.get("entry_price")) or 0.0)
             ok,val=execute_or_sim_close(conn,t,signal_time,px,f"immediate_bank_{int(threshold)}R",rr)
-            if ok: actual+=val; ids.append(safe_str(t.get("trade_id")))
+            if ok:
+                actual+=val; ids.append(safe_str(t.get("trade_id")))
+        stage_result=finalize_harvest_stage(conn,int(stage.get("id") or 0),signal_time)
         if ids:
             banked+=actual; bank_ids.extend(ids)
-            conn.execute("UPDATE protection_stages SET status='EXECUTED',executed_R=?,executed_at_signal_time=?,selected_trade_ids=?,updated_at_utc=?,reason=? WHERE id=?",
-                         (actual,signal_time,",".join(ids),now_utc_iso(),f"Banked whole trades against fixed target {target:.2f}R.",stage.get("id")))
     if banked:
         conn.execute("UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,realized_R_cycle=COALESCE(realized_R_cycle,0)+?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
                      (banked,banked,now_utc_iso()))
@@ -1274,7 +1968,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         before=basket_metrics(conn)
         state=ensure_cycle(conn,signal_time,before)
         # Update existing trades before deciding defence/entry.
-        for t in list(before["rows"]): update_trade_on_signal(conn,t,signal,support)
+        for t in list(before["rows"]): update_trade_on_signal(conn,t,signal,support,raw_signal_id=raw_signal_id)
         mid=basket_metrics(conn); state=ensure_cycle(conn,signal_time,mid)
         old_hwm=float(safe_float(state.get("high_water_R")) or 0.0); hwm=max(old_hwm,float(mid["basket_R"]))
         flags=latest_payload_flags(payload)
@@ -1317,6 +2011,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
                 tide_status,manager_action,manager_detail,defence_closed_count,defence_trade_ids,banked_R_this_hour,banked_trade_ids,note)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,(now_utc_iso(),raw_signal_id,signal_time,final_state.get("cycle_id"),candidate,entry_allowed,entry_created,before["open_count"],final["open_count"],before["basket_R"],final["basket_R"],final_state.get("high_water_R"),final_state.get("giveback_pct"),final["losing_pct"],final["phase"],score,status,action,detail,defence.get("closed_count"),",".join(defence.get("closed_trade_ids") or []),protection.get("banked_R"),",".join(protection.get("banked_trade_ids") or []),f"entry_block={block_reason}; raw_action={raw_action}; reasons={','.join(reasons)}"))
+        record_basket_snapshot(conn, raw_signal_id, signal_time, final_state, final)
     return {"ok":True,"raw_signal_id":raw_signal_id,"candidate":candidate,"entry_allowed":entry_allowed,"entry_created":entry_created,"trade_id":new_trade_id,"basket":snapshot()}
 
 
@@ -1367,10 +2062,10 @@ def reconcile_broker() -> Dict[str,Any]:
                                 "broker_entry_price":safe_float(match.get("price")),
                                 "currentUnits":safe_float(match.get("currentUnits"))})
             else:
-                conn.execute("""UPDATE trades SET status='BROKER_CLOSED',
-                              exit_reason='broker_reconciliation_not_open',exit_time=?,updated_at_utc=?
-                              WHERE trade_id=?""",(now_utc_iso(),now_utc_iso(),t.get("trade_id")))
-                updates.append({"trade_id":t.get("trade_id"),"broker_trade_id":bid,"status":"BROKER_CLOSED"})
+                # Do not invent close economics. Transaction sync is authoritative.
+                conn.execute("""UPDATE trades SET exit_reason=CASE WHEN COALESCE(exit_reason,'')='' THEN 'awaiting_broker_close_transaction' ELSE exit_reason END,
+                              updated_at_utc=? WHERE trade_id=?""",(now_utc_iso(),t.get("trade_id")))
+                updates.append({"trade_id":t.get("trade_id"),"broker_trade_id":bid,"status":"AWAITING_CLOSE_TRANSACTION"})
 
         if BCO_AUTO_ENTRY_ENABLED and oanda_orders_allowed()[0]:
             local_only=fetchall_dict(conn.execute(
@@ -1388,12 +2083,15 @@ def reconcile_broker() -> Dict[str,Any]:
              "unrealizedPL":safe_float(t.get("unrealizedPL"))}
             for t in owned if safe_str(t.get("id")) not in local_ids
         ]
+    with _db_lock,get_conn() as _rc:
+        runtime_set(_rc,"broker_reconcile_last_at",now_utc_iso())
+    tx_sync=sync_broker_transactions() if BCO_TRANSACTION_SYNC_ENABLED else {"ok":False,"skipped":True}
     return {"ok":True,"owned_open_count":len(owned),
             "owned_unrealized_pl":live.get("owned_unrealized_pl"),
             "owned_margin_used":live.get("owned_margin_used"),
             "account_open_count":live.get("account_open_count"),
             "updates":updates,"local_only_cleaned":local_only_cleaned,
-            "unlinked_broker_trades":unlinked_broker,"time_utc":now_utc_iso()}
+            "unlinked_broker_trades":unlinked_broker,"transaction_sync":tx_sync,"time_utc":now_utc_iso()}
 
 
 def snapshot() -> Dict[str,Any]:
@@ -1455,7 +2153,9 @@ def _worker() -> None:
     while not _worker_stop.wait(BROKER_RECONCILE_INTERVAL_SECONDS):
         try:
             if OANDA_ENABLED and OANDA_ACCOUNT_ID:
+                process_broker_action_queue()
                 reconcile_broker()
+                record_accounting_snapshot()
         except Exception as e:
             log_event("reconcile_error", str(e))
 
@@ -1469,7 +2169,14 @@ def start_worker() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
-    init_db(); start_worker(); log_event("startup", APP_NAME, {"safety":safety_status()})
+    init_db()
+    try:
+        sync_broker_transactions()
+        record_accounting_snapshot()
+    except Exception as exc:
+        log_event("startup_sync_warning", str(exc))
+    start_worker()
+    log_event("startup", APP_NAME, {"safety":safety_status()})
 
 
 # -----------------------------------------------------------------------------
@@ -1485,13 +2192,115 @@ def check_admin(x_admin_secret: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="invalid admin secret")
 
 
+
+def record_accounting_snapshot() -> Dict[str, Any]:
+    live = bco_broker_live_snapshot()
+    if not live.get("ok"):
+        return {"ok": False, "error": live.get("error")}
+    acct = live.get("account") or {}
+    with _db_lock, get_conn() as conn:
+        realized = fetchone_dict(conn.execute("""
+            SELECT COALESCE(SUM(broker_realized_pl_home),0) AS pl,
+                   COALESCE(SUM(financing_home),0) AS fin
+            FROM trades WHERE status='CLOSED'
+        """)) or {}
+        capital = float(runtime_get(conn, "broker_capital_movements_total", "0") or 0.0)
+        cursor = runtime_get(conn, "broker_transaction_cursor", "")
+        conn.execute("""
+            INSERT INTO accounting_snapshots(
+                created_at_utc,account_nav,account_balance,bco_open_pl,bco_realized_pl,
+                bco_financing,capital_movements,broker_last_transaction_id,note
+            ) VALUES(?,?,?,?,?,?,?,?,?)
+        """, (
+            now_utc_iso(), safe_float(acct.get("NAV")), safe_float(acct.get("balance")),
+            safe_float(live.get("owned_unrealized_pl")) or 0.0,
+            safe_float(realized.get("pl")) or 0.0, safe_float(realized.get("fin")) or 0.0,
+            capital, cursor,
+            "Shared account NAV/balance; BCO open/realized/financing isolated by owned trades."
+        ))
+        runtime_set(conn, "accounting_snapshot_last_at", now_utc_iso())
+    return {"ok": True}
+
+
+def operational_health() -> Dict[str, Any]:
+    db_ok = True
+    db_error = ""
+    signal_time = ""
+    reconcile_time = ""
+    queue_last = ""
+    tx_sync_at = ""
+    queue_pending = queue_failed = local_open = 0
+    broker_open = None
+    local_broker_linked = 0
+    try:
+        with get_conn() as conn:
+            fetchone_dict(conn.execute("SELECT 1 AS ok"))
+            latest = fetchone_dict(conn.execute(
+                "SELECT received_at_utc,timestamp_readable FROM raw_signals ORDER BY id DESC LIMIT 1"
+            )) or {}
+            signal_time = safe_str(latest.get("received_at_utc") or latest.get("timestamp_readable"))
+            reconcile_time = runtime_get(conn, "broker_reconcile_last_at", "")
+            queue_last = runtime_get(conn, "broker_action_queue_last_run", "")
+            tx_sync_at = runtime_get(conn, "broker_transaction_sync_at", "")
+            q = fetchone_dict(conn.execute("""
+                SELECT
+                    SUM(CASE WHEN status IN ('PENDING','RETRY') THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status='FAILED_FINAL' THEN 1 ELSE 0 END) AS failed
+                FROM broker_action_queue
+            """)) or {}
+            queue_pending = int(safe_float(q.get("pending")) or 0)
+            queue_failed = int(safe_float(q.get("failed")) or 0)
+            tr = fetchone_dict(conn.execute("""
+                SELECT COUNT(*) AS c,
+                       SUM(CASE WHEN broker_trade_id IS NOT NULL AND broker_trade_id<>'' THEN 1 ELSE 0 END) AS linked
+                FROM trades WHERE status='OPEN'
+            """)) or {}
+            local_open = int(safe_float(tr.get("c")) or 0)
+            local_broker_linked = int(safe_float(tr.get("linked")) or 0)
+    except Exception as exc:
+        db_ok = False
+        db_error = str(exc)
+
+    broker = bco_broker_live_snapshot() if OANDA_ENABLED and OANDA_ACCOUNT_ID else {"ok": False}
+    if broker.get("ok"):
+        broker_open = int(broker.get("owned_open_count") or 0)
+
+    signal_age = _iso_age_seconds(signal_time)
+    reconcile_age = _iso_age_seconds(reconcile_time)
+    tx_age = _iso_age_seconds(tx_sync_at)
+
+    checks = {
+        "database": {"ok": db_ok, "error": db_error},
+        "signal_freshness": {
+            "ok": signal_age is None or signal_age <= BCO_HEALTH_SIGNAL_STALE_SECONDS,
+            "age_seconds": signal_age, "latest": signal_time,
+        },
+        "broker_read": {"ok": bool(broker.get("ok")), "owned_open_count": broker_open, "error": broker.get("error")},
+        "local_broker_parity": {
+            "ok": broker_open is None or (local_broker_linked == broker_open and local_open == local_broker_linked),
+            "local_open": local_open, "local_linked": local_broker_linked, "broker_open": broker_open,
+        },
+        "action_queue": {
+            "ok": queue_failed == 0, "pending": queue_pending, "failed_final": queue_failed, "last_run": queue_last,
+        },
+        "transaction_sync": {
+            "ok": (not BCO_TRANSACTION_SYNC_ENABLED) or (tx_sync_at != "" and (tx_age is None or tx_age <= max(BCO_HEALTH_RECONCILE_STALE_SECONDS*3, 600))),
+            "enabled": BCO_TRANSACTION_SYNC_ENABLED, "last_sync": tx_sync_at, "age_seconds": tx_age,
+        },
+        "reconciliation": {
+            "ok": reconcile_time == "" or reconcile_age is None or reconcile_age <= max(BCO_HEALTH_RECONCILE_STALE_SECONDS*3, 600),
+            "last_reconcile": reconcile_time, "age_seconds": reconcile_age,
+        },
+    }
+    overall = "ok" if all(bool(v.get("ok")) for v in checks.values()) else "degraded"
+    return {"status": overall, "checks": checks, "time_utc": now_utc_iso()}
+
 @app.get("/health")
 def health():
-    db_ok=True; db_error=""
-    try:
-        with get_conn() as conn: fetchone_dict(conn.execute("SELECT 1 AS ok"))
-    except Exception as e: db_ok=False; db_error=str(e)
-    return {"status":"ok" if db_ok else "degraded","app":APP_NAME,"version":APP_VERSION,"database":{"ok":db_ok,"postgres":USE_POSTGRES,"error":db_error},"safety":safety_status(),"time_utc":now_utc_iso()}
+    op=operational_health()
+    return {"status":op.get("status"),"app":APP_NAME,"version":APP_VERSION,
+            "database":{"postgres":USE_POSTGRES},"safety":safety_status(),
+            "operational":op,"time_utc":now_utc_iso()}
 
 
 @app.post("/webhook/tradingview")
@@ -1762,6 +2571,62 @@ def export_bco_focused_research_zip(limit:int=25000):
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-focused-research.zip"'})
 
 
+
+def _bco_export_table_csv(table: str, limit: int = 50000) -> Response:
+    limit = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)))
+    out = io.StringIO()
+    if rows:
+        fields = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fields:
+                    fields.append(key)
+        writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    else:
+        out.write("note\nNo rows yet\n")
+    return Response(content=out.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{table}.csv"'})
+
+
+@app.get("/export/broker-action-queue.csv")
+def export_broker_action_queue(limit: int = 50000):
+    return _bco_export_table_csv("broker_action_queue", limit)
+
+
+@app.get("/export/broker-transactions.csv")
+def export_broker_transactions(limit: int = 50000):
+    return _bco_export_table_csv("broker_transactions", limit)
+
+
+@app.get("/export/fixed-48-outcomes.csv")
+def export_fixed_48_outcomes(limit: int = 50000):
+    return _bco_export_table_csv("fixed_48_outcomes", limit)
+
+
+@app.get("/export/trade-manager-reviews.csv")
+def export_trade_manager_reviews(limit: int = 50000):
+    return _bco_export_table_csv("trade_manager_reviews", limit)
+
+
+@app.get("/export/basket-snapshots.csv")
+def export_basket_snapshots(limit: int = 50000):
+    return _bco_export_table_csv("basket_snapshots", limit)
+
+
+@app.get("/export/harvest-execution-outcomes.csv")
+def export_harvest_execution_outcomes(limit: int = 50000):
+    return _bco_export_table_csv("harvest_execution_outcomes", limit)
+
+
+@app.get("/export/accounting-snapshots.csv")
+def export_accounting_snapshots(limit: int = 50000):
+    return _bco_export_table_csv("accounting_snapshots", limit)
+
+
 # ============================================================
 # BCO v0.2.0 — PROJECT EXIT PLAN STANDARD DASHBOARD
 # ============================================================
@@ -1932,155 +2797,93 @@ def _bco_standard_broker_html():
     '''
 
 def _bco_standard_execution_html():
+    rec = reconcile_broker()
     with get_conn() as conn:
-        audits = fetchall_dict(conn.execute("SELECT * FROM execution_audit ORDER BY id DESC LIMIT 50"))
-        stops = fetchall_dict(conn.execute("SELECT * FROM managed_stop_events ORDER BY id DESC LIMIT 50"))
-        events = fetchall_dict(conn.execute("SELECT * FROM system_events ORDER BY id DESC LIMIT 50"))
-    return f'''
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">Execution Audit</div><div class="v">{len(audits)}</div></div>
-        <div class="mini-card"><div class="k">Managed Stops</div><div class="v">{len(stops)}</div></div>
-        <div class="mini-card"><div class="k">System Events</div><div class="v">{len(events)}</div></div>
-        <div class="mini-card"><div class="k">Scope</div><div class="v">BCO ONLY</div></div>
-      </div>
-      <div class="section-note small"><a href="/export/execution-audit.csv">execution audit CSV</a> · <a href="/export/managed-stops.csv">managed stops CSV</a> · <a href="/export/system-events.csv">system events CSV</a></div>
-    '''
+        audits = fetchall_dict(conn.execute("SELECT * FROM execution_audit ORDER BY id DESC LIMIT 30"))
+        stops = fetchall_dict(conn.execute("SELECT * FROM managed_stop_events ORDER BY id DESC LIMIT 30"))
+        events = fetchall_dict(conn.execute("SELECT * FROM system_events ORDER BY id DESC LIMIT 30"))
+        queue = fetchall_dict(conn.execute("SELECT * FROM broker_action_queue ORDER BY id DESC LIMIT 30"))
+        reviews = fetchall_dict(conn.execute("SELECT * FROM trade_manager_reviews ORDER BY id DESC LIMIT 30"))
+        fixed = fetchall_dict(conn.execute("SELECT * FROM fixed_48_outcomes ORDER BY id DESC LIMIT 30"))
+        harvest = fetchall_dict(conn.execute("SELECT * FROM harvest_execution_outcomes ORDER BY id DESC LIMIT 20"))
 
-def _bco_standard_signal_html():
-    s = snapshot()
-    latest = s.get("latest_signal") or {}
-    with get_conn() as conn:
-        recent = fetchall_dict(conn.execute("SELECT id,timestamp_readable,signal_id,candidate_8h,signal_side,exec_close,model_name FROM raw_signals ORDER BY id DESC LIMIT 25"))
-    rows = "".join(f'<tr><td>{esc(r.get("timestamp_readable"))}</td><td>{esc(r.get("signal_id"))}</td><td>{"TRUE" if parse_bool(r.get("candidate_8h")) else "FALSE"}</td><td>{esc(r.get("signal_side") or "-")}</td><td>{esc(r.get("exec_close"))}</td><td>{esc(r.get("model_name") or "-")}</td></tr>' for r in recent)
-    if not rows:
-        rows = "<tr><td colspan='6'>Waiting for BCO signals.</td></tr>"
-    return f'''
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">Latest Candidate</div><div class="v {"pos" if parse_bool(latest.get("candidate_8h")) else "neg"}>{"CANDIDATE" if parse_bool(latest.get("candidate_8h")) else "NO TRADE"}</div></div>
-        <div class="mini-card"><div class="k">Latest Signal</div><div class="v small">{esc(latest.get("timestamp_readable") or "-")}</div></div>
-        <div class="mini-card"><div class="k">Latest Price</div><div class="v">{safe_float(latest.get("exec_close")) or 0:.3f}</div></div>
-        <div class="mini-card"><div class="k">Direction</div><div class="v">{esc(BCO_DIRECTION.upper())}</div></div>
-      </div>
-      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Signal ID</th><th>Candidate</th><th>Side</th><th>Price</th><th>Model</th></tr></thead><tbody>{rows}</tbody></table></div>
-    '''
+    pending = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"PENDING","RETRY"})
+    failed_final = sum(1 for q in queue if safe_str(q.get("status")).upper() == "FAILED_FINAL")
+    audit_rows = "".join(
+        f"<tr><td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td><td>{esc(a.get('success'))}</td><td>{esc(a.get('trade_id'))}</td><td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td></tr>"
+        for a in audits
+    )
+    queue_rows = "".join(
+        f"<tr><td>{esc(q.get('created_at_utc'))}</td><td>{esc(q.get('action_type'))}</td><td>{esc(q.get('status'))}</td><td>{esc(q.get('local_trade_id'))}</td><td>{esc(q.get('broker_trade_id'))}</td><td>{esc(q.get('attempts'))}</td><td>{esc(q.get('last_error'))}</td></tr>"
+        for q in queue
+    )
+    review_rows = "".join(
+        f"<tr><td>{esc(r.get('signal_time'))}</td><td>{esc(r.get('trade_id'))}</td><td>{esc(r.get('hold_candles'))}</td><td>{_fmt_metric(r.get('current_R'),'R',2)}</td><td>{_fmt_metric(r.get('mfe_pct'),'%',2)}</td><td>{_fmt_metric(r.get('mae_pct'),'%',2)}</td><td>{esc(r.get('regime'))}</td><td>{esc(r.get('manager_decision'))}</td><td>{esc(r.get('manager_reason'))}</td></tr>"
+        for r in reviews
+    )
+    fixed_rows = "".join(
+        f"<tr><td>{esc(r.get('trade_id'))}</td><td>{esc(r.get('signal_time'))}</td><td>{_fmt_metric(r.get('fixed_48_R'),'R',2)}</td><td>{_money(r.get('fixed_48_pnl_gbp'))}</td><td>{_fmt_metric(r.get('mfe_pct'),'%',2)}</td><td>{_fmt_metric(r.get('mae_pct'),'%',2)}</td></tr>"
+        for r in fixed
+    )
+    harvest_rows = "".join(
+        f"<tr><td>{esc(r.get('threshold_R'))}R</td><td>{esc(r.get('selected_trade_ids'))}</td><td>{_fmt_metric(r.get('model_realized_R'),'R',2)}</td><td>{_money(r.get('broker_realized_pl_gbp'))}</td><td>{_money(r.get('financing_gbp'))}</td><td>{_money(r.get('net_realized_gbp'))}</td><td>{esc(r.get('sync_status'))}</td></tr>"
+        for r in harvest
+    )
 
-def _bco_standard_research_html():
-    return '''
-      <div class="section-note">BCO keeps its strategy-specific candidate model and 3.5% stop research. The surrounding dashboard, management, audit and protection conventions now follow the common Project Exit Plan standard.</div>
-      <div class="section-note small"><a href="/export/raw-signals.csv">raw signals CSV</a> · <a href="/export/trades.csv">trades CSV</a> · <a href="/export/basket-decisions.csv">basket decisions CSV</a> · <a href="/export/protection-stages.csv">protection stages CSV</a> · <a href="/export/all.zip">full BCO analysis ZIP</a></div>
-    '''
-
-
-def _bco_age_zone(hold):
-    h=int(safe_float(hold) or 0)
-    if h<48:return "YOUNG"
-    if h<72:return "48–72 EARLY"
-    if h<96:return "72–96 STRONG"
-    if h<120:return "96–120 MATURE"
-    return "120+ LATE"
-
-def _bco_standard_open_trades_html():
-    s=snapshot();local=s.get("open_trades") or [];live=s.get("broker_live") or {}
-    broker_map={safe_str(t.get("id")):t for t in (live.get("owned_open_trades") or [])}
-    local_bids={safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
-    rows="";linked=local_only=0
-    for t in local:
-        bid=safe_str(t.get("broker_trade_id"));bt=broker_map.get(bid) if bid else None
-        if bt:linked+=1
-        else:local_only+=1
-        rr=safe_float(t.get("current_R")) or 0.0
-        eff=safe_float(t.get("effective_risk_gbp")) or safe_float(t.get("requested_risk_gbp")) or BCO_RISK_PER_TRADE_GBP
-        model_pnl=rr*eff;upl=safe_float((bt or {}).get("unrealizedPL"))
-        rows+=f"""<tr><td>{esc(t.get('trade_id'))}</td><td>{esc(bid or 'LOCAL ONLY')}</td>
-        <td>{esc(t.get('entry_time'))}</td><td>{safe_float(t.get('entry_price')) or 0:.3f}</td>
-        <td>{safe_float(t.get('current_price')) or 0:.3f}</td><td>{int(safe_float(t.get('hold_candles')) or 0)}h</td>
-        <td>{esc(_bco_age_zone(t.get('hold_candles')))}</td><td class="{_pnl_class(rr)}">{rr:.3f}R</td>
-        <td class="{_pnl_class(model_pnl)}">{_money(model_pnl)}</td><td class="{_pnl_class(upl)}">{_money(upl)}</td>
-        <td>{safe_float(t.get('mfe_pct')) or 0:.3f}%</td><td>{safe_float(t.get('mae_pct')) or 0:.3f}%</td>
-        <td>{safe_float(t.get('hard_sl_price')) or 0:.3f}</td><td>{esc(t.get('managed_stop_stage') or '-')}</td>
-        <td>{_money(eff)}</td></tr>"""
-    broker_only=[t for t in (live.get("owned_open_trades") or []) if safe_str(t.get("id")) not in local_bids]
-    borows="".join(f"""<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td>
-        <td>{esc(t.get('currentUnits'))}</td><td>{safe_float(t.get('price')) or 0:.3f}</td>
-        <td class="{_pnl_class(t.get('unrealizedPL'))}">{_money(t.get('unrealizedPL'))}</td>
-        <td>{_money(t.get('marginUsed'))}</td><td>{esc(t.get('openTime'))}</td></tr>""" for t in broker_only)
-    return f"""
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">OANDA BCO Trades</div><div class="v">{int(live.get('owned_open_count') or 0)}</div><div class="small">Actual broker positions</div></div>
-        <div class="mini-card"><div class="k">Linked Local Trades</div><div class="v {'pos' if linked==int(live.get('owned_open_count') or 0) else 'warn'}">{linked}</div><div class="small">Local ↔ broker IDs matched</div></div>
-        <div class="mini-card"><div class="k">Local-Only OPEN</div><div class="v {'neg' if local_only else 'pos'}">{local_only}</div><div class="small">Should be zero in auto-entry mode</div></div>
-        <div class="mini-card"><div class="k">BCO Broker UPL</div><div class="v {_pnl_class(live.get('owned_unrealized_pl'))}">{_money(live.get('owned_unrealized_pl'))}</div><div class="small">Fresh OANDA unrealised P&amp;L</div></div>
-      </div>
-      <h3>Open BCO Trades — Local Manager + OANDA</h3>
-      <div class="table-scroll"><table><thead><tr>
-        <th>Local Trade</th><th>Broker ID</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>Age</th><th>Zone</th>
-        <th>Model R</th><th>Model £</th><th>OANDA UPL</th><th>MFE</th><th>MAE</th><th>Hard SL</th><th>Protection</th><th>Effective Risk</th>
-      </tr></thead><tbody>{rows or '<tr><td colspan="15">No local open BCO trades.</td></tr>'}</tbody></table></div>
-      {f'<h3>Broker-Only BCO Trades — Attention Required</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{borows}</tbody></table></div>' if borows else ''}
-    """
-
-def _bco_standard_basket_manager_html():
-    s=snapshot();b=s.get("basket") or {};lm=s.get("live_local_basket") or {};rows=s.get("open_trades") or []
-    with get_conn() as conn:
-        support=candidate_support(conn);reg=regime(conn)
-    rr=safe_float(lm.get("basket_R")) or 0.0;pnl=safe_float(lm.get("basket_pnl_gbp")) or 0.0
-    hwm=safe_float(b.get("high_water_R")) or 0.0;give=((hwm-rr)/hwm*100.0) if hwm>0 and rr<hwm else 0.0
-    losing=sum(1 for t in rows if (safe_float(t.get("current_R")) or 0)<0);lp=losing/len(rows)*100 if rows else 0.0
-    return f"""
-      <div class="section-note"><strong>BCO Basket Manager.</strong> 48h minimum normal hold; hourly review thereafter; staged defence; tighten-only runner protection; immediate profit harvesting at configured R levels.</div>
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(rr)}">{rr:.2f}R</div><div class="small">{_money(pnl)} model P&amp;L</div></div>
-        <div class="mini-card"><div class="k">High-Water</div><div class="v {_pnl_class(hwm)}">{hwm:.2f}R</div><div class="small">Giveback {give:.1f}%</div></div>
-        <div class="mini-card"><div class="k">Basket Phase</div><div class="v">{esc(b.get('basket_phase') or basket_phase_from_count(len(rows)))}</div><div class="small">{len(rows)} managed trades</div></div>
-        <div class="mini-card"><div class="k">Tide</div><div class="v">{esc(b.get('tide_status') or 'FLAT')}</div><div class="small">Score {esc(b.get('tide_score') or 0)}</div></div>
-        <div class="mini-card"><div class="k">Manager Action</div><div class="v small">{esc(b.get('manager_action') or 'NO_OPEN_BASKET')}</div><div class="small">{esc(b.get('manager_detail') or '')}</div></div>
-        <div class="mini-card"><div class="k">Losing Trades</div><div class="v {'neg' if lp>=60 else 'warn' if lp>=40 else 'pos'}">{lp:.1f}%</div><div class="small">{losing} / {len(rows)}</div></div>
-        <div class="mini-card"><div class="k">Regime</div><div class="v">{esc(reg)}</div><div class="small">120h directional context</div></div>
-        <div class="mini-card"><div class="k">Candidate Support</div><div class="v {'pos' if support.get('supported') else 'warn'}">{esc(support.get('candidate_true_last_3') or 0)}/3</div><div class="small">Latest {esc(support.get('latest_candidate'))}</div></div>
-      </div>
-      {_bco_standard_open_trades_html()}
-    """
-
-def _bco_standard_broker_html():
-    s=snapshot();safety=s.get("broker_safety") or {};live=s.get("broker_live") or {};acct=live.get("account") or {};preview=risk_preview()
-    rows="".join(f"""<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td><td>{esc(t.get('currentUnits'))}</td>
-      <td>{safe_float(t.get('price')) or 0:.3f}</td><td class="{_pnl_class(t.get('unrealizedPL'))}">{_money(t.get('unrealizedPL'))}</td>
-      <td>{_money(t.get('marginUsed'))}</td><td>{esc(t.get('openTime'))}</td></tr>""" for t in (live.get("owned_open_trades") or []))
-    return f"""
-      <div class="section-note warn"><strong>{'LIVE' if OANDA_ENV=='live' else 'DEMO / PRACTICE'} BROKER LANE.</strong> Only {esc(BCO_OANDA_INSTRUMENT)} is owned here. Account NAV is shared; BCO P&amp;L is filtered to BCO only.</div>
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{_money(acct.get('NAV'))}</div><div class="small">Balance {_money(acct.get('balance'))}</div></div>
-        <div class="mini-card"><div class="k">BCO Open P&amp;L</div><div class="v {_pnl_class(live.get('owned_unrealized_pl'))}">{_money(live.get('owned_unrealized_pl'))}</div><div class="small">Fresh OANDA BCO-only UPL</div></div>
-        <div class="mini-card"><div class="k">BCO Broker Trades</div><div class="v">{int(live.get('owned_open_count') or 0)}</div><div class="small">Account total {int(live.get('account_open_count') or 0)}</div></div>
-        <div class="mini-card"><div class="k">BCO Margin Used</div><div class="v">{_money(live.get('owned_margin_used'))}</div></div>
-        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {'pos' if safety.get('orders_allowed') else 'warn'}">{'ENABLED' if safety.get('orders_allowed') else 'LOCKED'}</div><div class="small">{esc(safety.get('reason'))}</div></div>
-        <div class="mini-card"><div class="k">Auto Entry</div><div class="v {'pos' if safety.get('auto_entry') else 'warn'}">{'ON' if safety.get('auto_entry') else 'OFF'}</div></div>
-        <div class="mini-card"><div class="k">Auto Management</div><div class="v {'pos' if safety.get('auto_management') else 'warn'}">{'ON' if safety.get('auto_management') else 'OFF'}</div></div>
-        <div class="mini-card"><div class="k">Risk Preview</div><div class="v">{_money(preview.get('effective_risk_gbp'))}</div><div class="small">Target {_money(preview.get('target_risk_gbp'))} · {esc(preview.get('units') or '-')} units</div></div>
-      </div>
-      <h3>Actual OANDA BCO Open Trades</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="7">No OANDA BCO trades open.</td></tr>'}</tbody></table></div>
-      <div class="section-note small"><strong>Balance vs NAV:</strong> balance moves when P&amp;L is realised; NAV moves with open unrealised P&amp;L. <a href="/broker/risk-preview">risk preview</a> · <a href="/snapshot">full snapshot JSON</a></div>
-    """
-
-def _bco_standard_execution_html():
-    rec=reconcile_broker()
-    with get_conn() as conn:
-        audits=fetchall_dict(conn.execute("SELECT * FROM execution_audit ORDER BY id DESC LIMIT 30"))
-        stops=fetchall_dict(conn.execute("SELECT * FROM managed_stop_events ORDER BY id DESC LIMIT 30"))
-        events=fetchall_dict(conn.execute("SELECT * FROM system_events ORDER BY id DESC LIMIT 30"))
-    ar="".join(f"<tr><td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td><td>{esc(a.get('success'))}</td><td>{esc(a.get('trade_id'))}</td><td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td></tr>" for a in audits)
-    er="".join(f"<tr><td>{esc(x.get('created_at_utc'))}</td><td>{esc(x.get('event_type'))}</td><td>{esc(x.get('message'))}</td></tr>" for x in events)
     return f"""
       <div class="metric-grid">
         <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if rec.get('ok') else 'neg'}">{'SAFE' if rec.get('ok') else 'ERROR'}</div><div class="small">{int(rec.get('owned_open_count') or 0)} OANDA BCO trades</div></div>
-        <div class="mini-card"><div class="k">Local-only Cleaned</div><div class="v {'warn' if rec.get('local_only_cleaned') else 'pos'}">{len(rec.get('local_only_cleaned') or [])}</div><div class="small">{esc(', '.join(rec.get('local_only_cleaned') or []) or 'none')}</div></div>
-        <div class="mini-card"><div class="k">Unlinked Broker Trades</div><div class="v {'neg' if rec.get('unlinked_broker_trades') else 'pos'}">{len(rec.get('unlinked_broker_trades') or [])}</div></div>
+        <div class="mini-card"><div class="k">Queued Broker Actions</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">Durable close/stop retries</div></div>
+        <div class="mini-card"><div class="k">Failed Final Actions</div><div class="v {'neg' if failed_final else 'pos'}">{failed_final}</div></div>
         <div class="mini-card"><div class="k">Managed Stop Events</div><div class="v">{len(stops)}</div></div>
       </div>
-      <h3>Recent Execution Audit</h3><div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Success</th><th>Local Trade</th><th>Broker ID</th><th>Message</th></tr></thead><tbody>{ar or '<tr><td colspan="6">No audit rows.</td></tr>'}</tbody></table></div>
-      <h3>Recent System Events</h3><div class="table-scroll"><table><thead><tr><th>Time</th><th>Event</th><th>Message</th></tr></thead><tbody>{er or '<tr><td colspan="3">No events.</td></tr>'}</tbody></table></div>
+
+      <h3>Durable Broker Action Queue</h3>
+      <div class="table-scroll"><table><thead><tr><th>Created</th><th>Action</th><th>Status</th><th>Local Trade</th><th>Broker ID</th><th>Attempts</th><th>Last Error</th></tr></thead>
+      <tbody>{queue_rows or '<tr><td colspan="7">No queued actions.</td></tr>'}</tbody></table></div>
+
+      <h3>Recent Post-48 Manager Reviews</h3>
+      <div class="table-scroll"><table><thead><tr><th>Signal</th><th>Trade</th><th>Age</th><th>R</th><th>MFE</th><th>MAE</th><th>Regime</th><th>Decision</th><th>Reason</th></tr></thead>
+      <tbody>{review_rows or '<tr><td colspan="9">No 48h+ reviews yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Fixed-48h Control Outcomes</h3>
+      <div class="table-scroll"><table><thead><tr><th>Trade</th><th>48h Signal</th><th>48h R</th><th>48h £</th><th>MFE</th><th>MAE</th></tr></thead>
+      <tbody>{fixed_rows or '<tr><td colspan="6">No matured 48h controls yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Harvest Execution — Broker GBP</h3>
+      <div class="table-scroll"><table><thead><tr><th>Threshold</th><th>Trades</th><th>Realised R</th><th>Broker P/L</th><th>Financing</th><th>Net £</th><th>Sync</th></tr></thead>
+      <tbody>{harvest_rows or '<tr><td colspan="7">No executed harvest stages yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Recent Execution Audit</h3>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Success</th><th>Local Trade</th><th>Broker ID</th><th>Message</th></tr></thead>
+      <tbody>{audit_rows or '<tr><td colspan="6">No audit rows.</td></tr>'}</tbody></table></div>
+
+      <div class="section-note small">
+        <a href="/export/broker-action-queue.csv">broker action queue</a> ·
+        <a href="/export/broker-transactions.csv">broker transactions</a> ·
+        <a href="/export/fixed-48-outcomes.csv">fixed-48 outcomes</a> ·
+        <a href="/export/trade-manager-reviews.csv">manager reviews</a> ·
+        <a href="/export/basket-snapshots.csv">basket snapshots</a> ·
+        <a href="/export/harvest-execution-outcomes.csv">harvest GBP outcomes</a> ·
+        <a href="/export/accounting-snapshots.csv">accounting snapshots</a>
+      </div>
     """
+
+
+def _bco_standard_health_html():
+    h = operational_health()
+    checks = h.get("checks") or {}
+    cards = ""
+    for name, item in checks.items():
+        ok = bool(item.get("ok"))
+        detail = " · ".join(f"{k}={v}" for k,v in item.items() if k != "ok" and v not in (None,""))
+        cards += f'<div class="mini-card"><div class="k">{esc(name.replace("_"," ").title())}</div><div class="v {"pos" if ok else "neg"}>{"OK" if ok else "CHECK"}</div><div class="small">{esc(detail)}</div></div>'
+    return f"""
+      <div class="section-note"><strong>Operational Health.</strong> Signal freshness, OANDA read access, local↔broker parity, durable retry queue, transaction sync and reconciliation freshness.</div>
+      <div class="metric-grid">{cards}</div>
+      <div class="section-note small"><a href="/health">full health JSON</a></div>
+    """
+
 
 _BCO_STD_SECTIONS = {
     "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
@@ -2088,6 +2891,7 @@ _BCO_STD_SECTIONS = {
     "profit-harvesting": ("Profit Harvesting / Protection Plan", _bco_standard_profit_harvesting_html),
     "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_html),
     "execution": ("Execution / Reconciliation", _bco_standard_execution_html),
+    "operational-health": ("Operational Health / Pipeline", _bco_standard_health_html),
     "signals": ("Signal State", _bco_standard_signal_html),
     "research": ("BCO Research / Evidence Lab", build_bco_focused_research_html),
 }
@@ -2116,6 +2920,7 @@ def bco_standard_dashboard():
         _bco_std_placeholder("profit-harvesting", "Profit Harvesting / Protection Plan", "100R / 200R / 300R immediate banking and exceptional cohort ratchets."),
         _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO-only OANDA lane, account view and risk sizing."),
         _bco_std_placeholder("execution", "Execution / Reconciliation", "Audit, managed stops and ownership safety."),
+        _bco_std_placeholder("operational-health", "Operational Health / Pipeline", "Signal freshness, OANDA parity, durable retry queue, transaction/accounting sync and reconciliation freshness."),
         _bco_std_placeholder("signals", "Signal State", "Latest BCO candidate and recent signal history."),
         _bco_std_placeholder("research", "BCO Research / Evidence Lab", "High-water/banking outcomes, multi-horizon alignment, trend efficiency and basket recovery. Everything inside remains collapsed until opened."),
     ])
