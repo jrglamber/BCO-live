@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.6 — Giveback Cash Tile"
-APP_VERSION = "0.4.6"
-POLICY_VERSION = "bco_v0.4.6_giveback_cash_tile"
+APP_NAME = "Project Exit Plan — BCO v0.4.7 — Giveback Tile Parity"
+APP_VERSION = "0.4.7"
+POLICY_VERSION = "bco_v0.4.7_giveback_tile_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -3164,7 +3164,7 @@ async function loadTop(force=false){{const st=document.getElementById('topStatus
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
 ${{card('Broker P&L',money(s.total_pnl),`BCO UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
 ${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
-${{card('Giveback',money(s.giveback_gbp),`${{Number(s.giveback_r||0).toFixed(2)}}R · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
+${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
