@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.4 — Nonblocking Railway Startup"
-APP_VERSION = "0.4.4"
-POLICY_VERSION = "bco_v0.4.4_nonblocking_railway_startup"
+APP_NAME = "Project Exit Plan — BCO v0.4.5 — Import Fix"
+APP_VERSION = "0.4.5"
+POLICY_VERSION = "bco_v0.4.5_import_fix"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2780,6 +2780,139 @@ def bco_standard_top_snapshot(force=False):
 @app.get("/dashboard/top")
 def bco_standard_top_route(force: bool = False):
     return bco_standard_top_snapshot(force=force)
+
+
+def _bco_standard_signal_html():
+    s = snapshot()
+    latest = s.get("latest_signal") or {}
+    with get_conn() as conn:
+        recent = fetchall_dict(conn.execute(
+            """SELECT id,timestamp_readable,signal_id,candidate_8h,signal_side,
+                      exec_close,model_name
+               FROM raw_signals ORDER BY id DESC LIMIT 25"""
+        ))
+    rows = "".join(
+        f'<tr><td>{esc(r.get("timestamp_readable"))}</td>'
+        f'<td>{esc(r.get("signal_id"))}</td>'
+        f'<td>{"TRUE" if parse_bool(r.get("candidate_8h")) else "FALSE"}</td>'
+        f'<td>{esc(r.get("signal_side") or "-")}</td>'
+        f'<td>{esc(r.get("exec_close"))}</td>'
+        f'<td>{esc(r.get("model_name") or "-")}</td></tr>'
+        for r in recent
+    )
+    if not rows:
+        rows = "<tr><td colspan='6'>Waiting for BCO signals.</td></tr>"
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Latest Candidate</div>
+          <div class="v {'pos' if parse_bool(latest.get('candidate_8h')) else 'neg'}">
+            {'CANDIDATE' if parse_bool(latest.get('candidate_8h')) else 'NO TRADE'}
+          </div></div>
+        <div class="mini-card"><div class="k">Latest Signal</div>
+          <div class="v small">{esc(latest.get('timestamp_readable') or '-')}</div></div>
+        <div class="mini-card"><div class="k">Latest Price</div>
+          <div class="v">{safe_float(latest.get('exec_close')) or 0:.3f}</div></div>
+        <div class="mini-card"><div class="k">Direction</div>
+          <div class="v">{esc(BCO_DIRECTION.upper())}</div></div>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Time</th><th>Signal ID</th><th>Candidate</th>
+        <th>Side</th><th>Price</th><th>Model</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table></div>
+    """
+
+
+def _bco_standard_open_trades_html():
+    s=snapshot()
+    local=s.get("open_trades") or []
+    live=s.get("broker_live") or {}
+    broker_map={safe_str(t.get("id")):t for t in (live.get("owned_open_trades") or [])}
+    local_bids={safe_str(t.get("broker_trade_id")) for t in local if safe_str(t.get("broker_trade_id"))}
+    rows=""
+    linked=0
+    local_only=0
+
+    for t in local:
+        bid=safe_str(t.get("broker_trade_id"))
+        bt=broker_map.get(bid) if bid else None
+        if bt:
+            linked+=1
+        else:
+            local_only+=1
+        rr=safe_float(t.get("current_R")) or 0.0
+        eff=(
+            safe_float(t.get("effective_risk_gbp"))
+            or safe_float(t.get("requested_risk_gbp"))
+            or BCO_RISK_PER_TRADE_GBP
+        )
+        model_pnl=rr*eff
+        upl=safe_float((bt or {}).get("unrealizedPL"))
+        rows+=f"""<tr>
+          <td>{esc(t.get('trade_id'))}</td>
+          <td>{esc(bid or 'LOCAL ONLY')}</td>
+          <td>{esc(t.get('entry_time'))}</td>
+          <td>{safe_float(t.get('entry_price')) or 0:.3f}</td>
+          <td>{safe_float(t.get('current_price')) or 0:.3f}</td>
+          <td>{int(safe_float(t.get('hold_candles')) or 0)}h</td>
+          <td>{esc(_bco_age_zone(t.get('hold_candles')))}</td>
+          <td class="{_pnl_class(rr)}">{rr:.3f}R</td>
+          <td class="{_pnl_class(model_pnl)}">{_money(model_pnl)}</td>
+          <td class="{_pnl_class(upl)}">{_money(upl)}</td>
+          <td>{safe_float(t.get('mfe_pct')) or 0:.3f}%</td>
+          <td>{safe_float(t.get('mae_pct')) or 0:.3f}%</td>
+          <td>{safe_float(t.get('hard_sl_price')) or 0:.3f}</td>
+          <td>{esc(t.get('managed_stop_stage') or '-')}</td>
+          <td>{_money(eff)}</td>
+        </tr>"""
+
+    broker_only=[
+        t for t in (live.get("owned_open_trades") or [])
+        if safe_str(t.get("id")) not in local_bids
+    ]
+    broker_only_rows="".join(
+        f"""<tr>
+          <td>{esc(t.get('id'))}</td>
+          <td>{esc(t.get('instrument'))}</td>
+          <td>{esc(t.get('currentUnits'))}</td>
+          <td>{safe_float(t.get('price')) or 0:.3f}</td>
+          <td class="{_pnl_class(t.get('unrealizedPL'))}">{_money(t.get('unrealizedPL'))}</td>
+          <td>{_money(t.get('marginUsed'))}</td>
+          <td>{esc(t.get('openTime'))}</td>
+        </tr>"""
+        for t in broker_only
+    )
+
+    return f"""
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">OANDA BCO Trades</div>
+          <div class="v">{int(live.get('owned_open_count') or 0)}</div>
+          <div class="small">Actual broker positions</div></div>
+        <div class="mini-card"><div class="k">Linked Local Trades</div>
+          <div class="v {'pos' if linked==int(live.get('owned_open_count') or 0) else 'warn'}">{linked}</div>
+          <div class="small">Local ↔ broker IDs matched</div></div>
+        <div class="mini-card"><div class="k">Local-Only OPEN</div>
+          <div class="v {'neg' if local_only else 'pos'}">{local_only}</div>
+          <div class="small">Should be zero in auto-entry mode</div></div>
+        <div class="mini-card"><div class="k">BCO Broker UPL</div>
+          <div class="v {_pnl_class(live.get('owned_unrealized_pl'))}">{_money(live.get('owned_unrealized_pl'))}</div>
+          <div class="small">Fresh OANDA unrealised P&amp;L</div></div>
+      </div>
+
+      <h3>Open BCO Trades — Local Manager + OANDA</h3>
+      <div class="table-scroll"><table>
+        <thead><tr>
+          <th>Local Trade</th><th>Broker ID</th><th>Entry Time</th><th>Entry</th>
+          <th>Current</th><th>Age</th><th>Zone</th><th>Model R</th><th>Model £</th>
+          <th>OANDA UPL</th><th>MFE</th><th>MAE</th><th>Hard SL</th>
+          <th>Protection</th><th>Effective Risk</th>
+        </tr></thead>
+        <tbody>{rows or '<tr><td colspan="15">No local open BCO trades.</td></tr>'}</tbody>
+      </table></div>
+
+      {f'<h3>Broker-Only BCO Trades — Attention Required</h3><div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead><tbody>{broker_only_rows}</tbody></table></div>' if broker_only_rows else ''}
+    """
+
 
 def _bco_standard_basket_manager_html():
     s = snapshot()
