@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.3 — Railway Health Fix"
-APP_VERSION = "0.4.3"
-POLICY_VERSION = "bco_v0.4.3_railway_health_fix"
+APP_NAME = "Project Exit Plan — BCO v0.4.4 — Nonblocking Railway Startup"
+APP_VERSION = "0.4.4"
+POLICY_VERSION = "bco_v0.4.4_nonblocking_railway_startup"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2167,16 +2167,54 @@ def start_worker() -> None:
     threading.Thread(target=_worker,name="bco-broker-reconcile",daemon=True).start()
 
 
+_bootstrap_started = False
+_bootstrap_lock = threading.Lock()
+_bootstrap_state = {
+    "status": "NOT_STARTED",
+    "started_at_utc": "",
+    "completed_at_utc": "",
+    "error": "",
+}
+
+def _background_bootstrap() -> None:
+    _bootstrap_state["status"] = "INITIALIZING_DATABASE"
+    _bootstrap_state["started_at_utc"] = now_utc_iso()
+    try:
+        init_db()
+        _bootstrap_state["status"] = "STARTING_WORKER"
+        start_worker()
+        try:
+            log_event("startup", APP_NAME, {"safety": safety_status()})
+        except Exception:
+            pass
+        _bootstrap_state["status"] = "READY"
+        _bootstrap_state["completed_at_utc"] = now_utc_iso()
+    except Exception as exc:
+        _bootstrap_state["status"] = "FAILED"
+        _bootstrap_state["error"] = str(exc)
+        _bootstrap_state["completed_at_utc"] = now_utc_iso()
+        try:
+            print(f"BCO background bootstrap failed: {exc}", flush=True)
+        except Exception:
+            pass
+
 @app.on_event("startup")
 def startup_event() -> None:
-    # Keep Railway startup local and fast. OANDA/accounting work is handled
-    # by the existing background worker after the service is already live.
-    init_db()
-    start_worker()
-    try:
-        log_event("startup", APP_NAME, {"safety":safety_status()})
-    except Exception:
-        pass
+    """
+    Railway/Uvicorn must be allowed to bind immediately.
+    Database migrations and the broker worker are intentionally deferred to
+    a daemon thread so slow Postgres DDL can never block the platform healthcheck.
+    """
+    global _bootstrap_started
+    with _bootstrap_lock:
+        if _bootstrap_started:
+            return
+        _bootstrap_started = True
+        threading.Thread(
+            target=_background_bootstrap,
+            name="bco-background-bootstrap",
+            daemon=True,
+        ).start()
 
 
 # -----------------------------------------------------------------------------
@@ -2297,21 +2335,28 @@ def operational_health() -> Dict[str, Any]:
 
 @app.get("/health")
 def health():
-    """Fast Railway liveness check. No OANDA/network calls."""
-    db_ok=True
-    db_error=""
-    try:
-        with get_conn() as conn:
-            fetchone_dict(conn.execute("SELECT 1 AS ok"))
-    except Exception as exc:
-        db_ok=False
-        db_error=str(exc)
+    """
+    Railway liveness only. Must always return immediately once Uvicorn is bound.
+    Database/broker readiness is deliberately NOT part of platform liveness.
+    """
     return {
-        "status":"ok" if db_ok else "degraded",
-        "app":APP_NAME,
-        "version":APP_VERSION,
-        "database":{"ok":db_ok,"postgres":USE_POSTGRES,"error":db_error},
-        "time_utc":now_utc_iso()
+        "status": "ok",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "bootstrap": dict(_bootstrap_state),
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/ready")
+def ready():
+    """Application readiness separate from Railway liveness."""
+    status = safe_str(_bootstrap_state.get("status")).upper()
+    return {
+        "status": "ok" if status == "READY" else "initializing" if status not in {"FAILED"} else "degraded",
+        "ready": status == "READY",
+        "bootstrap": dict(_bootstrap_state),
+        "time_utc": now_utc_iso(),
     }
 
 
@@ -2899,6 +2944,12 @@ def _bco_standard_execution_html():
 
 @app.get("/operational-health")
 def operational_health_endpoint():
+    if safe_str(_bootstrap_state.get("status")).upper() != "READY":
+        return {
+            "status": "initializing" if safe_str(_bootstrap_state.get("status")).upper() != "FAILED" else "degraded",
+            "bootstrap": dict(_bootstrap_state),
+            "time_utc": now_utc_iso(),
+        }
     return operational_health()
 
 
@@ -2913,7 +2964,7 @@ def _bco_standard_health_html():
     return f"""
       <div class="section-note"><strong>Operational Health.</strong> Signal freshness, OANDA read access, local↔broker parity, durable retry queue, transaction sync and reconciliation freshness.</div>
       <div class="metric-grid">{cards}</div>
-      <div class="section-note small"><a href="/operational-health">full operational health JSON</a> · <a href="/health">Railway liveness</a></div>
+      <div class="section-note small"><a href="/operational-health">full operational health JSON</a> · <a href="/ready">application readiness</a> · <a href="/health">Railway liveness</a></div>
     """
 
 
