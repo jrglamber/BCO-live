@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.7 — Giveback Tile Parity"
-APP_VERSION = "0.4.7"
-POLICY_VERSION = "bco_v0.4.7_giveback_tile_parity"
+APP_NAME = "Project Exit Plan — BCO v0.4.9 — Audit Hardening"
+APP_VERSION = "0.4.9"
+POLICY_VERSION = "bco_v0.4.9_audit_hardening"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1219,6 +1219,20 @@ def record_fixed_48_outcome(
     ))
 
 
+
+def _bco_age_zone(hold: Any) -> str:
+    h = int(safe_float(hold) or 0)
+    if h < 48:
+        return "YOUNG"
+    if h < 72:
+        return "48–72 EARLY"
+    if h < 96:
+        return "72–96 STRONG"
+    if h < 120:
+        return "96–120 MATURE"
+    return "120+ LATE"
+
+
 def record_manager_review(
     conn: DBConn,
     raw_signal_id: Optional[int],
@@ -2270,13 +2284,27 @@ def operational_health() -> Dict[str, Any]:
     queue_pending = queue_failed = local_open = 0
     broker_open = None
     local_broker_linked = 0
+    latest_raw_id = 0
+    latest_decision_raw_id = 0
+    latest_processing_error = ""
     try:
         with get_conn() as conn:
             fetchone_dict(conn.execute("SELECT 1 AS ok"))
             latest = fetchone_dict(conn.execute(
-                "SELECT received_at_utc,timestamp_readable FROM raw_signals ORDER BY id DESC LIMIT 1"
+                "SELECT id,received_at_utc,timestamp_readable FROM raw_signals ORDER BY id DESC LIMIT 1"
             )) or {}
             signal_time = safe_str(latest.get("received_at_utc") or latest.get("timestamp_readable"))
+            latest_raw_id = int(safe_float(latest.get("id")) or 0)
+            _dec = fetchone_dict(conn.execute(
+                "SELECT raw_signal_id FROM basket_decisions ORDER BY id DESC LIMIT 1"
+            )) or {}
+            latest_decision_raw_id = int(safe_float(_dec.get("raw_signal_id")) or 0)
+            _err = fetchone_dict(conn.execute(
+                """SELECT message FROM system_events
+                   WHERE event_type='signal_processing_error'
+                   ORDER BY id DESC LIMIT 1"""
+            )) or {}
+            latest_processing_error = safe_str(_err.get("message"))
             reconcile_time = runtime_get(conn, "broker_reconcile_last_at", "")
             queue_last = runtime_get(conn, "broker_action_queue_last_run", "")
             tx_sync_at = runtime_get(conn, "broker_transaction_sync_at", "")
@@ -2312,6 +2340,13 @@ def operational_health() -> Dict[str, Any]:
         "signal_freshness": {
             "ok": signal_age is None or signal_age <= BCO_HEALTH_SIGNAL_STALE_SECONDS,
             "age_seconds": signal_age, "latest": signal_time,
+        },
+        "signal_processing": {
+            "ok": latest_raw_id == 0 or latest_decision_raw_id >= latest_raw_id,
+            "latest_raw_signal_id": latest_raw_id,
+            "latest_decision_raw_signal_id": latest_decision_raw_id,
+            "lag": max(0, latest_raw_id-latest_decision_raw_id),
+            "last_processing_error": latest_processing_error,
         },
         "broker_read": {"ok": bool(broker.get("ok")), "owned_open_count": broker_open, "error": broker.get("error")},
         "local_broker_parity": {
@@ -2463,7 +2498,7 @@ def dashboard_full():
     if not rows: rows="<tr><td colspan='9'>No open BCO trades.</td></tr>"
     allowed="YES" if safety.get("orders_allowed") else "NO — LOCKED"
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='60'><title>{esc(APP_NAME)}</title><style>
-    body{{background:#0b1220;color:#e5e7eb;font-family:Arial,sans-serif;margin:22px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}} .card{{background:#111827;border:1px solid #243044;border-radius:10px;padding:14px}} .label{{color:#94a3b8;font-size:12px;text-transform:uppercase}} .value{{font-size:24px;font-weight:700;margin-top:5px}} .ok{{color:#86efac}} .bad{{color:#fca5a5}} table{{width:100%;border-collapse:collapse;background:#111827;margin-top:12px}} th,td{{padding:8px;border-bottom:1px solid #243044;text-align:left;font-size:13px}} a{{color:#7dd3fc}} code{{color:#fde68a}} .note{{background:#172033;padding:10px;border-radius:8px;margin:12px 0}}.research-inner{margin:7px 10px}.research-inner>summary{background:#11161d;border-left-color:#315f39}.research-inner-body{padding:0}</style></head><body>
+    body{{background:#0b1220;color:#e5e7eb;font-family:Arial,sans-serif;margin:22px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}} .card{{background:#111827;border:1px solid #243044;border-radius:10px;padding:14px}} .label{{color:#94a3b8;font-size:12px;text-transform:uppercase}} .value{{font-size:24px;font-weight:700;margin-top:5px}} .ok{{color:#86efac}} .bad{{color:#fca5a5}} table{{width:100%;border-collapse:collapse;background:#111827;margin-top:12px}} th,td{{padding:8px;border-bottom:1px solid #243044;text-align:left;font-size:13px}} a{{color:#7dd3fc}} code{{color:#fde68a}} .note{{background:#172033;padding:10px;border-radius:8px;margin:12px 0}}.research-inner{{margin:7px 10px}}.research-inner>summary{{background:#11161d;border-left-color:#315f39}}.research-inner-body{{padding:0}}</style></head><body>
     <h1>BCO Live</h1><div class='note'>Production bootstrap. Shared OANDA account may be read, but this service owns <strong>BCO only</strong>. Initial live v1 is LONG-only, £{BCO_RISK_PER_TRADE_GBP:.2f}/R requested, {BCO_SL_PCT:.2f}% SL, 48h minimum then hourly management.</div>
     <div class='grid'>
       <div class='card'><div class='label'>Broker writes</div><div class='value {'ok' if safety.get('orders_allowed') else 'bad'}'>{allowed}</div><div>{esc(safety.get('reason'))}</div></div>
@@ -2739,6 +2774,11 @@ def _bco_standard_top_uncached():
     with get_conn() as conn:
         wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ws.isoformat(),)).fetchone()
         mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ms.isoformat(),)).fetchone()
+        _raw_latest=fetchone_dict(conn.execute("SELECT id FROM raw_signals ORDER BY id DESC LIMIT 1")) or {}
+        _dec_latest=fetchone_dict(conn.execute("SELECT raw_signal_id FROM basket_decisions ORDER BY id DESC LIMIT 1")) or {}
+        _latest_raw_id=int(safe_float(_raw_latest.get("id")) or 0)
+        _latest_decision_id=int(safe_float(_dec_latest.get("raw_signal_id")) or 0)
+        _processor_ok=(_latest_raw_id==0 or _latest_decision_id>=_latest_raw_id)
     return {
       "status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
       "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),
@@ -2762,7 +2802,11 @@ def _bco_standard_top_uncached():
                  "latest_time":safe_str(latest.get("timestamp_readable")),
                  "latest_price":safe_float(latest.get("exec_close")),
                  "latest_signal_id":safe_str(latest.get("signal_id")),
-                 "received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1},
+                 "received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1,
+                 "processor_ok":_processor_ok,
+                 "latest_raw_id":_latest_raw_id,
+                 "latest_decision_raw_id":_latest_decision_id,
+                 "processing_lag":max(0,_latest_raw_id-_latest_decision_id)},
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
 
@@ -2963,7 +3007,7 @@ def _bco_standard_profit_harvesting_html():
         banks.append(f'''
         <tr>
           <td>{threshold:.0f}R</td><td>{esc(m.get("status") or "NOT_ARMED")}</td><td>{fraction*100:.0f}%</td>
-          <td>{target:.2f}R</td><td class="{_pnl_class(executed)}">{executed:.2f}R</td>
+          <td>{_fmt_metric(target,"R",2)}</td><td class="{_pnl_class(executed)}">{_fmt_metric(executed,"R",2)}</td>
           <td>{_money((executed or 0.0)*BCO_RISK_PER_TRADE_GBP) if executed is not None else "—"}</td>
           <td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("selected_trade_ids") or "waiting")}</td>
         </tr>''')
@@ -3003,6 +3047,14 @@ def _bco_standard_broker_html():
       </div>
       <div class="section-note small"><a href="/broker/preflight">preflight</a> · <a href="/broker/risk-preview">risk preview</a> · <a href="/broker/instruments/discover">instrument discovery</a></div>
     '''
+
+
+def _fmt_metric(value: Any, suffix: str = "", decimals: int = 2) -> str:
+    v = safe_float(value)
+    if v is None:
+        return "—"
+    return f"{v:.{max(0,int(decimals))}f}{suffix}"
+
 
 def _bco_standard_execution_html():
     rec = reconcile_broker()
@@ -3171,7 +3223,7 @@ ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
-${{card('Signal Health',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,g.latest_time?'Latest BCO signal received':'Waiting for BCO signal',Number(g.received_assets||0)===1?'pos':'warn')}}
+${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'CHECK',g.processor_ok?(g.latest_time?'Latest BCO signal processed':'Waiting for BCO signal'):`Processing lag ${{eh(g.processing_lag||0)}} signal(s)`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'neg')}}
 ${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?'Missing none':'Waiting')}}
 ${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
