@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.5.2 — Broker P&L Parity"
-APP_VERSION = "0.5.2"
-POLICY_VERSION = "bco_v0.5.2_broker_pnl_parity"
+APP_NAME = "Project Exit Plan — BCO v0.5.3 — Indices Giveback Parity"
+APP_VERSION = "0.5.3"
+POLICY_VERSION = "bco_v0.5.3_indices_giveback_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2770,14 +2770,16 @@ def _bco_standard_top_uncached():
     realized_pnl=safe_float(closed.get("p")) or 0.0
     realized_r=safe_float(closed.get("r")) or 0.0
 
-    # Giveback must use the same full-cycle basis as Indices:
-    # current strategy/cycle P&L = realised + currently open basket.
-    # If current P&L has fallen below zero, giveback exceeds the original HWM.
-    current_cycle_gbp=realized_pnl+current_open_basket_gbp
-    current_cycle_r=realized_r+basket_r
+    # Match Live Indices:
+    # cash giveback = cash high-water minus CURRENT UNREALISED BROKER P&L.
+    # Realised historical P&L remains accounting context only.
+    current_giveback_basis_gbp=broker_open_pnl
 
-    giveback_r=max(0.0,hwm-current_cycle_r)
-    giveback_gbp=max(0.0,float(hwm_gbp or 0.0)-current_cycle_gbp)
+    # R giveback = open-basket R high-water minus current open-basket R.
+    current_giveback_basis_r=basket_r
+
+    giveback_r=max(0.0,hwm-current_giveback_basis_r)
+    giveback_gbp=max(0.0,float(hwm_gbp or 0.0)-current_giveback_basis_gbp)
     giveback_cash_pct=(
         (giveback_gbp/float(hwm_gbp)*100.0)
         if hwm_gbp is not None and float(hwm_gbp)>0
@@ -2803,7 +2805,8 @@ def _bco_standard_top_uncached():
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
                   "open_trades":broker_open,"local_open_trades":local_open,
                   "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
-                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"current_cycle_r":current_cycle_r,"current_cycle_gbp":current_cycle_gbp,
+                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"giveback_basis_r":current_giveback_basis_r,
+                  "giveback_basis_gbp":current_giveback_basis_gbp,
                   "giveback_r":giveback_r,"giveback_gbp":giveback_gbp,
                   "giveback_pct":giveback_cash_pct,
                   "giveback_r_pct":((giveback_r/hwm*100.0) if hwm>0 else 0.0),
