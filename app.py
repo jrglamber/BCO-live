@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.4.9 — Audit Hardening"
-APP_VERSION = "0.4.9"
-POLICY_VERSION = "bco_v0.4.9_audit_hardening"
+APP_NAME = "Project Exit Plan — BCO v0.5.1 — Total Cycle Giveback Fix"
+APP_VERSION = "0.5.1"
+POLICY_VERSION = "bco_v0.5.1_total_cycle_giveback_fix"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2766,10 +2766,23 @@ def _bco_standard_top_uncached():
     if hwm_gbp is None:
         hwm_gbp=hwm*float(BCO_RISK_PER_TRADE_GBP)
     give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
-    current_basket_gbp=safe_float(lm.get("basket_pnl_gbp")) or 0.0
-    giveback_r=max(0.0,hwm-basket_r)
-    giveback_gbp=max(0.0,float(hwm_gbp or 0.0)-current_basket_gbp)
-    realized_pnl=safe_float(closed.get("p")) or 0.0;realized_r=safe_float(closed.get("r")) or 0.0
+    current_open_basket_gbp=safe_float(lm.get("basket_pnl_gbp")) or 0.0
+    realized_pnl=safe_float(closed.get("p")) or 0.0
+    realized_r=safe_float(closed.get("r")) or 0.0
+
+    # Giveback must use the same full-cycle basis as Indices:
+    # current strategy/cycle P&L = realised + currently open basket.
+    # If current P&L has fallen below zero, giveback exceeds the original HWM.
+    current_cycle_gbp=realized_pnl+current_open_basket_gbp
+    current_cycle_r=realized_r+basket_r
+
+    giveback_r=max(0.0,hwm-current_cycle_r)
+    giveback_gbp=max(0.0,float(hwm_gbp or 0.0)-current_cycle_gbp)
+    giveback_cash_pct=(
+        (giveback_gbp/float(hwm_gbp)*100.0)
+        if hwm_gbp is not None and float(hwm_gbp)>0
+        else 0.0
+    )
     now=datetime.now(timezone.utc);ws=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
     with get_conn() as conn:
         wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ws.isoformat(),)).fetchone()
@@ -2789,7 +2802,10 @@ def _bco_standard_top_uncached():
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
                   "open_trades":broker_open,"local_open_trades":local_open,
                   "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
-                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"giveback_r":giveback_r,"giveback_gbp":giveback_gbp,"giveback_pct":give,
+                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"current_cycle_r":current_cycle_r,"current_cycle_gbp":current_cycle_gbp,
+                  "giveback_r":giveback_r,"giveback_gbp":giveback_gbp,
+                  "giveback_pct":giveback_cash_pct,
+                  "giveback_r_pct":((giveback_r/hwm*100.0) if hwm>0 else 0.0),
                   "basket_phase":safe_str(basket.get("basket_phase") or "FLAT"),
                   "tide_status":safe_str(basket.get("tide_status") or "FLAT"),
                   "manager_action":safe_str(basket.get("manager_action") or "NO_OPEN_BASKET"),
