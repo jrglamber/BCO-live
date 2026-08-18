@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.5.1 — Total Cycle Giveback Fix"
-APP_VERSION = "0.5.1"
-POLICY_VERSION = "bco_v0.5.1_total_cycle_giveback_fix"
+APP_NAME = "Project Exit Plan — BCO v0.5.2 — Broker P&L Parity"
+APP_VERSION = "0.5.2"
+POLICY_VERSION = "bco_v0.5.2_broker_pnl_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2798,7 +2798,8 @@ def _bco_standard_top_uncached():
                  "margin_available":safe_float(acct.get("marginAvailable")),"currency":safe_str(acct.get("currency"))},
       "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"Realised this week",
                     "month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"Realised this month"},
-      "strategy":{"open_pnl":broker_open_pnl,"model_open_pnl":model_open,"realized_pnl":realized_pnl,
+      "strategy":{"open_pnl":broker_open_pnl,"headline_pnl":broker_open_pnl,
+                  "model_open_pnl":model_open,"realized_pnl":realized_pnl,
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
                   "open_trades":broker_open,"local_open_trades":local_open,
                   "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
@@ -3230,7 +3231,7 @@ function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt
 async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}},ac=d.accounting||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
-${{card('Broker P&L',money(s.total_pnl),`BCO UPL ${{money(s.open_pnl)}} · Realised ${{money(s.realized_pnl)}}`,cls(s.total_pnl))}}
+${{card('Broker P&L',money(s.headline_pnl),`Open broker P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
 ${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
 <div class="cards four">
