@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.5.3 — Indices Giveback Parity"
-APP_VERSION = "0.5.3"
-POLICY_VERSION = "bco_v0.5.3_indices_giveback_parity"
+APP_NAME = "Project Exit Plan — BCO v0.5.4 — Candidate-Supported Runner"
+APP_VERSION = "0.5.4"
+POLICY_VERSION = "bco_v0.5.4_candidate_supported_runner"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1701,6 +1701,52 @@ def extension_decision(regime_name: str, return_pct: float, mfe_pct: float) -> T
     return (not reasons), reasons
 
 
+
+def candidate_supported_extension_override(
+    conn: DBConn,
+    support: Dict[str, Any],
+    regime_name: str,
+    rr: float,
+    reasons: List[str],
+) -> Tuple[bool, List[str]]:
+    """
+    Mirrors the Live Indices candidate-supported extension rule.
+
+    A current/recent same-direction BCO candidate may override only SOFT
+    post-48 extension failures. It must never suppress genuine safety exits:
+    - trade currently negative;
+    - adverse or flat/choppy regime;
+    - heavy basket pressure;
+    - excessive giveback.
+    """
+    if not support.get("supported"):
+        return False, reasons
+
+    metrics = basket_metrics(conn)
+    heavy_pressure = (
+        float(metrics.get("basket_R") or 0.0) <= -2.0
+        and float(metrics.get("losing_pct") or 0.0) >= 60.0
+    )
+
+    blockers = []
+    if rr < 0:
+        blockers.append("blocked_trade_negative")
+    if regime_name in {"adverse", "flat_choppy"}:
+        blockers.append(f"blocked_live_regime_{regime_name}")
+    if heavy_pressure:
+        blockers.append("blocked_heavy_basket_pressure")
+    if "too_much_giveback" in reasons:
+        blockers.append("blocked_too_much_giveback")
+
+    if blockers:
+        return False, list(reasons) + blockers
+
+    return True, [
+        "candidate_supported_extension_override",
+        "same_direction_bco_candidate_support_present",
+    ]
+
+
 def protect_fraction(hold: int) -> Tuple[float, str]:
     if hold >= 120: return BCO_PROTECT_120, "120h_plus_late_runner"
     if hold >= 96: return BCO_PROTECT_96, "96h_plus_mature_runner"
@@ -1799,15 +1845,31 @@ def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str
     reg=regime(conn)
     if hold >= 48 and not d48:
         passed,reasons=extension_decision(reg,ret,mfe)
-        if (not passed) and support.get("supported"):
-            m=basket_metrics(conn); heavy=m["basket_R"]<=-2 and m["losing_pct"]>=60
-            blocked=rr<0 or reg in {"adverse","flat_choppy"} or heavy or "too_much_giveback" in reasons
-            if not blocked: passed=True; reasons=["candidate_supported_48h_extension_override"]
+        if not passed:
+            override,override_reasons=candidate_supported_extension_override(conn,support,reg,rr,reasons)
+            if override:
+                passed=True
+                reasons=["candidate_supported_48h_extension_override"]+override_reasons
+            else:
+                reasons=override_reasons
         d48="extend" if passed else "exit:"+",".join(reasons)
-        if not passed: exit_now=True; reason="exit_48_no_extension:"+",".join(reasons)
+        if not passed:
+            exit_now=True
+            reason="exit_48_no_extension:"+",".join(reasons)
+
     if hold >= 72 and d48 == "extend" and not d72 and not exit_now:
-        passed,reasons=extension_decision(reg,ret,mfe); d72="extend" if passed else "exit:"+",".join(reasons)
-        if not passed: exit_now=True; reason="exit_72_no_extension:"+",".join(reasons)
+        passed,reasons=extension_decision(reg,ret,mfe)
+        if not passed:
+            override,override_reasons=candidate_supported_extension_override(conn,support,reg,rr,reasons)
+            if override:
+                passed=True
+                reasons=["candidate_supported_72h_extension_override"]+override_reasons
+            else:
+                reasons=override_reasons
+        d72="extend" if passed else "exit:"+",".join(reasons)
+        if not passed:
+            exit_now=True
+            reason="exit_72_no_extension:"+",".join(reasons)
     conn.execute("""
         UPDATE trades SET current_price=?,hold_candles=?,highest_high=?,lowest_low=?,return_pct=?,mfe_pct=?,mae_pct=?,current_R=?,
             decision_48=?,decision_72=?,updated_at_utc=? WHERE trade_id=?
