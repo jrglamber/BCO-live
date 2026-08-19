@@ -31,9 +31,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.5.4 — Candidate-Supported Runner"
-APP_VERSION = "0.5.4"
-POLICY_VERSION = "bco_v0.5.4_candidate_supported_runner"
+APP_NAME = "Project Exit Plan — BCO v0.6.0 — Live-Ready Broker Accounting"
+APP_VERSION = "0.6.0"
+POLICY_VERSION = "bco_v0.6.0_live_ready_broker_accounting"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -3114,21 +3114,208 @@ def _bco_standard_profit_harvesting_html():
       <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Lock</th><th>Executed At</th><th>Cohort Trade IDs</th></tr></thead><tbody>{"".join(cohorts)}</tbody></table></div>
     '''
 
+
+def bco_live_readiness() -> Dict[str, Any]:
+    """Production-readiness view. Read-only: never unlocks broker writes."""
+    safety = safety_status()
+    acct = account_summary()
+    rec = reconcile_broker()
+    pf = preflight()
+
+    with get_conn() as conn:
+        pending = int((conn.execute("""
+            SELECT COUNT(*) AS c FROM broker_action_queue
+            WHERE UPPER(COALESCE(status,'')) IN ('PENDING','RETRY','WAITING_MARKET_REOPEN','WAITING_RECONCILIATION')
+        """).fetchone() or {"c":0})["c"] or 0)
+        failed = int((conn.execute("""
+            SELECT COUNT(*) AS c FROM broker_action_queue
+            WHERE UPPER(COALESCE(status,'')) IN ('FAILED','FAILED_FINAL','EXECUTION_FAILED')
+        """).fetchone() or {"c":0})["c"] or 0)
+        tx = fetchone_dict(conn.execute("""
+            SELECT COUNT(*) AS rows,
+                   COALESCE(SUM(pl_home),0) AS pl,
+                   COALESCE(SUM(financing_home),0) AS financing,
+                   MAX(transaction_time) AS latest_time
+            FROM broker_transactions
+        """)) or {}
+        last_acct = fetchone_dict(conn.execute(
+            "SELECT * FROM accounting_snapshots ORDER BY id DESC LIMIT 1"
+        )) or {}
+
+    checks = [
+        {"name":"Environment", "ok": OANDA_ENV in {"practice","live"}, "detail": OANDA_ENV},
+        {"name":"OANDA read access", "ok": bool(acct.get("ok")), "detail": safe_str(acct.get("error") or "account readable")},
+        {"name":"GBP account", "ok": safe_str(acct.get("currency")).upper()=="GBP", "detail": safe_str(acct.get("currency") or "unknown")},
+        {"name":"Exact BCO ownership", "ok": bool(BCO_OANDA_INSTRUMENT) and not any(tok in safe_str(BCO_OANDA_INSTRUMENT).upper() for tok in FORBIDDEN_FOREIGN_INSTRUMENT_TOKENS), "detail": BCO_OANDA_INSTRUMENT},
+        {"name":"Risk preview", "ok": bool(risk_preview().get("ok")) if BCO_OANDA_INSTRUMENT else False, "detail": "risk-sized order preview"},
+        {"name":"Reconciliation", "ok": bool(rec.get("ok")), "detail": f"{int(rec.get('owned_open_count') or 0)} owned broker trades"},
+        {"name":"Durable queue", "ok": failed==0, "detail": f"{pending} pending / {failed} failed"},
+        {"name":"Transaction accounting", "ok": int(tx.get("rows") or 0)>0 or OANDA_ENV=="practice", "detail": f"{int(tx.get('rows') or 0)} broker transaction rows"},
+        {"name":"Auto management configured", "ok": bool(BCO_AUTO_MANAGEMENT_ENABLED), "detail": f"48h+ manager {'ON' if BCO_AUTO_MANAGEMENT_ENABLED else 'OFF'}"},
+    ]
+
+    # Promotion readiness does NOT require writes to be unlocked now.
+    promotion_ready = all(c["ok"] for c in checks)
+    return {
+        "status":"READY" if promotion_ready else "CHECK",
+        "promotion_ready":promotion_ready,
+        "current_environment":OANDA_ENV,
+        "switch_to_live_requires":[
+            "Set OANDA_ENV=live",
+            "Use live OANDA API base/account/token",
+            "Confirm GBP live account",
+            "Keep BCO_OANDA_INSTRUMENT exact",
+            "Run /broker/live-readiness while writes remain locked",
+            "Only then explicitly arm BROKER_READ_ONLY=false, BROKER_EXECUTION_ENABLED=true, BROKER_KILL_SWITCH=false and BCO_LIVE_EXECUTION_ARMED=true",
+        ],
+        "checks":checks,
+        "broker_safety":safety,
+        "account":acct,
+        "reconciliation":rec,
+        "transactions":tx,
+        "latest_accounting_snapshot":last_acct,
+        "preflight":pf,
+        "time_utc":now_utc_iso(),
+    }
+
+
+@app.get("/broker/live-readiness")
+def bco_live_readiness_endpoint():
+    return bco_live_readiness()
+
+
 def _bco_standard_broker_html():
     s = snapshot()
     safety = s.get("broker_safety") or {}
     acct = s.get("account") or {}
+    broker = s.get("broker_live") or {}
     preview = risk_preview()
-    return f'''
-      <div class="section-note warn"><strong>{"LIVE" if OANDA_ENV=="live" else "DEMO / PRACTICE"}.</strong> Exact BCO instrument ownership is enforced.</div>
-      <div class="metric-grid">
-        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {"pos" if safety.get("orders_allowed") else "warn"}>{"ENABLED" if safety.get("orders_allowed") else "LOCKED"}</div><div class="small">{esc(safety.get("reason"))}</div></div>
-        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{_money(acct.get("NAV"))}</div><div class="small">Margin {_money(acct.get("marginAvailable"))}</div></div>
-        <div class="mini-card"><div class="k">Instrument</div><div class="v">{esc(BCO_OANDA_INSTRUMENT or "NOT SET")}</div></div>
-        <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{BCO_RISK_PER_TRADE_GBP:.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL</div></div>
+    ready = bco_live_readiness()
+
+    with get_conn() as conn:
+        txs = fetchall_dict(conn.execute("""
+            SELECT * FROM broker_transactions
+            ORDER BY id DESC LIMIT 30
+        """))
+        queue = fetchall_dict(conn.execute("""
+            SELECT * FROM broker_action_queue
+            ORDER BY id DESC LIMIT 30
+        """))
+        audits = fetchall_dict(conn.execute("""
+            SELECT * FROM execution_audit
+            ORDER BY id DESC LIMIT 30
+        """))
+        accounting = fetchall_dict(conn.execute("""
+            SELECT * FROM accounting_snapshots
+            ORDER BY id DESC LIMIT 20
+        """))
+
+    owned = broker.get("owned_open_trades") or []
+    local_open = s.get("open_trades") or []
+    broker_ids = {safe_str(x.get("id")) for x in owned}
+    local_ids = {safe_str(x.get("broker_trade_id")) for x in local_open if safe_str(x.get("broker_trade_id"))}
+    local_missing = [x for x in local_open if safe_str(x.get("broker_trade_id")) and safe_str(x.get("broker_trade_id")) not in broker_ids]
+    broker_only = [x for x in owned if safe_str(x.get("id")) not in local_ids]
+
+    pending = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"PENDING","RETRY","WAITING_MARKET_REOPEN","WAITING_RECONCILIATION"})
+    failed = sum(1 for q in queue if safe_str(q.get("status")).upper() in {"FAILED","FAILED_FINAL","EXECUTION_FAILED"})
+
+    tx_pl = sum(float(safe_float(x.get("pl_home")) or 0) for x in txs)
+    tx_fin = sum(float(safe_float(x.get("financing_home")) or 0) for x in txs)
+
+    owned_rows = "".join(
+        f"<tr><td>{esc(t.get('id'))}</td><td>{esc(t.get('instrument'))}</td><td>{esc(t.get('currentUnits'))}</td>"
+        f"<td>{_fmt_metric(t.get('price'),3)}</td><td class='{_pnl_class(t.get('unrealizedPL'))}'>{_money(t.get('unrealizedPL'))}</td>"
+        f"<td>{_money(t.get('marginUsed'))}</td><td>{esc(t.get('openTime'))}</td></tr>"
+        for t in owned
+    )
+    tx_rows = "".join(
+        f"<tr><td>{esc(t.get('transaction_time'))}</td><td>{esc(t.get('transaction_id'))}</td><td>{esc(t.get('transaction_type'))}</td>"
+        f"<td class='{_pnl_class(t.get('pl_home'))}'>{_money(t.get('pl_home'))}</td><td>{_money(t.get('financing_home'))}</td>"
+        f"<td>{_money(t.get('account_balance'))}</td></tr>"
+        for t in txs
+    )
+    queue_rows = "".join(
+        f"<tr><td>{esc(q.get('created_at_utc'))}</td><td>{esc(q.get('action_type'))}</td><td>{esc(q.get('status'))}</td>"
+        f"<td>{esc(q.get('local_trade_id'))}</td><td>{esc(q.get('broker_trade_id'))}</td><td>{esc(q.get('attempts'))}</td>"
+        f"<td>{esc(q.get('last_error'))}</td></tr>"
+        for q in queue
+    )
+    audit_rows = "".join(
+        f"<tr><td>{esc(a.get('created_at_utc'))}</td><td>{esc(a.get('action'))}</td><td>{esc(a.get('success'))}</td>"
+        f"<td>{esc(a.get('trade_id'))}</td><td>{esc(a.get('broker_trade_id'))}</td><td>{esc(a.get('message'))}</td></tr>"
+        for a in audits
+    )
+    acct_rows = "".join(
+        f"<tr><td>{esc(a.get('created_at_utc'))}</td><td>{_money(a.get('account_nav'))}</td><td>{_money(a.get('account_balance'))}</td>"
+        f"<td class='{_pnl_class(a.get('bco_open_pl'))}'>{_money(a.get('bco_open_pl'))}</td>"
+        f"<td>{_money(a.get('bco_realized_pl'))}</td><td>{_money(a.get('bco_financing'))}</td></tr>"
+        for a in accounting
+    )
+    readiness_rows = "".join(
+        f"<tr><td>{esc(c.get('name'))}</td><td class='{'pos' if c.get('ok') else 'neg'}'>{'PASS' if c.get('ok') else 'CHECK'}</td><td>{esc(c.get('detail'))}</td></tr>"
+        for c in ready.get("checks") or []
+    )
+
+    return f"""
+      <div class="section-note {'warn' if OANDA_ENV!='live' else 'neg'}">
+        <strong>{'LIVE' if OANDA_ENV=='live' else 'DEMO / PRACTICE'} BROKER LANE.</strong>
+        Exact BCO ownership is enforced. Demo and live use the same execution/reconciliation/accounting architecture; promotion is an environment/credential/safety-gate change, not a new engine.
       </div>
-      <div class="section-note small"><a href="/broker/preflight">preflight</a> · <a href="/broker/risk-preview">risk preview</a> · <a href="/broker/instruments/discover">instrument discovery</a></div>
-    '''
+
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Live Readiness</div><div class="v {'pos' if ready.get('promotion_ready') else 'warn'}">{esc(ready.get('status'))}</div><div class="small">Read-only readiness test</div></div>
+        <div class="mini-card"><div class="k">Broker Writes</div><div class="v {'pos' if safety.get('orders_allowed') else 'warn'}">{'ENABLED' if safety.get('orders_allowed') else 'LOCKED'}</div><div class="small">{esc(safety.get('reason'))}</div></div>
+        <div class="mini-card"><div class="k">Account NAV</div><div class="v">{_money(acct.get('NAV'))}</div><div class="small">Balance {_money(acct.get('balance'))}</div></div>
+        <div class="mini-card"><div class="k">Margin Available</div><div class="v">{_money(acct.get('marginAvailable'))}</div><div class="small">Currency {esc(acct.get('currency') or '-')}</div></div>
+        <div class="mini-card"><div class="k">BCO Open P&amp;L</div><div class="v {_pnl_class(broker.get('owned_unrealized_pl'))}">{_money(broker.get('owned_unrealized_pl'))}</div><div class="small">{int(broker.get('owned_open_count') or 0)} owned broker trades</div></div>
+        <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if not local_missing and not broker_only else 'neg'}">{'SAFE' if not local_missing and not broker_only else 'CHECK'}</div><div class="small">Local missing {len(local_missing)} · broker-only {len(broker_only)}</div></div>
+        <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
+        <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{BCO_RISK_PER_TRADE_GBP:.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL · 1.00x locked</div></div>
+      </div>
+
+      <h3>Live Promotion Readiness</h3>
+      <div class="table-scroll"><table><thead><tr><th>Check</th><th>State</th><th>Detail</th></tr></thead>
+      <tbody>{readiness_rows}</tbody></table></div>
+
+      <h3>Risk / Order Preview</h3>
+      <div class="table-scroll"><table><thead><tr><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>Entry</th><th>SL</th><th>State</th></tr></thead>
+      <tbody><tr><td>{esc(preview.get('instrument') or BCO_OANDA_INSTRUMENT)}</td><td>£{BCO_RISK_PER_TRADE_GBP:.2f}</td>
+      <td>{_money(preview.get('effective_risk_gbp'))}</td><td>{esc(preview.get('units') or preview.get('order_units') or '-')}</td>
+      <td>{_fmt_metric(preview.get('entry_price'),3)}</td><td>{_fmt_metric(preview.get('sl_price'),3)}</td>
+      <td class='{'pos' if preview.get('ok') else 'warn'}'>{'OK' if preview.get('ok') else 'BLOCKED'}</td></tr></tbody></table></div>
+
+      <h3>Actual OANDA BCO Open Trades</h3>
+      <div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
+      <tbody>{owned_rows or '<tr><td colspan="7">No OANDA BCO trades open.</td></tr>'}</tbody></table></div>
+
+      <h3>Broker-Authoritative Realised P&amp;L / Financing</h3>
+      <div class="section-note small">Recent transaction rows shown below. Full ledger is persisted independently of local strategy trades.</div>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Transaction</th><th>Type</th><th>P/L</th><th>Financing</th><th>Account Balance</th></tr></thead>
+      <tbody>{tx_rows or '<tr><td colspan="6">No broker transaction rows yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Durable Broker Action Queue</h3>
+      <div class="table-scroll"><table><thead><tr><th>Created</th><th>Action</th><th>Status</th><th>Local Trade</th><th>Broker ID</th><th>Attempts</th><th>Error</th></tr></thead>
+      <tbody>{queue_rows or '<tr><td colspan="7">No queued broker actions.</td></tr>'}</tbody></table></div>
+
+      <h3>Accounting Snapshots</h3>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>NAV</th><th>Balance</th><th>BCO Open P/L</th><th>Realised</th><th>Financing</th></tr></thead>
+      <tbody>{acct_rows or '<tr><td colspan="6">No accounting snapshots yet.</td></tr>'}</tbody></table></div>
+
+      <h3>Recent Execution Audit</h3>
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Success</th><th>Local Trade</th><th>Broker ID</th><th>Message</th></tr></thead>
+      <tbody>{audit_rows or '<tr><td colspan="6">No execution audit rows.</td></tr>'}</tbody></table></div>
+
+      <div class="section-note small">
+        <a href="/broker/live-readiness">live-readiness JSON</a> ·
+        <a href="/broker/preflight">execution preflight</a> ·
+        <a href="/broker/risk-preview">risk preview</a> ·
+        <a href="/broker/instruments/discover">instrument discovery</a> ·
+        <a href="/export/broker-transactions.csv">broker transactions</a> ·
+        <a href="/export/broker-action-queue.csv">action queue</a> ·
+        <a href="/export/accounting-snapshots.csv">accounting snapshots</a>
+      </div>
+    """
 
 
 def _fmt_metric(value: Any, suffix: str = "", decimals: int = 2) -> str:
