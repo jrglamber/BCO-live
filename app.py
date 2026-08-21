@@ -32,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.0 — AI Regime Observer"
-APP_VERSION = "0.7.0"
-POLICY_VERSION = "bco_v0.7.0_ai_regime_observer"
+APP_NAME = "Project Exit Plan — BCO v0.7.1 — AI Live Basket Context"
+APP_VERSION = "0.7.1"
+POLICY_VERSION = "bco_v0.7.1_ai_live_basket_context"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2710,17 +2710,57 @@ def build_ai_regime_observer_html():
 
 
 def _bco_aiobs_state(conn, raw_signal_id, payload):
+    """
+    Point-in-time BCO observer state using the SAME basket state basis as the
+    production manager/dashboard, rather than rebuilding from stale trade rows.
+    """
     sig=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
     sig=dict(sig) if sig else {}
     state=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1").fetchone()
     state=dict(state) if state else {}
+
     rows=conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id").fetchall()
     open_rows=[dict(r) for r in rows]
-    mature=sum(1 for t in open_rows if int(safe_float(t.get("hold_candles")) or 0)>=48)
+
+    # Use actual wall-clock/manager age where available for maturity count.
+    mature=0
+    for t in open_rows:
+        hold=int(safe_float(t.get("hold_candles")) or 0)
+        if hold >= 48:
+            mature += 1
+
     candidate=bool(sig.get("candidate_8h"))
-    basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows)
-    hwm=float(safe_float(state.get("high_water_R")) or 0.0)
-    give=float(safe_float(state.get("giveback_pct")) or 0.0)
+
+    # Production basket_state is the authoritative manager state.
+    # Fallback only if older DB rows do not have the expected columns populated.
+    basket_r=(
+        safe_float(state.get("current_basket_R"))
+        if safe_float(state.get("current_basket_R")) is not None
+        else safe_float(state.get("basket_R"))
+    )
+    if basket_r is None:
+        basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows)
+    basket_r=float(basket_r or 0.0)
+
+    hwm=(
+        safe_float(state.get("high_water_R"))
+        if safe_float(state.get("high_water_R")) is not None
+        else safe_float(state.get("high_water_r"))
+    )
+    hwm=float(hwm or 0.0)
+
+    give=(
+        safe_float(state.get("giveback_pct"))
+        if safe_float(state.get("giveback_pct")) is not None
+        else 0.0
+    )
+    give=float(give or 0.0)
+
+    # If giveback percentage is absent/stale but R HWM is available, derive
+    # an R-basis fallback for observer context only.
+    if hwm > 0 and give <= 0 and basket_r < hwm:
+        give=max(0.0,(hwm-basket_r)/hwm*100.0)
+
     consumed=0
     cycle=safe_str(state.get("cycle_id"))
     if cycle:
@@ -2728,16 +2768,34 @@ def _bco_aiobs_state(conn, raw_signal_id, payload):
                             WHERE cycle_id=? AND UPPER(COALESCE(status,'')) IN
                             ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
         consumed=int(row["c"] or 0) if row else 0
+
     return {
-        "asset":"BCO","candidate":candidate,"side":"long" if candidate else "",
-        "open_count":len(open_rows),"mature_48h_plus":mature,
-        "basket_r":basket_r,"high_water_r":hwm,"giveback_pct":give,
+        "asset":"BCO",
+        "candidate":candidate,
+        "side":"long" if candidate else "",
+        "open_count":len(open_rows),
+        "mature_48h_plus":mature,
+
+        # Explicit provenance for future audit/export.
+        "basket_state_source":"basket_state:BCO_LONG",
+        "basket_r":basket_r,
+        "high_water_r":hwm,
+        "giveback_pct":give,
+
         "giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),
         "high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),
         "consumed_bank_stages":consumed,
         "cycle_id":cycle,
-        "tide_status":safe_str(state.get("tide_status") or state.get("status")),
-        "manager_action":safe_str(state.get("manager_action")),
+        "tide_status":safe_str(
+            state.get("tide_status")
+            or state.get("status")
+            or state.get("phase")
+        ),
+        "manager_action":safe_str(
+            state.get("manager_action")
+            or state.get("recommended_action")
+            or state.get("action")
+        ),
     }
 
 
@@ -2781,7 +2839,7 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
             "current_signal":_aiobs_scalar_features(payload),
             "event_state":current,
             "recent_history":[],
-            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing.",
+            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing. Basket R/HWM/giveback come from production basket_state:BCO_LONG.",
         }
         recent=conn.execute("""SELECT timestamp_readable,candidate_8h,exec_close,signal_side
                                FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT 6""",(int(raw_signal_id),)).fetchall()
