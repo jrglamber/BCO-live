@@ -19,6 +19,7 @@ import math
 import os
 import re
 import threading
+import queue
 import time
 import urllib.error
 import urllib.parse
@@ -31,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.6.0 — Live-Ready Broker Accounting"
-APP_VERSION = "0.6.0"
-POLICY_VERSION = "bco_v0.6.0_live_ready_broker_accounting"
+APP_NAME = "Project Exit Plan — BCO v0.7.0 — AI Regime Observer"
+APP_VERSION = "0.7.0"
+POLICY_VERSION = "bco_v0.7.0_ai_regime_observer"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2293,6 +2294,514 @@ def startup_event() -> None:
         ).start()
 
 
+
+# ============================================================
+# BCO — EVENT-DRIVEN AI REGIME OBSERVER
+# Mirrors the Live Indices research architecture.
+# ZERO execution/broker authority.
+# ============================================================
+AI_SHADOW_CAPTURE_ENABLED = os.getenv("AI_SHADOW_CAPTURE_ENABLED", "true").strip().lower() == "true"
+AI_SHADOW_ENABLED = os.getenv("AI_SHADOW_ENABLED", "false").strip().lower() == "true"
+AI_SHADOW_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+AI_SHADOW_OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
+AI_SHADOW_MODEL = os.getenv("AI_SHADOW_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
+AI_SHADOW_PROMPT_VERSION = "ai_regime_observer_family_v1_2026_08_21"
+AI_SHADOW_OBSERVER_VERSION = "ai_regime_observer_v1_event_driven_2026_08_21"
+AI_SHADOW_EVENT_DRIVEN_ONLY = os.getenv("AI_SHADOW_EVENT_DRIVEN_ONLY", "true").strip().lower() == "true"
+AI_SHADOW_TIMEOUT_SECONDS = max(10.0, min(float(os.getenv("AI_SHADOW_TIMEOUT_SECONDS", "45")), 120.0))
+AI_SHADOW_MAX_OUTPUT_TOKENS = max(250, min(int(float(os.getenv("AI_SHADOW_MAX_OUTPUT_TOKENS", "700"))), 2000))
+AI_SHADOW_QUEUE_MAXSIZE = max(50, min(int(float(os.getenv("AI_SHADOW_QUEUE_MAXSIZE", "1000"))), 10000))
+AI_SHADOW_GIVEBACK_BANDS_PCT = (25.0, 50.0, 75.0)
+# Includes earlier levels than Indices because BCO/Metals basket throughput is
+# still being learned prospectively. These are CALL TRIGGERS ONLY.
+AI_SHADOW_HIGH_WATER_LEVELS_R = (25.0, 50.0, 75.0, 100.0, 200.0, 300.0)
+
+AI_REGIME_SYSTEM_PROMPT = 'You are the Project Exit Plan AI Regime Observer.\nYou are research-only and have ZERO authority over live or demo trading.\n\nYou receive one immutable point-in-time snapshot captured before the deterministic\ntrading worker acts on that signal. Use ONLY that snapshot. Do not use web\nknowledge, remembered market history, later candles, hidden information, or\nassumptions about what happened next.\n\nThis project trades BCO/Brent long-only using deterministic rules. BCO is a\nsingle-market strategy with stacked entries. Existing positions use a 48h minimum\nnormal hold with hourly mature-runner review thereafter. Your role is to classify\nthe current Brent regime and independently describe whether a fresh deterministic\nlong slice looks supported and whether existing exposure appears HOLD / PROTECT /\nREDUCE. You do not make or alter trading decisions.\n\nregime TREND / CHOP / TRANSITION / EXHAUSTION describes the current state only.\nBe conservative about certainty. Candidate state is evidence, not an instruction.'
+
+AI_REGIME_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entry_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
+        "management_view": {"type": "string", "enum": ["HOLD", "PROTECT", "REDUCE"]},
+        "regime": {"type": "string", "enum": ["TREND", "CHOP", "TRANSITION", "EXHAUSTION"]},
+        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "live_rule_assessment": {
+            "type": "string",
+            "enum": ["AGREE", "AI_MORE_PERMISSIVE", "AI_MORE_DEFENSIVE",
+                     "MANAGEMENT_DIFFERS", "INSUFFICIENT_CONTEXT"],
+        },
+        "reason_codes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 6,
+        },
+        "short_reason": {"type": "string"},
+    },
+    "required": [
+        "entry_view","management_view","regime","confidence",
+        "live_rule_assessment","reason_codes","short_reason"
+    ],
+    "additionalProperties": False,
+}
+
+
+_ai_regime_queue = queue.Queue(maxsize=AI_SHADOW_QUEUE_MAXSIZE)
+_ai_regime_worker_started = False
+_ai_regime_worker_thread = None
+_ai_regime_last_heartbeat_utc = ""
+_ai_regime_last_raw_signal_id = None
+
+
+def ensure_ai_regime_observer_table() -> None:
+    with get_conn() as conn:
+        id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS ai_regime_observer (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                raw_signal_id BIGINT NOT NULL UNIQUE,
+                asset TEXT,
+                signal_time TEXT,
+                live_candidate INTEGER DEFAULT 0,
+                candidate_side TEXT,
+                trigger_reason TEXT,
+                api_eligible INTEGER DEFAULT 0,
+                status TEXT,
+                snapshot_json TEXT,
+                model TEXT,
+                prompt_version TEXT,
+                observer_version TEXT,
+                entry_view TEXT,
+                management_view TEXT,
+                regime TEXT,
+                confidence INTEGER,
+                live_rule_assessment TEXT,
+                reason_codes TEXT,
+                short_reason TEXT,
+                response_id TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                request_started_at_utc TEXT,
+                completed_at_utc TEXT,
+                error TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_status ON ai_regime_observer(status, created_at_utc)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_asset ON ai_regime_observer(asset, raw_signal_id)")
+        conn.commit()
+
+
+def _aiobs_bool(v):
+    if isinstance(v, bool):
+        return v
+    return safe_str(v).lower() in {"1","true","yes","on","y","candidate","long","short"}
+
+
+def _aiobs_band(value, levels):
+    v = float(safe_float(value) or 0.0)
+    band = 0
+    for level in levels:
+        if v >= float(level):
+            band = int(level)
+    return band
+
+
+def _aiobs_scalar_features(raw):
+    """Small deterministic feature subset; secrets/non-scalars are excluded."""
+    if not isinstance(raw, dict):
+        return {}
+    preferred = [
+        "pair","ticker","symbol","timestamp","timestamp_readable","timeframe",
+        "context_tf","execution_tf","exec_close","exec_high","exec_low",
+        "forward_test_candidate","take_trade","signal_side","model_version",
+        "model_name","atr_pct","ctx_atr_pct","context_atr_pct","rsi","ctx_rsi",
+        "daily_rsi","macd_hist","macd_hist_delta","ema20","ema50","ema200",
+        "trend","exec_trend","context_trend","ctx_regime","daily_trend",
+        "return_4h","return_8h","return_24h","momentum","breakout","pullback",
+    ]
+    out = {}
+    lower = {safe_str(k).lower(): k for k in raw.keys()}
+    for want in preferred:
+        key = lower.get(want.lower())
+        if key is not None and isinstance(raw.get(key), (str,int,float,bool,type(None))):
+            out[want] = raw.get(key)
+    # Retain other useful scalar technical fields without dumping arbitrary JSON.
+    useful_tokens = ("trend","atr","rsi","macd","ema","moment","return","break","pull","vol","candidate","regime")
+    for key,val in raw.items():
+        if len(out) >= 60:
+            break
+        lk = safe_str(key).lower()
+        if any(tok in lk for tok in useful_tokens) and isinstance(val,(str,int,float,bool,type(None))):
+            out.setdefault(safe_str(key), val)
+    return out
+
+
+def _aiobs_extract_text(data):
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    bits = []
+    for item in data.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if isinstance(content, dict):
+                txt = content.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    bits.append(txt.strip())
+    return "\n".join(bits).strip()
+
+
+def _aiobs_openai_call(model_input, raw_signal_id):
+    body = {
+        "model": AI_SHADOW_MODEL,
+        "instructions": AI_REGIME_SYSTEM_PROMPT,
+        "input": json.dumps(model_input, separators=(",",":"), default=str),
+        "store": False,
+        "max_output_tokens": AI_SHADOW_MAX_OUTPUT_TOKENS,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "project_exit_plan_regime_observer",
+                "strict": True,
+                "schema": AI_REGIME_OUTPUT_SCHEMA,
+            }
+        },
+    }
+    req = urllib.request.Request(
+        AI_SHADOW_OPENAI_API_BASE + "/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + AI_SHADOW_OPENAI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    last_error = ""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=AI_SHADOW_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            txt = _aiobs_extract_text(data)
+            decision = json.loads(txt) if txt else {}
+            required = {"entry_view","management_view","regime","confidence","live_rule_assessment","reason_codes","short_reason"}
+            if not isinstance(decision, dict) or not required.issubset(decision):
+                raise ValueError("structured regime decision missing required fields")
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            return {
+                "ok": True,
+                "decision": decision,
+                "response_id": safe_str(data.get("id")),
+                "input_tokens": int(safe_float(usage.get("input_tokens")) or 0),
+                "output_tokens": int(safe_float(usage.get("output_tokens")) or 0),
+            }
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    return {"ok": False, "error": last_error or "OpenAI request failed"}
+
+
+def process_ai_regime_observer(raw_signal_id):
+    if not AI_SHADOW_ENABLED or not AI_SHADOW_OPENAI_API_KEY:
+        return {"ok":True,"skipped":True,"reason":"AI observer API inactive"}
+    ensure_ai_regime_observer_table()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+        if not row:
+            return {"ok":False,"reason":"snapshot_missing"}
+        row = dict(row)
+        if safe_str(row.get("status")).upper() == "COMPLETE":
+            return {"ok":True,"skipped":True,"reason":"already_complete"}
+        if not int(safe_float(row.get("api_eligible")) or 0):
+            return {"ok":True,"skipped":True,"reason":"capture_only"}
+        snap = json.loads(safe_str(row.get("snapshot_json")) or "{}")
+        model_input = snap.get("model_input") or {}
+        started = now_utc_iso()
+        conn.execute("""UPDATE ai_regime_observer
+                       SET status='RUNNING',updated_at_utc=?,request_started_at_utc=?,model=?,error=''
+                       WHERE raw_signal_id=?""",
+                    (started,started,AI_SHADOW_MODEL,int(raw_signal_id)))
+        conn.commit()
+
+    api = _aiobs_openai_call(model_input, int(raw_signal_id))
+    now = now_utc_iso()
+    with get_conn() as conn:
+        if not api.get("ok"):
+            conn.execute("""UPDATE ai_regime_observer SET status='ERROR',updated_at_utc=?,
+                            completed_at_utc=?,error=? WHERE raw_signal_id=?""",
+                         (now,now,safe_str(api.get("error"))[:4000],int(raw_signal_id)))
+            conn.commit()
+            return api
+        d = api["decision"]
+        conn.execute("""UPDATE ai_regime_observer SET
+                        status='COMPLETE',updated_at_utc=?,completed_at_utc=?,
+                        entry_view=?,management_view=?,regime=?,confidence=?,
+                        live_rule_assessment=?,reason_codes=?,short_reason=?,
+                        response_id=?,input_tokens=?,output_tokens=?,model=?,error=''
+                        WHERE raw_signal_id=?""",
+                     (now,now,safe_str(d.get("entry_view")),safe_str(d.get("management_view")),
+                      safe_str(d.get("regime")),int(safe_float(d.get("confidence")) or 0),
+                      safe_str(d.get("live_rule_assessment")),json.dumps(d.get("reason_codes") or []),
+                      safe_str(d.get("short_reason"))[:1500],safe_str(api.get("response_id")),
+                      int(api.get("input_tokens") or 0),int(api.get("output_tokens") or 0),
+                      AI_SHADOW_MODEL,int(raw_signal_id)))
+        conn.commit()
+    return {"ok":True,"decision":d,"research_only":True}
+
+
+def _aiobs_worker_loop():
+    global _ai_regime_last_heartbeat_utc, _ai_regime_last_raw_signal_id
+    while True:
+        _ai_regime_last_heartbeat_utc = now_utc_iso()
+        try:
+            rid = _ai_regime_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            _ai_regime_last_raw_signal_id = int(rid)
+            process_ai_regime_observer(int(rid))
+        finally:
+            _ai_regime_last_heartbeat_utc = now_utc_iso()
+            try:
+                _ai_regime_queue.task_done()
+            except Exception:
+                pass
+
+
+def _aiobs_ensure_worker():
+    global _ai_regime_worker_started, _ai_regime_worker_thread
+    if not AI_SHADOW_ENABLED or not AI_SHADOW_OPENAI_API_KEY:
+        return
+    if _ai_regime_worker_thread is not None and _ai_regime_worker_thread.is_alive():
+        _ai_regime_worker_started = True
+        return
+    _ai_regime_worker_started = True
+    _ai_regime_worker_thread = threading.Thread(target=_aiobs_worker_loop,name="bco-ai-regime-observer",daemon=True)
+    _ai_regime_worker_thread.start()
+
+
+def enqueue_ai_regime_observer(raw_signal_id):
+    if not AI_SHADOW_ENABLED:
+        return {"queued":False,"reason":"AI_SHADOW_ENABLED=false"}
+    if not AI_SHADOW_OPENAI_API_KEY:
+        return {"queued":False,"reason":"OPENAI_API_KEY missing"}
+    _aiobs_ensure_worker()
+    try:
+        _ai_regime_queue.put_nowait(int(raw_signal_id))
+        return {"queued":True}
+    except queue.Full:
+        return {"queued":False,"reason":"observer_queue_full"}
+
+
+def ai_regime_observer_status():
+    ensure_ai_regime_observer_table()
+    with get_conn() as conn:
+        rows = conn.execute("SELECT status,COUNT(*) AS c FROM ai_regime_observer GROUP BY status").fetchall()
+    return {
+        "ok":True,
+        "research_only":True,
+        "execution_authority":False,
+        "capture_enabled":AI_SHADOW_CAPTURE_ENABLED,
+        "ai_enabled":AI_SHADOW_ENABLED,
+        "api_key_configured":bool(AI_SHADOW_OPENAI_API_KEY),
+        "model":AI_SHADOW_MODEL,
+        "prompt_version":AI_SHADOW_PROMPT_VERSION,
+        "observer_version":AI_SHADOW_OBSERVER_VERSION,
+        "event_driven_only":AI_SHADOW_EVENT_DRIVEN_ONLY,
+        "counts":{safe_str(r["status"]):int(r["c"] or 0) for r in rows},
+        "worker_started":_ai_regime_worker_started,
+        "thread_alive":bool(_ai_regime_worker_thread and _ai_regime_worker_thread.is_alive()),
+        "queue_size":_ai_regime_queue.qsize(),
+        "last_heartbeat_utc":_ai_regime_last_heartbeat_utc,
+        "last_raw_signal_id":_ai_regime_last_raw_signal_id,
+    }
+
+
+@app.get("/ai-regime-observer/status")
+def ai_regime_observer_status_endpoint():
+    return ai_regime_observer_status()
+
+
+@app.get("/export/ai-regime-observer.csv")
+def export_ai_regime_observer_csv(limit: int = 5000):
+    ensure_ai_regime_observer_table()
+    limit=max(1,min(int(limit),50000))
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute(
+            "SELECT * FROM ai_regime_observer ORDER BY id DESC LIMIT ?",(limit,)
+        ).fetchall()]
+    out=io.StringIO()
+    if rows:
+        fields=[]
+        for r in rows:
+            for k in r:
+                if k not in fields: fields.append(k)
+        w=csv.DictWriter(out,fieldnames=fields,extrasaction="ignore")
+        w.writeheader();w.writerows(rows)
+    else:
+        out.write("note\nNo AI regime-observer rows yet\n")
+    return Response(content=out.getvalue(),media_type="text/csv",
+                    headers={"Content-Disposition":'attachment; filename="ai-regime-observer.csv"'})
+
+
+def build_ai_regime_observer_html():
+    status=ai_regime_observer_status()
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute(
+            "SELECT * FROM ai_regime_observer ORDER BY id DESC LIMIT 300"
+        ).fetchall()]
+    complete=[r for r in rows if safe_str(r.get("status")).upper()=="COMPLETE"]
+    visible=[r for r in rows if int(safe_float(r.get("api_eligible")) or 0) or safe_str(r.get("status")).upper()=="COMPLETE"][:50]
+    counts={x:sum(1 for r in complete if safe_str(r.get("regime")).upper()==x)
+             for x in ("TREND","TRANSITION","CHOP","EXHAUSTION")}
+    latest=complete[0] if complete else None
+    if status["ai_enabled"] and status["api_key_configured"]:
+        mode="ACTIVE EVENT-DRIVEN REGIME OBSERVER";cls="pos"
+    elif status["capture_enabled"]:
+        mode="CAPTURE ONLY — API INACTIVE";cls="warn"
+    else:
+        mode="DISABLED";cls="flat"
+    latest_txt=(f"{safe_str(latest.get('asset'))} {safe_str(latest.get('regime'))} "
+                f"({int(safe_float(latest.get('confidence')) or 0)}%)") if latest else "No completed label yet"
+    trs=""
+    for r in visible:
+        try:
+            codes=json.loads(safe_str(r.get("reason_codes")) or "[]")
+        except Exception:
+            codes=[]
+        trs+=f"""<tr>
+          <td>{esc(r.get('signal_time'))}</td><td><strong>{esc(r.get('asset'))}</strong></td>
+          <td>{esc(r.get('trigger_reason') or '—')}</td>
+          <td>{'TRUE' if int(safe_float(r.get('live_candidate')) or 0) else 'FALSE'}</td>
+          <td>{esc(r.get('candidate_side') or '—')}</td>
+          <td><strong>{esc(r.get('regime') or '—')}</strong></td>
+          <td>{esc(r.get('confidence') if r.get('confidence') is not None else '—')}</td>
+          <td>{esc(', '.join(str(x) for x in codes) or '—')}</td>
+          <td>{esc(r.get('short_reason') or r.get('error') or '—')}</td>
+          <td>{esc(r.get('status'))}</td>
+        </tr>"""
+    if not trs:
+        trs='<tr><td colspan="10">No AI regime-observer events yet. First post-deploy production signal will create a point-in-time observation.</td></tr>'
+    return f"""
+      <div class="section-note small">
+        <strong>Research only — zero broker authority.</strong>
+        Same event-driven regime-observer architecture and output taxonomy as Live Indices.
+        Every signal snapshot is frozen before deterministic processing; paid calls occur only
+        on meaningful state changes. No observer field is consumed by entry, exit, stop,
+        sizing, harvesting or basket-management code.
+      </div>
+      <div class="cards three">
+        <div class="card"><div class="label">AI Regime Observer</div><div class="value {cls}" style="font-size:18px">{esc(mode)}</div><div class="small">Model: {esc(AI_SHADOW_MODEL)} · {esc(AI_SHADOW_PROMPT_VERSION)}</div></div>
+        <div class="card"><div class="label">Latest Regime Label</div><div class="value flat" style="font-size:18px">{esc(latest_txt)}</div><div class="small">TREND {counts['TREND']} · TRANSITION {counts['TRANSITION']} · CHOP {counts['CHOP']} · EXHAUSTION {counts['EXHAUSTION']}</div></div>
+        <div class="card"><div class="label">API Spend Control</div><div class="value pos">EVENT DRIVEN</div><div class="small">Captured {len(rows)} recent · paid-eligible {sum(1 for r in rows if int(safe_float(r.get('api_eligible')) or 0))}</div></div>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Candle</th><th>Asset</th><th>Why AI Was Called</th><th>Candidate</th><th>Side</th><th>Regime</th><th>Confidence</th><th>Reason Codes</th><th>Observer Reason / Error</th><th>Status</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table></div>
+      <div class="section-note small">
+        Export: <a href="/export/ai-regime-observer.csv">AI Regime Observer CSV</a> ·
+        status: <a href="/ai-regime-observer/status">observer JSON</a>.
+      </div>
+    """
+
+
+def _bco_aiobs_state(conn, raw_signal_id, payload):
+    sig=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+    sig=dict(sig) if sig else {}
+    state=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1").fetchone()
+    state=dict(state) if state else {}
+    rows=conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id").fetchall()
+    open_rows=[dict(r) for r in rows]
+    mature=sum(1 for t in open_rows if int(safe_float(t.get("hold_candles")) or 0)>=48)
+    candidate=bool(sig.get("candidate_8h"))
+    basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows)
+    hwm=float(safe_float(state.get("high_water_R")) or 0.0)
+    give=float(safe_float(state.get("giveback_pct")) or 0.0)
+    consumed=0
+    cycle=safe_str(state.get("cycle_id"))
+    if cycle:
+        row=conn.execute("""SELECT COUNT(*) AS c FROM protection_stages
+                            WHERE cycle_id=? AND UPPER(COALESCE(status,'')) IN
+                            ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
+        consumed=int(row["c"] or 0) if row else 0
+    return {
+        "asset":"BCO","candidate":candidate,"side":"long" if candidate else "",
+        "open_count":len(open_rows),"mature_48h_plus":mature,
+        "basket_r":basket_r,"high_water_r":hwm,"giveback_pct":give,
+        "giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),
+        "high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),
+        "consumed_bank_stages":consumed,
+        "cycle_id":cycle,
+        "tide_status":safe_str(state.get("tide_status") or state.get("status")),
+        "manager_action":safe_str(state.get("manager_action")),
+    }
+
+
+def capture_ai_regime_snapshot(raw_signal_id, payload):
+    if not AI_SHADOW_CAPTURE_ENABLED:
+        return {"captured":False,"reason":"AI_SHADOW_CAPTURE_ENABLED=false"}
+    ensure_ai_regime_observer_table()
+    with get_conn() as conn:
+        existing=conn.execute("SELECT * FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+        if existing:
+            return {"captured":True,"existing":True,"api_eligible":bool(existing["api_eligible"]),"trigger_reason":existing["trigger_reason"]}
+        sig=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
+        sig=dict(sig) if sig else {}
+        current=_bco_aiobs_state(conn,raw_signal_id,payload)
+        previous_row=conn.execute("SELECT snapshot_json FROM ai_regime_observer ORDER BY raw_signal_id DESC LIMIT 1").fetchone()
+        previous={}
+        if previous_row:
+            try: previous=(json.loads(previous_row["snapshot_json"]) or {}).get("event_state") or {}
+            except Exception: previous={}
+        reasons=[]
+        if not previous:
+            reasons.append("FIRST_OBSERVATION")
+        else:
+            if bool(current["candidate"]) != bool(previous.get("candidate")):
+                reasons.append("CANDIDATE_FLIP_TO_TRUE" if current["candidate"] else "CANDIDATE_FLIP_TO_FALSE")
+            if int(previous.get("mature_48h_plus") or 0)<=0<int(current["mature_48h_plus"]):
+                reasons.append("MATURE_EXPOSURE_ON")
+            elif int(previous.get("mature_48h_plus") or 0)>0>=int(current["mature_48h_plus"]):
+                reasons.append("MATURE_EXPOSURE_OFF")
+            if int(current["giveback_band"])>int(previous.get("giveback_band") or 0):
+                reasons.append(f"GIVEBACK_BAND_UP_{int(previous.get('giveback_band') or 0)}_TO_{current['giveback_band']}")
+            if int(current["high_water_band"])>int(previous.get("high_water_band") or 0):
+                reasons.append(f"HIGH_WATER_BAND_UP_{int(previous.get('high_water_band') or 0)}_TO_{current['high_water_band']}")
+            if int(current["consumed_bank_stages"])>int(previous.get("consumed_bank_stages") or 0):
+                reasons.append("BANK_STAGE_CONSUMED")
+        api_eligible=(not AI_SHADOW_EVENT_DRIVEN_ONLY) or bool(reasons)
+        model_input={
+            "snapshot_version":"ai_regime_observer_point_in_time_v1",
+            "project_family":"BCO",
+            "current_asset":"BCO",
+            "current_signal":_aiobs_scalar_features(payload),
+            "event_state":current,
+            "recent_history":[],
+            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing.",
+        }
+        recent=conn.execute("""SELECT timestamp_readable,candidate_8h,exec_close,signal_side
+                               FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT 6""",(int(raw_signal_id),)).fetchall()
+        model_input["recent_history"]=[dict(r) for r in recent]
+        snapshot={"captured_at_utc":now_utc_iso(),"event_state":current,"model_input":model_input}
+        status="CAPTURED" if api_eligible else "CAPTURED_NO_CALL"
+        trigger="|".join(reasons)
+        conn.execute("""INSERT INTO ai_regime_observer(
+            created_at_utc,updated_at_utc,raw_signal_id,asset,signal_time,
+            live_candidate,candidate_side,trigger_reason,api_eligible,status,
+            snapshot_json,model,prompt_version,observer_version)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now_utc_iso(),now_utc_iso(),int(raw_signal_id),"BCO",safe_str(sig.get("timestamp_readable")),
+             1 if current["candidate"] else 0,current["side"],trigger,1 if api_eligible else 0,status,
+             json.dumps(snapshot,default=str),AI_SHADOW_MODEL,AI_SHADOW_PROMPT_VERSION,AI_SHADOW_OBSERVER_VERSION))
+        conn.commit()
+    q=enqueue_ai_regime_observer(raw_signal_id) if api_eligible else {"queued":False,"reason":"event_driven_capture_only"}
+    return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,"queue":q,"research_only":True}
+
+
 # -----------------------------------------------------------------------------
 # API / dashboard
 # -----------------------------------------------------------------------------
@@ -2464,13 +2973,18 @@ async def tradingview_webhook(request: Request, secret: str = Query(default=""))
     if not isinstance(body,dict): raise HTTPException(status_code=400,detail="JSON object required")
     raw_id,payload,duplicate=store_signal(body)
     if duplicate: return {"status":"duplicate","raw_signal_id":raw_id}
+    # Freeze AI research evidence BEFORE deterministic entry/manager processing.
+    try:
+        ai_regime_observer=capture_ai_regime_snapshot(raw_id,payload)
+    except Exception as _ai_exc:
+        ai_regime_observer={"captured":False,"research_only":True,"error":f"{type(_ai_exc).__name__}: {_ai_exc}"}
     try:
         result=process_signal(raw_id,payload)
         focused_research=record_bco_focused_research(raw_id)
     except Exception as e:
         log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id})
         raise
-    return {"status":"ok","raw_signal_id":raw_id,"result":result,"focused_research":focused_research}
+    return {"status":"ok","raw_signal_id":raw_id,"result":result,"focused_research":focused_research,"ai_regime_observer":ai_regime_observer}
 
 
 @app.get("/snapshot")
@@ -2700,7 +3214,8 @@ def _bf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_bco_focused_research_html():
-    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same four evidence themes as the Indices master. BCO alignment is the single-asset 4h/8h/24h equivalent. Research-only; no execution impact.</div>' + \
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus the event-driven AI Regime Observer. All AI output is research-only with zero execution authority.</div>' + \
+      '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _bf_table("BCO Multi-Horizon Alignment / Divergence",_bf_rows("bco_focused_alignment",100),["signal_time","state","return_4h","return_8h","return_24h","candidate"]) + \
       _bf_table("Trend Efficiency / Chop Research",_bf_rows("bco_focused_efficiency",150),["signal_time","lookback_candles","efficiency","state","net_move_pct","path_travelled_pct"]) + \
@@ -2721,7 +3236,18 @@ def export_bco_focused_research_zip(limit:int=25000):
                         if k not in fields:fields.append(k)
                 w=csv.DictWriter(out,fieldnames=fields);w.writeheader();w.writerows(rows)
             z.writestr(fn,out.getvalue())
-        z.writestr("manifest.json",json.dumps({"project":"BCO","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)},indent=2))
+        ensure_ai_regime_observer_table()
+        with get_conn() as _aic:
+            _airows=[dict(r) for r in _aic.execute("SELECT * FROM ai_regime_observer ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+        _aio=io.StringIO()
+        if _airows:
+            _fields=[]
+            for _r in _airows:
+                for _k in _r:
+                    if _k not in _fields:_fields.append(_k)
+            _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
+        z.writestr("ai-regime-observer.csv",_aio.getvalue())
+        z.writestr("manifest.json",json.dumps({"project":"BCO","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"]},indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-focused-research.zip"'})
 
 
