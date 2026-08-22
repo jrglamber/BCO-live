@@ -32,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.1 — AI Live Basket Context"
-APP_VERSION = "0.7.1"
-POLICY_VERSION = "bco_v0.7.1_ai_live_basket_context"
+APP_NAME = "Project Exit Plan — BCO v0.7.2 — Self-Healing Manager + Complete Analysis Export"
+APP_VERSION = "0.7.2"
+POLICY_VERSION = "bco_v0.7.2_self_healing_manager_complete_export"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -146,6 +146,15 @@ BCO_TRANSACTION_SYNC_PAGE_LIMIT = max(100, min(int(float(os.getenv("BCO_TRANSACT
 BCO_HEALTH_SIGNAL_STALE_SECONDS = max(3600, int(float(os.getenv("BCO_HEALTH_SIGNAL_STALE_SECONDS", "10800"))))
 BCO_HEALTH_RECONCILE_STALE_SECONDS = max(60, int(float(os.getenv("BCO_HEALTH_RECONCILE_STALE_SECONDS", "180"))))
 
+# v0.7.2 — self-healing signal/manager recovery.
+# A TradingView signal is durable as soon as it is inserted into raw_signals.
+# If processing dies after that insert but before basket_decisions is written,
+# the background worker safely replays the unprocessed tail in chronological order.
+BCO_SIGNAL_RECOVERY_ENABLED = env_bool("BCO_SIGNAL_RECOVERY_ENABLED", True)
+BCO_SIGNAL_RECOVERY_BATCH_LIMIT = max(
+    1, min(int(float(os.getenv("BCO_SIGNAL_RECOVERY_BATCH_LIMIT", "12"))), 100)
+)
+
 
 # Shared-account guard. This service may read account-wide NAV/margin, but all
 # writes and strategy P&L are restricted to BCO-owned trades only.
@@ -157,6 +166,7 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 _db_lock = threading.RLock()
 _worker_stop = threading.Event()
 _worker_started = False
+_worker_thread: Optional[threading.Thread] = None
 
 
 # -----------------------------------------------------------------------------
@@ -1642,11 +1652,29 @@ def close_broker_trade(broker_trade_id: str, local_trade_id: str, reason: str) -
 # -----------------------------------------------------------------------------
 # Trade/basket engine
 # -----------------------------------------------------------------------------
-def candidate_support(conn: DBConn, limit: int = 3) -> Dict[str, Any]:
-    rows = fetchall_dict(conn.execute("SELECT candidate_8h FROM raw_signals ORDER BY id DESC LIMIT ?", (limit,)))
+def candidate_support(
+    conn: DBConn,
+    limit: int = 3,
+    max_raw_signal_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Candidate support using only information available at that raw signal."""
+    if max_raw_signal_id is not None and int(max_raw_signal_id or 0) > 0:
+        rows = fetchall_dict(conn.execute(
+            "SELECT candidate_8h FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT ?",
+            (int(max_raw_signal_id), int(limit)),
+        ))
+    else:
+        rows = fetchall_dict(conn.execute(
+            "SELECT candidate_8h FROM raw_signals ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ))
     vals = [parse_bool(r.get("candidate_8h"), False) for r in rows]
     n = sum(1 for v in vals if v)
-    return {"latest_candidate": bool(vals[0]) if vals else False, "candidate_true_last_3": n, "supported": bool((vals and vals[0]) or n >= 2)}
+    return {
+        "latest_candidate": bool(vals[0]) if vals else False,
+        "candidate_true_last_3": n,
+        "supported": bool((vals and vals[0]) or n >= 2),
+    }
 
 
 def basket_metrics(conn: DBConn) -> Dict[str, Any]:
@@ -1674,8 +1702,19 @@ def ensure_cycle(conn: DBConn, signal_time: str, metrics: Dict[str, Any]) -> Dic
     return state
 
 
-def regime(conn: DBConn) -> str:
-    rows = fetchall_dict(conn.execute("SELECT exec_close,exec_high,exec_low FROM raw_signals WHERE exec_close IS NOT NULL ORDER BY id DESC LIMIT 121"))
+def regime(conn: DBConn, max_raw_signal_id: Optional[int] = None) -> str:
+    """Regime using only rows known at the signal being processed/recovered."""
+    if max_raw_signal_id is not None and int(max_raw_signal_id or 0) > 0:
+        rows = fetchall_dict(conn.execute(
+            "SELECT exec_close,exec_high,exec_low FROM raw_signals "
+            "WHERE exec_close IS NOT NULL AND id<=? ORDER BY id DESC LIMIT 121",
+            (int(max_raw_signal_id),),
+        ))
+    else:
+        rows = fetchall_dict(conn.execute(
+            "SELECT exec_close,exec_high,exec_low FROM raw_signals "
+            "WHERE exec_close IS NOT NULL ORDER BY id DESC LIMIT 121"
+        ))
     if len(rows) < 121: return "unknown"
     latest = safe_float(rows[0].get("exec_close")); oldest = safe_float(rows[-1].get("exec_close"))
     highs = [safe_float(r.get("exec_high")) for r in rows]; lows = [safe_float(r.get("exec_low")) for r in rows]
@@ -1843,7 +1882,7 @@ def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str
     ret = (current-entry)/entry*100.0; mfe=max(0.0,(highest-entry)/entry*100.0); mae=min(0.0,(lowest-entry)/entry*100.0); rr=ret/BCO_SL_PCT
     record_fixed_48_outcome(conn, trade, signal_time, float(current), rr, mfe, mae, hold)
     d48=safe_str(trade.get("decision_48")); d72=safe_str(trade.get("decision_72")); exit_now=False; reason=""
-    reg=regime(conn)
+    reg=regime(conn, max_raw_signal_id=raw_signal_id)
     if hold >= 48 and not d48:
         passed,reasons=extension_decision(reg,ret,mfe)
         if not passed:
@@ -2041,7 +2080,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         # idempotency: decision row means this raw signal was already fully processed.
         if fetchone_dict(conn.execute("SELECT id FROM basket_decisions WHERE raw_signal_id=?",(raw_signal_id,))):
             return {"ok":True,"duplicate":True,"raw_signal_id":raw_signal_id}
-        support=candidate_support(conn)
+        support=candidate_support(conn, max_raw_signal_id=raw_signal_id)
         before=basket_metrics(conn)
         state=ensure_cycle(conn,signal_time,before)
         # Update existing trades before deciding defence/entry.
@@ -2090,6 +2129,105 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         """,(now_utc_iso(),raw_signal_id,signal_time,final_state.get("cycle_id"),candidate,entry_allowed,entry_created,before["open_count"],final["open_count"],before["basket_R"],final["basket_R"],final_state.get("high_water_R"),final_state.get("giveback_pct"),final["losing_pct"],final["phase"],score,status,action,detail,defence.get("closed_count"),",".join(defence.get("closed_trade_ids") or []),protection.get("banked_R"),",".join(protection.get("banked_trade_ids") or []),f"entry_block={block_reason}; raw_action={raw_action}; reasons={','.join(reasons)}"))
         record_basket_snapshot(conn, raw_signal_id, signal_time, final_state, final)
     return {"ok":True,"raw_signal_id":raw_signal_id,"candidate":candidate,"entry_allowed":entry_allowed,"entry_created":entry_created,"trade_id":new_trade_id,"basket":snapshot()}
+
+
+def recover_unprocessed_bco_signals(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Recover only the unprocessed tail of durable BCO raw signals.
+
+    Rows are replayed oldest-first. Candidate support and regime calculations are
+    bounded to each raw_signal_id so an older recovered signal cannot see later
+    raw rows. AI observer snapshots are intentionally not backfilled because their
+    contract requires capture before deterministic processing.
+    """
+    if not BCO_SIGNAL_RECOVERY_ENABLED:
+        return {"ok": True, "enabled": False, "recovered": 0, "pending": 0}
+
+    batch = max(1, min(int(limit or BCO_SIGNAL_RECOVERY_BATCH_LIMIT), 100))
+    with _db_lock, get_conn() as conn:
+        dec = fetchone_dict(conn.execute(
+            "SELECT COALESCE(MAX(raw_signal_id),0) AS max_id FROM basket_decisions"
+        )) or {}
+        max_decision_id = int(safe_float(dec.get("max_id")) or 0)
+        pending = fetchall_dict(conn.execute(
+            "SELECT * FROM raw_signals WHERE id>? ORDER BY id ASC LIMIT ?",
+            (max_decision_id, batch),
+        ))
+
+    recovered = 0
+    duplicates = 0
+    errors: List[Dict[str, Any]] = []
+    recovered_ids: List[int] = []
+
+    for row in pending:
+        raw_id = int(safe_float(row.get("id")) or 0)
+        if raw_id <= 0:
+            continue
+
+        with _db_lock, get_conn() as conn:
+            done = fetchone_dict(conn.execute(
+                "SELECT id FROM basket_decisions WHERE raw_signal_id=? LIMIT 1",
+                (raw_id,),
+            ))
+        if done:
+            duplicates += 1
+            continue
+
+        try:
+            raw_body = json.loads(safe_str(row.get("raw_json")) or "{}")
+            if not isinstance(raw_body, dict):
+                raise ValueError("raw_json is not a JSON object")
+            payload = extract_payload(raw_body)
+            if not isinstance(payload, dict):
+                raise ValueError("stored payload is not a JSON object")
+
+            result = process_signal(raw_id, payload)
+            if result.get("duplicate"):
+                duplicates += 1
+            elif result.get("ok"):
+                recovered += 1
+                recovered_ids.append(raw_id)
+                research_fn = globals().get("record_bco_focused_research")
+                if callable(research_fn):
+                    try:
+                        research_fn(raw_id)
+                    except Exception as research_exc:
+                        log_event(
+                            "signal_recovery_research_warning",
+                            f"raw_signal_id={raw_id}: {research_exc}",
+                        )
+                log_event(
+                    "signal_recovered",
+                    f"Recovered stored BCO raw signal {raw_id} into deterministic processing.",
+                    {"raw_signal_id": raw_id},
+                )
+            else:
+                raise RuntimeError(safe_str(result.get("error") or "process_signal returned ok=false"))
+        except Exception as exc:
+            errors.append({"raw_signal_id": raw_id, "error": f"{type(exc).__name__}: {exc}"})
+            log_event(
+                "signal_recovery_error",
+                f"raw_signal_id={raw_id}: {type(exc).__name__}: {exc}",
+                {"raw_signal_id": raw_id},
+            )
+            # Never skip over a failed tail row: that would break chronology.
+            break
+
+    with _db_lock, get_conn() as conn:
+        runtime_set(conn, "signal_recovery_last_at", now_utc_iso())
+        runtime_set(conn, "signal_recovery_last_recovered", str(recovered))
+        runtime_set(conn, "signal_recovery_last_errors", str(len(errors)))
+
+    return {
+        "ok": not errors,
+        "enabled": True,
+        "max_completed_raw_signal_id_before": max_decision_id,
+        "pending_scanned": len(pending),
+        "recovered": recovered,
+        "recovered_ids": recovered_ids,
+        "duplicates": duplicates,
+        "errors": errors,
+        "time_utc": now_utc_iso(),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -2229,6 +2367,8 @@ def preflight() -> Dict[str,Any]:
 def _worker() -> None:
     while not _worker_stop.wait(BROKER_RECONCILE_INTERVAL_SECONDS):
         try:
+            # Signal/manager recovery does not depend on OANDA being available.
+            recover_unprocessed_bco_signals()
             if OANDA_ENABLED and OANDA_ACCOUNT_ID:
                 process_broker_action_queue()
                 reconcile_broker()
@@ -2238,10 +2378,17 @@ def _worker() -> None:
 
 
 def start_worker() -> None:
-    global _worker_started
-    if _worker_started: return
-    _worker_started=True
-    threading.Thread(target=_worker,name="bco-broker-reconcile",daemon=True).start()
+    global _worker_started, _worker_thread
+    if _worker_thread is not None and _worker_thread.is_alive():
+        _worker_started = True
+        return
+    _worker_started = True
+    _worker_thread = threading.Thread(
+        target=_worker,
+        name="bco-broker-reconcile-and-manager-recovery",
+        daemon=True,
+    )
+    _worker_thread.start()
 
 
 _bootstrap_started = False
@@ -2258,6 +2405,13 @@ def _background_bootstrap() -> None:
     _bootstrap_state["started_at_utc"] = now_utc_iso()
     try:
         init_db()
+        if BCO_SIGNAL_RECOVERY_ENABLED:
+            _bootstrap_state["status"] = "RECOVERING_STORED_SIGNALS"
+            recovery = recover_unprocessed_bco_signals()
+            try:
+                log_event("startup_signal_recovery", "BCO startup signal recovery completed.", recovery)
+            except Exception:
+                pass
         _bootstrap_state["status"] = "STARTING_WORKER"
         start_worker()
         try:
@@ -2964,8 +3118,25 @@ def operational_health() -> Dict[str, Any]:
     reconcile_age = _iso_age_seconds(reconcile_time)
     tx_age = _iso_age_seconds(tx_sync_at)
 
+    worker_alive = bool(_worker_thread is not None and _worker_thread.is_alive())
+    recovery_last_at = ""
+    recovery_last_count = 0
+    try:
+        with get_conn() as conn:
+            recovery_last_at = runtime_get(conn, "signal_recovery_last_at", "")
+            recovery_last_count = int(float(runtime_get(conn, "signal_recovery_last_recovered", "0") or 0))
+    except Exception:
+        pass
+
     checks = {
         "database": {"ok": db_ok, "error": db_error},
+        "manager_recovery_worker": {
+            "ok": worker_alive,
+            "enabled": BCO_SIGNAL_RECOVERY_ENABLED,
+            "thread_alive": worker_alive,
+            "last_recovery_at": recovery_last_at,
+            "last_recovered_count": recovery_last_count,
+        },
         "signal_freshness": {
             "ok": signal_age is None or signal_age <= BCO_HEALTH_SIGNAL_STALE_SECONDS,
             "age_seconds": signal_age, "latest": signal_time,
@@ -3097,7 +3268,22 @@ def csv_response(rows: List[Dict[str,Any]], filename: str) -> Response:
 
 @app.get("/export/{table}.csv")
 def export_table(table: str):
-    allowed={"raw-signals":"raw_signals","trades":"trades","basket-decisions":"basket_decisions","protection-stages":"protection_stages","managed-stops":"managed_stop_events","execution-audit":"execution_audit","system-events":"system_events"}
+    allowed={
+        "raw-signals":"raw_signals",
+        "trades":"trades",
+        "basket-decisions":"basket_decisions",
+        "protection-stages":"protection_stages",
+        "managed-stops":"managed_stop_events",
+        "execution-audit":"execution_audit",
+        "system-events":"system_events",
+        "broker-action-queue":"broker_action_queue",
+        "broker-transactions":"broker_transactions",
+        "fixed-48-outcomes":"fixed_48_outcomes",
+        "trade-manager-reviews":"trade_manager_reviews",
+        "basket-snapshots":"basket_snapshots",
+        "harvest-execution-outcomes":"harvest_execution_outcomes",
+        "accounting-snapshots":"accounting_snapshots",
+    }
     if table not in allowed: raise HTTPException(status_code=404,detail="unknown export")
     with get_conn() as conn: rows=fetchall_dict(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id ASC"))
     return csv_response(rows,f"bco-{table}.csv")
@@ -3105,7 +3291,22 @@ def export_table(table: str):
 
 @app.get("/export/all.zip")
 def export_all_zip():
-    allowed={"raw-signals":"raw_signals","trades":"trades","basket-decisions":"basket_decisions","protection-stages":"protection_stages","managed-stops":"managed_stop_events","execution-audit":"execution_audit","system-events":"system_events"}
+    allowed={
+        "raw-signals":"raw_signals",
+        "trades":"trades",
+        "basket-decisions":"basket_decisions",
+        "protection-stages":"protection_stages",
+        "managed-stops":"managed_stop_events",
+        "execution-audit":"execution_audit",
+        "system-events":"system_events",
+        "broker-action-queue":"broker_action_queue",
+        "broker-transactions":"broker_transactions",
+        "fixed-48-outcomes":"fixed_48_outcomes",
+        "trade-manager-reviews":"trade_manager_reviews",
+        "basket-snapshots":"basket_snapshots",
+        "harvest-execution-outcomes":"harvest_execution_outcomes",
+        "accounting-snapshots":"accounting_snapshots",
+    }
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         with get_conn() as conn:
@@ -3120,7 +3321,18 @@ def export_all_zip():
                     w=csv.DictWriter(sio,fieldnames=fields); w.writeheader(); w.writerows(rows)
                 z.writestr(f"bco-{name}.csv",sio.getvalue())
         z.writestr("bco-live-snapshot.json",json.dumps(snapshot(),indent=2,default=str))
-        z.writestr("manifest.json",json.dumps({"app":APP_NAME,"version":APP_VERSION,"policy":POLICY_VERSION,"asset":"BCOUSD","direction":"long","risk_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,"generated_at_utc":now_utc_iso()},indent=2))
+        z.writestr("manifest.json",json.dumps({
+            "app":APP_NAME,
+            "version":APP_VERSION,
+            "policy":POLICY_VERSION,
+            "asset":"BCOUSD",
+            "direction":"long",
+            "requested_risk_gbp":BCO_RISK_PER_TRADE_GBP,
+            "sl_pct":BCO_SL_PCT,
+            "signal_recovery_enabled":BCO_SIGNAL_RECOVERY_ENABLED,
+            "analysis_tables":sorted(list(allowed.keys())),
+            "generated_at_utc":now_utc_iso(),
+        },indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-live-analysis.zip"'})
 
 
@@ -4085,4 +4297,3 @@ async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
     return {"status":"ok","version":"0.3.0","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
-
