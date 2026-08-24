@@ -32,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.2 — Self-Healing Manager + Complete Analysis Export"
-APP_VERSION = "0.7.2"
-POLICY_VERSION = "bco_v0.7.2_self_healing_manager_complete_export"
+APP_NAME = "Project Exit Plan — BCO v0.7.3 — Dashboard Visibility Parity"
+APP_VERSION = "0.7.3"
+POLICY_VERSION = "bco_v0.7.3_dashboard_visibility_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -3870,6 +3870,37 @@ def _bco_standard_basket_manager_html():
       <div class="table-scroll"><table><thead><tr><th>Trade</th><th>Entry</th><th>Price</th><th>Age</th><th>R</th><th>48h</th><th>72h</th><th>Protection</th><th>Broker ID</th></tr></thead><tbody>{trade_rows}</tbody></table></div>
     '''
 
+
+def _bco_latest_30_signals_html(limit: int = 30):
+    limit=max(1,min(int(limit or 30),100))
+    with get_conn() as conn:
+        rows=fetchall_dict(conn.execute("SELECT id,received_at_utc,pair,signal_id,timestamp_readable,exec_close,forward_test_candidate,candidate_8h,signal_side,model_name,raw_json FROM raw_signals ORDER BY id DESC LIMIT ?",(limit,)))
+        decisions=fetchall_dict(conn.execute("SELECT raw_signal_id,entry_allowed,entry_created,manager_action,note FROM basket_decisions WHERE raw_signal_id IS NOT NULL ORDER BY id DESC LIMIT ?",(limit*3,)))
+    by_raw={int(safe_float(x.get('raw_signal_id')) or 0):x for x in decisions}; body=[]
+    for r in rows:
+        rid=int(safe_float(r.get('id')) or 0); d=by_raw.get(rid,{})
+        cand=parse_bool(r.get('candidate_8h'),parse_bool(r.get('forward_test_candidate'),False))
+        try:
+            raw=json.loads(safe_str(r.get('raw_json')) or '{}'); raw=raw.get('payload',raw) if isinstance(raw,dict) else {}
+        except Exception: raw={}
+        ctx=context_8h(raw); trend=safe_str(ctx.get('ctx_trend_state') or '-'); atr=safe_float(ctx.get('ctx_atr_pct') or raw.get('ctx_atr_pct')); price=safe_float(r.get('exec_close'))
+        reason=safe_str(d.get('note') or d.get('manager_action') or ('candidate' if cand else 'not candidate'))
+        body.append(f'''<tr><td>{rid}</td><td>{esc(r.get('timestamp_readable'))}</td><td><strong>BCO</strong></td><td class="{'pos' if cand else 'neg'}">{'TRUE' if cand else 'FALSE'}</td><td>{esc(r.get('signal_side') or '-')}</td><td>{esc(trend)}</td><td>{'—' if atr is None else format(atr,'.3f')+'%'}</td><td>{'—' if price is None else format(price,'.3f')}</td><td>{'YES' if parse_bool(d.get('entry_allowed')) else 'NO'}</td><td>{'YES' if parse_bool(d.get('entry_created')) else 'NO'}</td><td>{esc(reason[:500])}</td><td>{esc(r.get('signal_id'))}</td><td>{esc(r.get('received_at_utc'))}</td></tr>''')
+    if not body: return '<div class="section-note">No BCO signals stored yet.</div>'
+    return f'''<div class="section-note small"><strong>Latest 30 BCO Signals.</strong> Candidate state plus deterministic basket decision.</div><div class="table-scroll"><table><thead><tr><th>ID</th><th>Candle</th><th>Asset</th><th>Candidate</th><th>Side</th><th>8H Regime</th><th>8H ATR</th><th>Price</th><th>Entry Allowed</th><th>Entry Created</th><th>Decision / Reason</th><th>Signal ID</th><th>Received UTC</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+
+
+def _bco_recently_closed_trades_html(limit: int = 30):
+    limit=max(1,min(int(limit or 30),100))
+    with get_conn() as conn:
+        rows=fetchall_dict(conn.execute("SELECT * FROM trades WHERE UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED') ORDER BY COALESCE(exit_time,updated_at_utc,created_at_utc) DESC,id DESC LIMIT ?",(limit,)))
+    body=[]
+    for r in rows:
+        rr=safe_float(r.get('realized_R')); pnl=safe_float(r.get('realized_pnl_gbp'))
+        body.append(f'''<tr><td>{esc(r.get('exit_time'))}</td><td>{esc(r.get('trade_id'))}</td><td>{esc(r.get('broker_trade_id') or '-')}</td><td>{esc(safe_str(r.get('direction')).upper())}</td><td>{esc(r.get('entry_time'))}</td><td>{int(safe_float(r.get('hold_candles')) or 0)}h</td><td>{esc(r.get('exit_reason') or '-')}</td><td class="{_pnl_class(rr)}">{_fmt_metric(rr,'R',2)}</td><td class="{_pnl_class(pnl)}">{_money(pnl)}</td><td>{_money(r.get('broker_realized_pl_home'))}</td><td>{_money(r.get('financing_home'))}</td><td>{_money(r.get('effective_risk_gbp'))}</td><td>{_fmt_metric(r.get('mfe_pct'),'%',2)}</td><td>{_fmt_metric(r.get('mae_pct'),'%',2)}</td><td>{esc(r.get('managed_stop_stage') or '-')}</td></tr>''')
+    if not body: return '<div class="section-note">No closed BCO trades yet.</div>'
+    return f'''<div class="section-note small"><strong>Recently Closed BCO Trades.</strong> Latest 30 closures with persisted close reason and broker/accounting result.</div><div class="table-scroll"><table><thead><tr><th>Exit</th><th>Trade</th><th>Broker ID</th><th>Side</th><th>Entry</th><th>Age</th><th>Why Closed</th><th>Realised R</th><th>Net P&amp;L</th><th>Broker P/L</th><th>Financing</th><th>Risk</th><th>MFE</th><th>MAE</th><th>Protection</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+
 def _bco_standard_profit_harvesting_html():
     s = snapshot()
     b = s.get("basket") or {}
@@ -4222,6 +4253,8 @@ def _bco_standard_health_html():
 
 
 _BCO_STD_SECTIONS = {
+    "latest-signals": ("Latest 30 BCO Signals", _bco_latest_30_signals_html),
+    "recent-closed": ("Recently Closed BCO Trades", _bco_recently_closed_trades_html),
     "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
     "open-trades": ("Open Trades / Positions", _bco_standard_open_trades_html),
     "profit-harvesting": ("Profit Harvesting / Protection Plan", _bco_standard_profit_harvesting_html),
@@ -4251,6 +4284,8 @@ def _bco_std_placeholder(key, title, note=""):
 @app.get("/dashboard", response_class=HTMLResponse)
 def bco_standard_dashboard():
     sections = "".join([
+        _bco_std_placeholder("latest-signals", "Latest 30 BCO Signals", "Actual BCO candidate state and deterministic entry/manager decision."),
+        _bco_std_placeholder("recent-closed", "Recently Closed BCO Trades", "Latest 30 BCO closures with exact reason, realised R, broker P&L and financing."),
         _bco_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48h management and staged defence."),
         _bco_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA BCO positions with local R, MFE/MAE, age, stops and effective risk."),
         _bco_std_placeholder("profit-harvesting", "Profit Harvesting / Protection Plan", "100R / 200R / 300R immediate banking and exceptional cohort ratchets."),
@@ -4271,7 +4306,7 @@ details{{background:var(--panel);border:1px solid var(--border);border-radius:10
 .metric-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:8px;padding:12px}}.mini-card{{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:9px}}table{{width:100%;border-collapse:collapse;background:var(--panel)}}th,td{{padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-align:left;vertical-align:top}}th{{background:#0f141a;color:white}}.table-scroll{{width:100%;overflow-x:auto}}a{{color:var(--blue);text-decoration:none}}.links{{margin:9px 0 14px;font-size:12px}}
 @media(max-width:1000px){{.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}@media(max-width:650px){{body{{padding:8px}}h1{{font-size:34px}}.cards{{gap:6px;margin-bottom:6px}}.cards.four{{grid-template-columns:repeat(2,minmax(0,1fr))}}.cards.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.card{{min-height:76px;padding:8px 9px}}.label,.k{{font-size:10px}}.value,.v{{font-size:18px}}.small{{font-size:9px}}details>summary{{font-size:13px;padding:9px 10px}}}}
 </style></head><body><div class="page">
-<h1>Project Exit Plan — BCO</h1><div class="sub">v0.3.1 Master Parity · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
+<h1>Project Exit Plan — BCO</h1><div class="sub">{esc(APP_VERSION)} Dashboard Parity · BCO LONG · {esc(env_label)}</div><div class="banner"><strong>{esc(env_label)}.</strong> Standalone BCO project. This service owns BCO only; indices and metals remain outside its management scope.</div>
 <div id="topStatus" class="top-status">Loading top tiles…</div><div id="topTiles"><div class="cards four"><div class="card"><div class="label">Account NAV</div><div class="value">…</div></div><div class="card"><div class="label">BCO P&amp;L</div><div class="value">…</div></div><div class="card"><div class="label">Basket High-Water</div><div class="value">…</div></div><div class="card"><div class="label">Giveback</div><div class="value">…</div></div></div></div>
 <div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/snapshot">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/all.zip">⬇ BCO Analysis ZIP</a><a class="export-btn research" href="/export/bco-focused-research.zip">⬇ BCO Research ZIP</a></div><h2>Details</h2>{sections}</div>
 <script>
