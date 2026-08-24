@@ -32,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.3 — Dashboard Visibility Parity"
+APP_NAME = "Project Exit Plan — BCO v0.7.4 — Standardised Dashboard"
 APP_VERSION = "0.7.3"
-POLICY_VERSION = "bco_v0.7.3_dashboard_visibility_parity"
+POLICY_VERSION = "bco_v0.7.4_standardised_dashboard"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -4252,19 +4252,40 @@ def _bco_standard_health_html():
     """
 
 
+
+def _bco_standard_latest_signals_combined_html():
+    return _bco_latest_30_signals_html() + """
+      <details><summary>Current Signal State / Recent Signal Detail</summary>
+      <div class="research-inner-body">""" + _bco_standard_signal_html() + """</div></details>"""
+
+
+def _bco_standard_broker_combined_html():
+    return _bco_standard_broker_html() + """
+      <details><summary>Execution / Reconciliation</summary>
+      <div class="research-inner-body">""" + _bco_standard_execution_html() + """</div></details>
+      <details><summary>Operational Health / Pipeline</summary>
+      <div class="research-inner-body">""" + _bco_standard_health_html() + """</div></details>"""
+
+
+def _bco_standard_manager_protection_html():
+    return _bco_standard_basket_manager_html() + """
+      <details open><summary>Profit Harvesting / Protection Plan</summary>
+      <div class="research-inner-body">""" + _bco_standard_profit_harvesting_html() + """</div></details>"""
+
+
 _BCO_STD_SECTIONS = {
-    "latest-signals": ("Latest 30 BCO Signals", _bco_latest_30_signals_html),
+    "latest-signals": ("Latest 30 BCO Signals", _bco_standard_latest_signals_combined_html),
     "recent-closed": ("Recently Closed BCO Trades", _bco_recently_closed_trades_html),
-    "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
     "open-trades": ("Open Trades / Positions", _bco_standard_open_trades_html),
+    "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_combined_html),
+    "manager-protection": ("Basket Manager / Profit Protection", _bco_standard_manager_protection_html),
+    "research": ("BCO Research / Evidence Lab", build_bco_focused_research_html),
+    "basket-manager": ("Basket Manager", _bco_standard_basket_manager_html),
     "profit-harvesting": ("Profit Harvesting / Protection Plan", _bco_standard_profit_harvesting_html),
-    "broker": ("Broker / OANDA / Accounting", _bco_standard_broker_html),
     "execution": ("Execution / Reconciliation", _bco_standard_execution_html),
     "operational-health": ("Operational Health / Pipeline", _bco_standard_health_html),
     "signals": ("Signal State", _bco_standard_signal_html),
-    "research": ("BCO Research / Evidence Lab", build_bco_focused_research_html),
 }
-
 @app.get("/dashboard/section/{section_key}", response_class=HTMLResponse)
 def bco_standard_section(section_key: str):
     item = _BCO_STD_SECTIONS.get(safe_str(section_key))
@@ -4284,16 +4305,12 @@ def _bco_std_placeholder(key, title, note=""):
 @app.get("/dashboard", response_class=HTMLResponse)
 def bco_standard_dashboard():
     sections = "".join([
-        _bco_std_placeholder("latest-signals", "Latest 30 BCO Signals", "Actual BCO candidate state and deterministic entry/manager decision."),
-        _bco_std_placeholder("recent-closed", "Recently Closed BCO Trades", "Latest 30 BCO closures with exact reason, realised R, broker P&L and financing."),
-        _bco_std_placeholder("basket-manager", "Basket Manager", "48h minimum hold, hourly post-48h management and staged defence."),
+        _bco_std_placeholder("latest-signals", "Latest 30 BCO Signals", "Current BCO candidate state plus detailed signal context."),
+        _bco_std_placeholder("recent-closed", "Recently Closed BCO Trades", "Latest BCO closures with exact reason, realised R, broker P&L and financing."),
         _bco_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA BCO positions with local R, MFE/MAE, age, stops and effective risk."),
-        _bco_std_placeholder("profit-harvesting", "Profit Harvesting / Protection Plan", "100R / 200R / 300R immediate banking and exceptional cohort ratchets."),
-        _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO-only OANDA lane, account view and risk sizing."),
-        _bco_std_placeholder("execution", "Execution / Reconciliation", "Audit, managed stops and ownership safety."),
-        _bco_std_placeholder("operational-health", "Operational Health / Pipeline", "Signal freshness, OANDA parity, durable retry queue, transaction/accounting sync and reconciliation freshness."),
-        _bco_std_placeholder("signals", "Signal State", "Latest BCO candidate and recent signal history."),
-        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "High-water/banking outcomes, multi-horizon alignment, trend efficiency and basket recovery. Everything inside remains collapsed until opened."),
+        _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO OANDA lane, accounting, execution/reconciliation and operational health."),
+        _bco_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus persisted harvesting/protection stages."),
+        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "AI/regime evidence, high-water outcomes, alignment, trend efficiency and basket recovery."),
     ])
     env_label = "LIVE" if OANDA_ENV == "live" else "DEMO / PRACTICE"
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Exit Plan — BCO</title>
