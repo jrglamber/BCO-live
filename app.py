@@ -27,14 +27,18 @@ import urllib.request
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.5 — Webhook Ingress Hardening"
-APP_VERSION = "0.7.3"
-POLICY_VERSION = "bco_v0.7.5_webhook_ingress_hardening"
+APP_NAME = "Project Exit Plan — BCO v0.7.6 — Signal Candle Time Parity"
+APP_VERSION = "0.7.6"
+POLICY_VERSION = "bco_v0.7.6_signal_candle_time_parity"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -75,6 +79,47 @@ def now_utc_iso() -> str:
 def esc(v: Any) -> str:
     s = safe_str(v)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _bco_zone(name: str):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return timezone.utc
+
+
+def bco_display_candle_time(value: Any) -> str:
+    """Display TradingView candle timestamps in UK time, matching Metals.
+
+    This is presentation-only. Stored timestamps are not altered.
+    """
+    s = safe_str(value)
+    if not s:
+        return ""
+
+    source_tz = _bco_zone(BCO_SIGNAL_CANDLE_TIMEZONE)
+    display_tz = _bco_zone(BCO_DISPLAY_TIMEZONE)
+
+    for fmt in (
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=source_tz)
+            return dt.astimezone(display_tz).strftime("%Y-%m-%d %H:%M") + f" {BCO_DISPLAY_TIME_LABEL}"
+        except Exception:
+            pass
+
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=source_tz)
+        return dt.astimezone(display_tz).strftime("%Y-%m-%d %H:%M") + f" {BCO_DISPLAY_TIME_LABEL}"
+    except Exception:
+        return s
 
 
 # -----------------------------------------------------------------------------
@@ -154,6 +199,12 @@ BCO_SIGNAL_RECOVERY_ENABLED = env_bool("BCO_SIGNAL_RECOVERY_ENABLED", True)
 BCO_SIGNAL_RECOVERY_BATCH_LIMIT = max(
     1, min(int(float(os.getenv("BCO_SIGNAL_RECOVERY_BATCH_LIMIT", "12"))), 100)
 )
+
+# v0.7.6 — dashboard candle-time parity with Metals.
+# Display-only: stored timestamps and all trading/management chronology remain unchanged.
+BCO_SIGNAL_CANDLE_TIMEZONE = os.getenv("BCO_SIGNAL_CANDLE_TIMEZONE", "America/Chicago").strip()
+BCO_DISPLAY_TIMEZONE = os.getenv("BCO_DISPLAY_TIMEZONE", "Europe/London").strip()
+BCO_DISPLAY_TIME_LABEL = os.getenv("BCO_DISPLAY_TIME_LABEL", "UK").strip() or "UK"
 
 
 # Shared-account guard. This service may read account-wide NAV/margin, but all
@@ -3777,6 +3828,7 @@ def _bco_standard_top_uncached():
                   "broker_account_open_count":int(broker.get("account_open_count") or 0)},
       "signals":{"candidate":parse_bool(latest.get("candidate_8h"),False),
                  "latest_time":safe_str(latest.get("timestamp_readable")),
+                 "latest_time_display":bco_display_candle_time(latest.get("timestamp_readable")),
                  "latest_price":safe_float(latest.get("exec_close")),
                  "latest_signal_id":safe_str(latest.get("signal_id")),
                  "received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1,
@@ -4441,12 +4493,12 @@ ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
-${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'CHECK',g.processor_ok?(g.latest_time?'Latest BCO signal processed':'Waiting for BCO signal'):`Processing lag ${{eh(g.processing_lag||0)}} signal(s)`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'neg')}}
-${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?'Missing none':'Waiting')}}
+${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'CHECK',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}`:'Waiting for BCO signal'):`Processing lag ${{eh(g.processing_lag||0)}} signal(s)${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'neg')}}
+${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?(g.latest_time_display?`Latest candle · ${{eh(g.latest_time_display)}}`:'Signal received'):(g.latest_time_display?`Waiting · latest ${{eh(g.latest_time_display)}}`:'Waiting'))}}
 ${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
 </script></body></html>'''
 
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
-    return {"status":"ok","version":"0.3.0","project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
+    return {"status":"ok","version":APP_VERSION,"project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
