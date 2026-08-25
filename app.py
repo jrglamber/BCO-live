@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.6 — Signal Candle Time Parity"
-APP_VERSION = "0.7.6"
-POLICY_VERSION = "bco_v0.7.6_signal_candle_time_parity"
+APP_NAME = "Project Exit Plan — BCO v0.7.7 — Signal Recovery + Flat Basket Reset"
+APP_VERSION = "0.7.7"
+POLICY_VERSION = "bco_v0.7.7_signal_recovery_flat_basket_reset"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -199,6 +199,10 @@ BCO_SIGNAL_RECOVERY_ENABLED = env_bool("BCO_SIGNAL_RECOVERY_ENABLED", True)
 BCO_SIGNAL_RECOVERY_BATCH_LIMIT = max(
     1, min(int(float(os.getenv("BCO_SIGNAL_RECOVERY_BATCH_LIMIT", "12"))), 100)
 )
+BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS = max(
+    3.0,
+    min(float(os.getenv("BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS", "10")), 60.0),
+)
 
 # v0.7.6 — dashboard candle-time parity with Metals.
 # Display-only: stored timestamps and all trading/management chronology remain unchanged.
@@ -218,6 +222,8 @@ _db_lock = threading.RLock()
 _worker_stop = threading.Event()
 _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
+_signal_recovery_started = False
+_signal_recovery_thread: Optional[threading.Thread] = None
 
 
 # -----------------------------------------------------------------------------
@@ -1739,6 +1745,74 @@ def basket_metrics(conn: DBConn) -> Dict[str, Any]:
             "losing_pct":losing/count*100.0 if count else 0.0,"phase":basket_phase_from_count(count)}
 
 
+
+def reset_flat_bco_basket_state(
+    conn: DBConn,
+    reason: str,
+    observed_at: str = "",
+) -> Dict[str, Any]:
+    """Reset CURRENT basket state after the BCO basket is genuinely flat.
+
+    Historical basket_snapshots / research tables are intentionally untouched,
+    so the completed cycle's ~20R high-water remains available for analysis.
+    """
+    open_row = fetchone_dict(conn.execute(
+        "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+    )) or {}
+    local_open = int(safe_float(open_row.get("c")) or 0)
+    if local_open > 0:
+        return {
+            "reset": False,
+            "reason": "local_open_trades_remain",
+            "local_open": local_open,
+        }
+
+    state = fetchone_dict(conn.execute(
+        "SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+    )) or {}
+    previous = {
+        "cycle_id": safe_str(state.get("cycle_id")),
+        "high_water_R": safe_float(state.get("high_water_R")) or 0.0,
+        "high_water_seen_at": safe_str(state.get("high_water_seen_at")),
+        "banked_R_cycle": safe_float(state.get("banked_R_cycle")) or 0.0,
+        "realized_R_cycle": safe_float(state.get("realized_R_cycle")) or 0.0,
+        "status": safe_str(state.get("status")),
+    }
+
+    conn.execute("""
+        UPDATE basket_state
+        SET status='FLAT',
+            cycle_id=NULL,
+            cycle_started_at=NULL,
+            open_count=0,
+            basket_R=0,
+            basket_pnl_gbp=0,
+            high_water_R=0,
+            high_water_seen_at=NULL,
+            giveback_pct=0,
+            losing_pct=0,
+            basket_phase='FLAT',
+            tide_score=0,
+            tide_status='FLAT',
+            manager_action='NO_OPEN_BASKET',
+            manager_detail=?,
+            realized_R_cycle=0,
+            banked_R_cycle=0,
+            updated_at_utc=?
+        WHERE singleton_key='BCO_LONG'
+    """, (
+        f"Flat basket state reset: {safe_str(reason)}",
+        observed_at or now_utc_iso(),
+    ))
+
+    return {
+        "reset": True,
+        "reason": safe_str(reason),
+        "previous": previous,
+        "local_open": 0,
+    }
+
+
 def ensure_cycle(conn: DBConn, signal_time: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
     state = fetchone_dict(conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'")) or {}
     if metrics.get("open_count", 0) <= 0:
@@ -2165,7 +2239,11 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
             cycle=safe_str(state.get("cycle_id"))
             if cycle:
                 conn.execute("UPDATE protection_stages SET status='EXPIRED_FLAT',updated_at_utc=? WHERE cycle_id=? AND status LIKE 'ARMED%'",(now_utc_iso(),cycle))
-            conn.execute("UPDATE basket_state SET status='FLAT',cycle_id=NULL,open_count=0,basket_R=0,basket_pnl_gbp=0,giveback_pct=0,losing_pct=0,basket_phase='FLAT',manager_action='NO_OPEN_BASKET',updated_at_utc=? WHERE singleton_key='BCO_LONG'",(now_utc_iso(),))
+            flat_reset = reset_flat_bco_basket_state(
+                conn,
+                reason="process_signal_final_open_count_zero",
+                observed_at=signal_time or now_utc_iso(),
+            )
         else:
             state=ensure_cycle(conn,signal_time,final); hwm2=max(float(safe_float(state.get("high_water_R")) or 0.0),float(final["basket_R"])); give2=((hwm2-final["basket_R"])/hwm2*100.0) if hwm2>0 and final["basket_R"]<hwm2 else 0.0
             conn.execute("""
@@ -2354,12 +2432,33 @@ def reconcile_broker() -> Dict[str,Any]:
     with _db_lock,get_conn() as _rc:
         runtime_set(_rc,"broker_reconcile_last_at",now_utc_iso())
     tx_sync=sync_broker_transactions() if BCO_TRANSACTION_SYNC_ENABLED else {"ok":False,"skipped":True}
+
+    flat_reset={"reset":False,"reason":"not_flat"}
+    if len(owned) == 0:
+        with _db_lock,get_conn() as _flat_conn:
+            _open_now=fetchone_dict(_flat_conn.execute(
+                "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+            )) or {}
+            if int(safe_float(_open_now.get("c")) or 0) == 0:
+                flat_reset=reset_flat_bco_basket_state(
+                    _flat_conn,
+                    reason="broker_and_local_flat_after_reconcile",
+                    observed_at=now_utc_iso(),
+                )
+        if flat_reset.get("reset"):
+            log_event(
+                "basket_cycle_flat_reset",
+                "BCO broker and local basket are flat; current basket HWM/giveback reset to zero.",
+                flat_reset,
+            )
+
     return {"ok":True,"owned_open_count":len(owned),
             "owned_unrealized_pl":live.get("owned_unrealized_pl"),
             "owned_margin_used":live.get("owned_margin_used"),
             "account_open_count":live.get("account_open_count"),
             "updates":updates,"local_only_cleaned":local_only_cleaned,
-            "unlinked_broker_trades":unlinked_broker,"transaction_sync":tx_sync,"time_utc":now_utc_iso()}
+            "unlinked_broker_trades":unlinked_broker,"transaction_sync":tx_sync,
+            "flat_basket_reset":flat_reset,"time_utc":now_utc_iso()}
 
 
 def snapshot() -> Dict[str,Any]:
@@ -2415,13 +2514,38 @@ def preflight() -> Dict[str,Any]:
 
 
 # -----------------------------------------------------------------------------
-# Background reconcile worker
+# Background workers
 # -----------------------------------------------------------------------------
+def _signal_recovery_worker() -> None:
+    """Dedicated deterministic signal recovery, independent of broker/OANDA I/O."""
+    while not _worker_stop.is_set():
+        try:
+            recover_unprocessed_bco_signals()
+        except Exception as e:
+            log_event("signal_recovery_worker_error", str(e))
+        if _worker_stop.wait(BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS):
+            break
+
+
+def start_signal_recovery_worker() -> None:
+    global _signal_recovery_started, _signal_recovery_thread
+    if not BCO_SIGNAL_RECOVERY_ENABLED:
+        return
+    if _signal_recovery_thread is not None and _signal_recovery_thread.is_alive():
+        _signal_recovery_started = True
+        return
+    _signal_recovery_started = True
+    _signal_recovery_thread = threading.Thread(
+        target=_signal_recovery_worker,
+        name="bco-deterministic-signal-recovery",
+        daemon=True,
+    )
+    _signal_recovery_thread.start()
+
+
 def _worker() -> None:
     while not _worker_stop.wait(BROKER_RECONCILE_INTERVAL_SECONDS):
         try:
-            # Signal/manager recovery does not depend on OANDA being available.
-            recover_unprocessed_bco_signals()
             if OANDA_ENABLED and OANDA_ACCOUNT_ID:
                 process_broker_action_queue()
                 reconcile_broker()
@@ -2466,6 +2590,7 @@ def _background_bootstrap() -> None:
             except Exception:
                 pass
         _bootstrap_state["status"] = "STARTING_WORKER"
+        start_signal_recovery_worker()
         start_worker()
         try:
             log_event("startup", APP_NAME, {"safety": safety_status()})
@@ -3172,6 +3297,9 @@ def operational_health() -> Dict[str, Any]:
     tx_age = _iso_age_seconds(tx_sync_at)
 
     worker_alive = bool(_worker_thread is not None and _worker_thread.is_alive())
+    recovery_worker_alive = bool(
+        _signal_recovery_thread is not None and _signal_recovery_thread.is_alive()
+    )
     recovery_last_at = ""
     recovery_last_count = 0
     try:
@@ -3184,11 +3312,13 @@ def operational_health() -> Dict[str, Any]:
     checks = {
         "database": {"ok": db_ok, "error": db_error},
         "manager_recovery_worker": {
-            "ok": worker_alive,
+            "ok": (not BCO_SIGNAL_RECOVERY_ENABLED) or recovery_worker_alive,
             "enabled": BCO_SIGNAL_RECOVERY_ENABLED,
-            "thread_alive": worker_alive,
+            "thread_alive": recovery_worker_alive,
+            "interval_seconds": BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS,
             "last_recovery_at": recovery_last_at,
             "last_recovered_count": recovery_last_count,
+            "broker_worker_alive": worker_alive,
         },
         "signal_freshness": {
             "ok": signal_age is None or signal_age <= BCO_HEALTH_SIGNAL_STALE_SECONDS,
@@ -3404,6 +3534,21 @@ def practice_smoke_close(broker_trade_id: str, x_admin_secret: Optional[str] = H
 @app.post("/admin/reconcile")
 def reconcile_endpoint(x_admin_secret: Optional[str] = Header(default=None)):
     check_admin(x_admin_secret); return reconcile_broker()
+
+
+@app.post("/admin/signals/recover-pending")
+def recover_pending_signals_endpoint(
+    x_admin_secret: Optional[str] = Header(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+):
+    """Manual safe recovery trigger.
+
+    This does NOT override/mark signals as processed. It reruns the existing
+    deterministic processor idempotently so Signal Health can return to OK only
+    after the missing basket_decision rows genuinely exist.
+    """
+    check_admin(x_admin_secret)
+    return recover_unprocessed_bco_signals(limit=limit)
 
 
 def csv_response(rows: List[Dict[str,Any]], filename: str) -> Response:
@@ -3759,6 +3904,15 @@ def _bco_standard_top_uncached():
     broker_open_pnl=safe_float(broker.get("owned_unrealized_pl")) or 0.0
     hwm=safe_float(basket.get("high_water_R")) or 0.0
     hwm_time=safe_str(basket.get("high_water_seen_at"))
+
+    # v0.7.7: current basket HWM/giveback belongs to the ACTIVE basket only.
+    # Once both OANDA and local BCO exposure are flat, show zero immediately;
+    # completed-cycle HWM remains preserved in basket_snapshots/research.
+    authoritative_flat = (local_open == 0 and broker_open == 0)
+    if authoritative_flat:
+        hwm = 0.0
+        hwm_time = ""
+
     hwm_gbp=None
     if hwm > 0:
         with get_conn() as _hwm_conn:
@@ -3797,11 +3951,35 @@ def _bco_standard_top_uncached():
     with get_conn() as conn:
         wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ws.isoformat(),)).fetchone()
         mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ms.isoformat(),)).fetchone()
-        _raw_latest=fetchone_dict(conn.execute("SELECT id FROM raw_signals ORDER BY id DESC LIMIT 1")) or {}
-        _dec_latest=fetchone_dict(conn.execute("SELECT raw_signal_id FROM basket_decisions ORDER BY id DESC LIMIT 1")) or {}
+        _raw_latest=fetchone_dict(conn.execute(
+            "SELECT id FROM raw_signals ORDER BY id DESC LIMIT 1"
+        )) or {}
+        _dec_latest=fetchone_dict(conn.execute(
+            "SELECT raw_signal_id FROM basket_decisions ORDER BY id DESC LIMIT 1"
+        )) or {}
         _latest_raw_id=int(safe_float(_raw_latest.get("id")) or 0)
         _latest_decision_id=int(safe_float(_dec_latest.get("raw_signal_id")) or 0)
-        _processor_ok=(_latest_raw_id==0 or _latest_decision_id>=_latest_raw_id)
+
+        _pending=fetchone_dict(conn.execute("""
+            SELECT
+                COUNT(*) AS c,
+                COALESCE(SUM(CASE WHEN COALESCE(r.candidate_8h,0)<>0 THEN 1 ELSE 0 END),0) AS candidate_c
+            FROM raw_signals r
+            LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
+            WHERE d.id IS NULL
+        """)) or {}
+        _pending_count=int(safe_float(_pending.get("c")) or 0)
+        _pending_candidate_count=int(safe_float(_pending.get("candidate_c")) or 0)
+
+        _latest_processed=True
+        if _latest_raw_id>0:
+            _latest_done=fetchone_dict(conn.execute(
+                "SELECT id FROM basket_decisions WHERE raw_signal_id=? LIMIT 1",
+                (_latest_raw_id,),
+            ))
+            _latest_processed=bool(_latest_done)
+
+        _processor_ok=bool(_latest_processed and _pending_count==0)
     return {
       "status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
       "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),
@@ -3833,9 +4011,12 @@ def _bco_standard_top_uncached():
                  "latest_signal_id":safe_str(latest.get("signal_id")),
                  "received_assets":1 if safe_str(latest.get("signal_id")) else 0,"expected_assets":1,
                  "processor_ok":_processor_ok,
+                 "latest_raw_processed":_latest_processed,
                  "latest_raw_id":_latest_raw_id,
                  "latest_decision_raw_id":_latest_decision_id,
-                 "processing_lag":max(0,_latest_raw_id-_latest_decision_id)},
+                 "processing_lag":_pending_count,
+                 "pending_candidate_count":_pending_candidate_count,
+                 "recovery_interval_seconds":BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS},
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
 
@@ -4493,7 +4674,7 @@ ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
-${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'CHECK',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}`:'Waiting for BCO signal'):`Processing lag ${{eh(g.processing_lag||0)}} signal(s)${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'neg')}}
+${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'RECOVERING',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}`:'Waiting for BCO signal'):`Pending processing ${{eh(g.processing_lag||0)}} · candidate pending ${{eh(g.pending_candidate_count||0)}} · auto-retry every ${{eh(g.recovery_interval_seconds||10)}}s${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'warn')}}
 ${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?(g.latest_time_display?`Latest candle · ${{eh(g.latest_time_display)}}`:'Signal received'):(g.latest_time_display?`Waiting · latest ${{eh(g.latest_time_display)}}`:'Waiting'))}}
 ${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
