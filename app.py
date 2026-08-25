@@ -32,9 +32,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.4 — Standardised Dashboard"
+APP_NAME = "Project Exit Plan — BCO v0.7.5 — Webhook Ingress Hardening"
 APP_VERSION = "0.7.3"
-POLICY_VERSION = "bco_v0.7.4_standardised_dashboard"
+POLICY_VERSION = "bco_v0.7.5_webhook_ingress_hardening"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -704,23 +704,25 @@ def store_signal(body: Dict[str, Any]) -> Tuple[int, Dict[str, Any], bool]:
     if not signal_id:
         signal_id = f"BCO_{timestamp}_{safe_str(payload.get('signal_side'))}_{safe_str(payload.get('exec_close'))}"
     close = safe_float(payload.get("exec_close") or payload.get("close") or payload.get("rule_entry_price"))
-    high = safe_float(payload.get("exec_high") or payload.get("high"))
-    low = safe_float(payload.get("exec_low") or payload.get("low"))
-    candidate = bco_long_candidate(payload)
-    side = directional_side(payload.get("signal_side"))
-    model = safe_str(payload.get("model_name") or payload.get("model_version"))
-    now = now_utc_iso()
-    with _db_lock, get_conn() as conn:
-        existing = fetchone_dict(conn.execute("SELECT id FROM raw_signals WHERE signal_id=?", (signal_id,)))
-        if existing:
-            return int(existing["id"]), payload, True
-        raw_id = db_insert_id(conn, """
-            INSERT INTO raw_signals(
-                received_at_utc,pair,signal_id,timestamp_readable,exec_close,exec_high,exec_low,
-                forward_test_candidate,candidate_8h,signal_side,model_name,raw_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (now, pair, signal_id, timestamp, close, high, low, bool(candidate), bool(candidate), side, model, json.dumps(body)))
-    return raw_id, payload, False
+    high = safe_float(payload.get("exec_high") or payload.get("high")); low = safe_float(payload.get("exec_low") or payload.get("low"))
+    candidate = bco_long_candidate(payload); side = directional_side(payload.get("signal_side")); model = safe_str(payload.get("model_name") or payload.get("model_version")); now = now_utc_iso()
+
+    for attempt in range(6):
+        try:
+            with _db_lock, get_conn() as conn:
+                existing = fetchone_dict(conn.execute("SELECT id FROM raw_signals WHERE signal_id=?", (signal_id,)))
+                if existing: return int(existing["id"]), payload, True
+                raw_id = db_insert_id(conn, """
+                    INSERT INTO raw_signals(received_at_utc,pair,signal_id,timestamp_readable,exec_close,exec_high,exec_low,forward_test_candidate,candidate_8h,signal_side,model_name,raw_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (now,pair,signal_id,timestamp,close,high,low,bool(candidate),bool(candidate),side,model,json.dumps(body)))
+                return raw_id,payload,False
+        except Exception as exc:
+            msg=safe_str(exc).lower(); transient=any(x in msg for x in ['database is locked','deadlock','could not serialize','connection reset','timeout'])
+            if transient and attempt<5:
+                time.sleep(0.35*(attempt+1)); continue
+            raise
+    raise RuntimeError('BCO raw signal insert retries exhausted')
 
 
 # -----------------------------------------------------------------------------
@@ -3195,25 +3197,122 @@ def ready():
     }
 
 
+# -----------------------------------------------------------------------------
+# Webhook ingress audit / delivery hardening
+# -----------------------------------------------------------------------------
+def ensure_webhook_ingress_audit_table() -> None:
+    with _db_lock, get_conn() as conn:
+        id_type = "BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS webhook_ingress_audit (
+                id {id_type}, received_at_utc TEXT NOT NULL, completed_at_utc TEXT,
+                status TEXT NOT NULL, http_content_type TEXT, body_size BIGINT,
+                body_preview_redacted TEXT, pair TEXT, signal_id TEXT, signal_time TEXT,
+                raw_signal_id BIGINT, detail TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_webhook_ingress_time ON webhook_ingress_audit(received_at_utc)")
+        conn.commit()
+
+
+def _bco_redact_webhook_preview(raw_text: str) -> str:
+    s=safe_str(raw_text)[:12000]
+    s=re.sub(r'(?i)("secret"\s*:\s*")[^"]*(")', r'\1***REDACTED***\2', s)
+    s=re.sub(r"(?i)('secret'\s*:\s*')[^']*(')", r'\1***REDACTED***\2', s)
+    return s
+
+
+def _bco_ingress_begin(content_type: str, raw_text: str) -> Optional[int]:
+    try:
+        ensure_webhook_ingress_audit_table()
+        with _db_lock,get_conn() as conn:
+            rid=db_insert_id(conn,"""INSERT INTO webhook_ingress_audit(received_at_utc,status,http_content_type,body_size,body_preview_redacted,detail) VALUES(?,?,?,?,?,?)""",
+                (now_utc_iso(),'RECEIVED',safe_str(content_type),len(raw_text.encode('utf-8',errors='ignore')),_bco_redact_webhook_preview(raw_text),'HTTP request reached Railway'))
+            return int(rid)
+    except Exception:
+        return None
+
+
+def _bco_ingress_finish(receipt_id: Optional[int],status: str,*,pair: str='',signal_id: str='',signal_time: str='',raw_signal_id: Any=None,detail: str='') -> None:
+    if not receipt_id: return
+    try:
+        with _db_lock,get_conn() as conn:
+            conn.execute("UPDATE webhook_ingress_audit SET completed_at_utc=?,status=?,pair=?,signal_id=?,signal_time=?,raw_signal_id=?,detail=? WHERE id=?",
+                (now_utc_iso(),safe_str(status),safe_str(pair),safe_str(signal_id),safe_str(signal_time),int(raw_signal_id) if raw_signal_id is not None else None,safe_str(detail),int(receipt_id)))
+    except Exception: pass
+
+
+def bco_webhook_ingress_health(hours: int=48) -> Dict[str,Any]:
+    ensure_webhook_ingress_audit_table(); hours=max(1,min(int(hours),168)); cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
+    with _db_lock,get_conn() as conn:
+        rows=fetchall_dict(conn.execute("SELECT * FROM webhook_ingress_audit WHERE received_at_utc>=? ORDER BY id DESC LIMIT 1000",(cutoff,)))
+    counts={}
+    for r in rows:
+        st=safe_str(r.get('status') or 'UNKNOWN').upper(); counts[st]=counts.get(st,0)+1
+    failures=sum(v for k,v in counts.items() if k in {'INVALID_JSON','BAD_SECRET','WRONG_ASSET','DB_ERROR','STORE_FAILED'})
+    return {'ok':failures==0,'hours':hours,'receipt_count':len(rows),'status_counts':counts,'latest':rows[:50],
+            'note':'RECEIVED proves HTTP reached Railway; STORED proves raw_signals insert succeeded.'}
+
+
+@app.get('/webhook/ingress-health')
+def bco_webhook_ingress_health_route(hours: int=48): return bco_webhook_ingress_health(hours)
+
+
+@app.get('/export/webhook-ingress.csv')
+def bco_export_webhook_ingress_csv(limit: int=5000):
+    ensure_webhook_ingress_audit_table(); limit=max(1,min(int(limit),50000))
+    with _db_lock,get_conn() as conn:
+        rows=fetchall_dict(conn.execute('SELECT * FROM webhook_ingress_audit ORDER BY id DESC LIMIT ?',(limit,)))
+    out=io.StringIO(); fields=['id','received_at_utc','completed_at_utc','status','http_content_type','body_size','pair','signal_id','signal_time','raw_signal_id','detail','body_preview_redacted']
+    w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore'); w.writeheader(); w.writerows(rows)
+    return Response(content=out.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="webhook-ingress.csv"'})
+
+
+def _bco_webhook_ingress_html() -> str:
+    h=bco_webhook_ingress_health(48); counts=h.get('status_counts') or {}; bad=sum(v for k,v in counts.items() if k in {'INVALID_JSON','BAD_SECRET','WRONG_ASSET','DB_ERROR','STORE_FAILED'})
+    trs=''
+    for r in (h.get('latest') or [])[:30]:
+        trs+=f"<tr><td>{esc(r.get('received_at_utc'))}</td><td>{esc(r.get('signal_time') or '—')}</td><td><strong>{esc(r.get('status'))}</strong></td><td>{esc(r.get('raw_signal_id') or '—')}</td><td>{esc(r.get('detail') or '—')}</td></tr>"
+    if not trs: trs='<tr><td colspan="5">No ingress receipts yet; logging begins with the next webhook hit.</td></tr>'
+    return f"""<div class='metric-grid'><div class='mini-card'><div class='k'>HTTP Receipts · 48h</div><div class='v'>{int(h.get('receipt_count') or 0)}</div><div class='small'>Every BCO webhook that reached Railway</div></div><div class='mini-card'><div class='k'>Ingress Errors</div><div class='v'>{bad}</div><div class='small'>{esc(counts)}</div></div></div><div class='section-note small'><strong>Delivery audit.</strong> RECEIVED = HTTP reached Railway; STORED = raw signal safely persisted.</div><div class='table-scroll'><table><thead><tr><th>Received</th><th>Signal Time</th><th>Status</th><th>Raw ID</th><th>Detail</th></tr></thead><tbody>{trs}</tbody></table></div><div class='section-note small'><a href='/webhook/ingress-health'>Ingress health JSON</a> · <a href='/export/webhook-ingress.csv'>Ingress audit CSV</a></div>"""
+
+
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(request: Request, secret: str = Query(default="")):
-    check_webhook(secret)
-    body=await request.json()
-    if not isinstance(body,dict): raise HTTPException(status_code=400,detail="JSON object required")
-    raw_id,payload,duplicate=store_signal(body)
-    if duplicate: return {"status":"duplicate","raw_signal_id":raw_id}
-    # Freeze AI research evidence BEFORE deterministic entry/manager processing.
+    raw_bytes=await request.body(); raw_text=raw_bytes.decode('utf-8',errors='replace'); receipt_id=_bco_ingress_begin(request.headers.get('content-type',''),raw_text)
+    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "change-me" or secret != WEBHOOK_SECRET:
+        _bco_ingress_finish(receipt_id,'BAD_SECRET',detail='Request reached Railway but webhook secret did not match')
+        raise HTTPException(status_code=401,detail="Invalid webhook secret")
+    try:
+        body=json.loads(raw_text)
+    except Exception as exc:
+        _bco_ingress_finish(receipt_id,'INVALID_JSON',detail=f'{type(exc).__name__}: {exc}')
+        raise HTTPException(status_code=400,detail='Invalid JSON body')
+    if not isinstance(body,dict):
+        _bco_ingress_finish(receipt_id,'INVALID_JSON',detail='JSON object required')
+        raise HTTPException(status_code=400,detail='JSON object required')
+    payload=extract_payload(body); pair=normalise_pair(payload.get('pair') or payload.get('ticker') or payload.get('symbol')); signal_id=safe_str(payload.get('signal_id')); signal_time=safe_str(payload.get('timestamp') or payload.get('timestamp_readable') or payload.get('rule_entry_timestamp'))
+    if pair != BCO_ASSET:
+        _bco_ingress_finish(receipt_id,'WRONG_ASSET',pair=pair,signal_id=signal_id,signal_time=signal_time,detail='BCO service owns BCO only')
+        raise HTTPException(status_code=400,detail=f"BCO Live accepts BCO only; received {pair or 'unknown'}")
+    try:
+        raw_id,payload,duplicate=store_signal(body)
+    except Exception as exc:
+        _bco_ingress_finish(receipt_id,'DB_ERROR',pair=pair,signal_id=signal_id,signal_time=signal_time,detail=f'{type(exc).__name__}: {exc}')
+        raise
+    if duplicate:
+        _bco_ingress_finish(receipt_id,'DUPLICATE',pair=pair,signal_id=signal_id,signal_time=signal_time,raw_signal_id=raw_id,detail='Signal already stored')
+        return {"status":"duplicate","raw_signal_id":raw_id,"ingress_receipt_id":receipt_id}
+    _bco_ingress_finish(receipt_id,'STORED',pair=pair,signal_id=signal_id,signal_time=signal_time,raw_signal_id=raw_id,detail='HTTP received, validated and stored in raw_signals')
     try:
         ai_regime_observer=capture_ai_regime_snapshot(raw_id,payload)
     except Exception as _ai_exc:
         ai_regime_observer={"captured":False,"research_only":True,"error":f"{type(_ai_exc).__name__}: {_ai_exc}"}
     try:
-        result=process_signal(raw_id,payload)
-        focused_research=record_bco_focused_research(raw_id)
+        result=process_signal(raw_id,payload); focused_research=record_bco_focused_research(raw_id)
     except Exception as e:
-        log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id})
-        raise
-    return {"status":"ok","raw_signal_id":raw_id,"result":result,"focused_research":focused_research,"ai_regime_observer":ai_regime_observer}
+        log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id}); raise
+    return {"status":"ok","raw_signal_id":raw_id,"ingress_receipt_id":receipt_id,"result":result,"focused_research":focused_research,"ai_regime_observer":ai_regime_observer}
 
 
 @app.get("/snapshot")
@@ -4255,6 +4354,8 @@ def _bco_standard_health_html():
 
 def _bco_standard_latest_signals_combined_html():
     return _bco_latest_30_signals_html() + """
+      <details><summary>Webhook Ingress / Delivery Audit</summary>
+      <div class="research-inner-body">""" + _bco_webhook_ingress_html() + """</div></details>
       <details><summary>Current Signal State / Recent Signal Detail</summary>
       <div class="research-inner-body">""" + _bco_standard_signal_html() + """</div></details>"""
 
