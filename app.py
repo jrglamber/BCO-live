@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.8 — Postgres Signal Health Hotfix + Flat Basket Reset"
-APP_VERSION = "0.7.8"
-POLICY_VERSION = "bco_v0.7.8_postgres_signal_health_hotfix_flat_basket_reset"
+APP_NAME = "Project Exit Plan — BCO v0.7.9 — Fresh Signal Recovery + Legacy Gap Isolation"
+APP_VERSION = "0.7.9"
+POLICY_VERSION = "bco_v0.7.9_fresh_signal_recovery_legacy_gap_isolation"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -2263,33 +2263,58 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
 
 
 def recover_unprocessed_bco_signals(limit: Optional[int] = None) -> Dict[str, Any]:
-    """Recover only the unprocessed tail of durable BCO raw signals.
+    """Recover only FRESH durable BCO signals missing a basket_decision.
 
-    Rows are replayed oldest-first. Candidate support and regime calculations are
-    bounded to each raw_signal_id so an older recovered signal cannot see later
-    raw rows. AI observer snapshots are intentionally not backfilled because their
-    contract requires capture before deterministic processing.
+    v0.7.9 safety change:
+    - scan genuine orphan rows using LEFT JOIN, so a hole below the newest
+      decision is detectable;
+    - only rows received within BCO_FRESH_SIGNAL_MAX_AGE_SECONDS are eligible
+      for deterministic replay;
+    - older orphan rows are classified as legacy audit gaps and are NEVER
+      replayed into entry/management logic.
+
+    This prevents historical gaps (including old candidate=true rows) from
+    reopening trades long after their original candle.
     """
     if not BCO_SIGNAL_RECOVERY_ENABLED:
-        return {"ok": True, "enabled": False, "recovered": 0, "pending": 0}
+        return {
+            "ok": True,
+            "enabled": False,
+            "recovered": 0,
+            "pending_fresh": 0,
+            "legacy_unprocessed": 0,
+        }
 
     batch = max(1, min(int(limit or BCO_SIGNAL_RECOVERY_BATCH_LIMIT), 100))
+    now_dt = datetime.now(timezone.utc)
+    cutoff = (now_dt - timedelta(seconds=BCO_FRESH_SIGNAL_MAX_AGE_SECONDS)).isoformat()
+
     with _db_lock, get_conn() as conn:
-        dec = fetchone_dict(conn.execute(
-            "SELECT COALESCE(MAX(raw_signal_id),0) AS max_id FROM basket_decisions"
-        )) or {}
-        max_decision_id = int(safe_float(dec.get("max_id")) or 0)
-        pending = fetchall_dict(conn.execute(
-            "SELECT * FROM raw_signals WHERE id>? ORDER BY id ASC LIMIT ?",
-            (max_decision_id, batch),
-        ))
+        fresh_pending = fetchall_dict(conn.execute("""
+            SELECT r.*
+            FROM raw_signals r
+            LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
+            WHERE d.id IS NULL
+              AND r.received_at_utc>=?
+            ORDER BY r.id ASC
+            LIMIT ?
+        """, (cutoff, batch)))
+
+        legacy_row = fetchone_dict(conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM raw_signals r
+            LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
+            WHERE d.id IS NULL
+              AND r.received_at_utc<?
+        """, (cutoff,))) or {}
+        legacy_unprocessed = int(safe_float(legacy_row.get("c")) or 0)
 
     recovered = 0
     duplicates = 0
     errors: List[Dict[str, Any]] = []
     recovered_ids: List[int] = []
 
-    for row in pending:
+    for row in fresh_pending:
         raw_id = int(safe_float(row.get("id")) or 0)
         if raw_id <= 0:
             continue
@@ -2328,31 +2353,53 @@ def recover_unprocessed_bco_signals(limit: Optional[int] = None) -> Dict[str, An
                         )
                 log_event(
                     "signal_recovered",
-                    f"Recovered stored BCO raw signal {raw_id} into deterministic processing.",
-                    {"raw_signal_id": raw_id},
+                    f"Recovered fresh stored BCO raw signal {raw_id} into deterministic processing.",
+                    {
+                        "raw_signal_id": raw_id,
+                        "fresh_signal_max_age_seconds": BCO_FRESH_SIGNAL_MAX_AGE_SECONDS,
+                    },
                 )
             else:
-                raise RuntimeError(safe_str(result.get("error") or "process_signal returned ok=false"))
+                raise RuntimeError(
+                    safe_str(result.get("error") or "process_signal returned ok=false")
+                )
         except Exception as exc:
-            errors.append({"raw_signal_id": raw_id, "error": f"{type(exc).__name__}: {exc}"})
+            errors.append({
+                "raw_signal_id": raw_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
             log_event(
                 "signal_recovery_error",
                 f"raw_signal_id={raw_id}: {type(exc).__name__}: {exc}",
                 {"raw_signal_id": raw_id},
             )
-            # Never skip over a failed tail row: that would break chronology.
+            # Do not continue past a fresh failed orphan: preserve chronology
+            # among the recoverable tail.
             break
 
     with _db_lock, get_conn() as conn:
+        remaining_fresh_row = fetchone_dict(conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM raw_signals r
+            LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
+            WHERE d.id IS NULL
+              AND r.received_at_utc>=?
+        """, (cutoff,))) or {}
+        remaining_fresh = int(safe_float(remaining_fresh_row.get("c")) or 0)
+
         runtime_set(conn, "signal_recovery_last_at", now_utc_iso())
         runtime_set(conn, "signal_recovery_last_recovered", str(recovered))
         runtime_set(conn, "signal_recovery_last_errors", str(len(errors)))
+        runtime_set(conn, "signal_recovery_legacy_unprocessed", str(legacy_unprocessed))
+        runtime_set(conn, "signal_recovery_fresh_pending", str(remaining_fresh))
 
     return {
         "ok": not errors,
         "enabled": True,
-        "max_completed_raw_signal_id_before": max_decision_id,
-        "pending_scanned": len(pending),
+        "fresh_signal_max_age_seconds": BCO_FRESH_SIGNAL_MAX_AGE_SECONDS,
+        "pending_fresh_scanned": len(fresh_pending),
+        "pending_fresh_remaining": remaining_fresh,
+        "legacy_unprocessed": legacy_unprocessed,
         "recovered": recovered,
         "recovered_ids": recovered_ids,
         "duplicates": duplicates,
@@ -3541,11 +3588,10 @@ def recover_pending_signals_endpoint(
     x_admin_secret: Optional[str] = Header(default=None),
     limit: int = Query(default=100, ge=1, le=100),
 ):
-    """Manual safe recovery trigger.
+    """Manual safe recovery trigger for FRESH orphan signals only.
 
-    This does NOT override/mark signals as processed. It reruns the existing
-    deterministic processor idempotently so Signal Health can return to OK only
-    after the missing basket_decision rows genuinely exist.
+    Historical orphan rows older than BCO_FRESH_SIGNAL_MAX_AGE_SECONDS are
+    intentionally never replayed into current entry/management logic.
     """
     check_admin(x_admin_secret)
     return recover_unprocessed_bco_signals(limit=limit)
@@ -3960,20 +4006,38 @@ def _bco_standard_top_uncached():
         _latest_raw_id=int(safe_float(_raw_latest.get("id")) or 0)
         _latest_decision_id=int(safe_float(_dec_latest.get("raw_signal_id")) or 0)
 
-        # v0.7.8 Postgres-safe processing backlog calculation.
-        # candidate_8h is BOOLEAN on Postgres, so do not COALESCE it with an
-        # integer. Count rows in Python and use the project's parse_bool helper.
+        # v0.7.9: live Signal Health is concerned only with FRESH,
+        # recoverable processing gaps. Old historical orphan rows are retained
+        # as audit gaps but cannot keep the live dashboard in RECOVERING or be
+        # replayed into current trading.
+        _health_cutoff=(
+            datetime.now(timezone.utc)
+            - timedelta(seconds=BCO_FRESH_SIGNAL_MAX_AGE_SECONDS)
+        ).isoformat()
+
         _pending_rows=fetchall_dict(conn.execute("""
             SELECT r.id, r.candidate_8h
             FROM raw_signals r
             LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
             WHERE d.id IS NULL
+              AND r.received_at_utc>=?
             ORDER BY r.id ASC
-        """))
+        """, (_health_cutoff,)))
         _pending_count=len(_pending_rows)
         _pending_candidate_count=sum(
             1 for _pending_row in _pending_rows
             if parse_bool(_pending_row.get("candidate_8h"), False)
+        )
+
+        _legacy_pending_row=fetchone_dict(conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM raw_signals r
+            LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
+            WHERE d.id IS NULL
+              AND r.received_at_utc<?
+        """, (_health_cutoff,))) or {}
+        _legacy_pending_count=int(
+            safe_float(_legacy_pending_row.get("c")) or 0
         )
 
         _latest_processed=True
@@ -4021,7 +4085,9 @@ def _bco_standard_top_uncached():
                  "latest_decision_raw_id":_latest_decision_id,
                  "processing_lag":_pending_count,
                  "pending_candidate_count":_pending_candidate_count,
-                 "processing_health_source":"unprocessed raw_signals missing basket_decisions",
+                 "legacy_unprocessed_count":_legacy_pending_count,
+                 "fresh_signal_max_age_seconds":BCO_FRESH_SIGNAL_MAX_AGE_SECONDS,
+                 "processing_health_source":"fresh unprocessed raw_signals missing basket_decisions",
                  "recovery_interval_seconds":BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS},
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
@@ -4680,7 +4746,7 @@ ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl
 ${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
-${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'RECOVERING',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}`:'Waiting for BCO signal'):`Pending processing ${{eh(g.processing_lag||0)}} · candidate pending ${{eh(g.pending_candidate_count||0)}} · auto-retry every ${{eh(g.recovery_interval_seconds||10)}}s${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'warn')}}
+${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'RECOVERING',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}${{Number(g.legacy_unprocessed_count||0)>0?' · legacy audit gaps '+eh(g.legacy_unprocessed_count)+' (non-executable)':''}}`:'Waiting for BCO signal'):`Fresh pending ${{eh(g.processing_lag||0)}} · candidate pending ${{eh(g.pending_candidate_count||0)}} · auto-retry every ${{eh(g.recovery_interval_seconds||10)}}s${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'warn')}}
 ${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?(g.latest_time_display?`Latest candle · ${{eh(g.latest_time_display)}}`:'Signal received'):(g.latest_time_display?`Waiting · latest ${{eh(g.latest_time_display)}}`:'Waiting'))}}
 ${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
