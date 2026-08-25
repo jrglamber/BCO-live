@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.7 — Signal Recovery + Flat Basket Reset"
-APP_VERSION = "0.7.7"
-POLICY_VERSION = "bco_v0.7.7_signal_recovery_flat_basket_reset"
+APP_NAME = "Project Exit Plan — BCO v0.7.8 — Postgres Signal Health Hotfix + Flat Basket Reset"
+APP_VERSION = "0.7.8"
+POLICY_VERSION = "bco_v0.7.8_postgres_signal_health_hotfix_flat_basket_reset"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -3960,16 +3960,21 @@ def _bco_standard_top_uncached():
         _latest_raw_id=int(safe_float(_raw_latest.get("id")) or 0)
         _latest_decision_id=int(safe_float(_dec_latest.get("raw_signal_id")) or 0)
 
-        _pending=fetchone_dict(conn.execute("""
-            SELECT
-                COUNT(*) AS c,
-                COALESCE(SUM(CASE WHEN COALESCE(r.candidate_8h,0)<>0 THEN 1 ELSE 0 END),0) AS candidate_c
+        # v0.7.8 Postgres-safe processing backlog calculation.
+        # candidate_8h is BOOLEAN on Postgres, so do not COALESCE it with an
+        # integer. Count rows in Python and use the project's parse_bool helper.
+        _pending_rows=fetchall_dict(conn.execute("""
+            SELECT r.id, r.candidate_8h
             FROM raw_signals r
             LEFT JOIN basket_decisions d ON d.raw_signal_id=r.id
             WHERE d.id IS NULL
-        """)) or {}
-        _pending_count=int(safe_float(_pending.get("c")) or 0)
-        _pending_candidate_count=int(safe_float(_pending.get("candidate_c")) or 0)
+            ORDER BY r.id ASC
+        """))
+        _pending_count=len(_pending_rows)
+        _pending_candidate_count=sum(
+            1 for _pending_row in _pending_rows
+            if parse_bool(_pending_row.get("candidate_8h"), False)
+        )
 
         _latest_processed=True
         if _latest_raw_id>0:
@@ -4016,6 +4021,7 @@ def _bco_standard_top_uncached():
                  "latest_decision_raw_id":_latest_decision_id,
                  "processing_lag":_pending_count,
                  "pending_candidate_count":_pending_candidate_count,
+                 "processing_health_source":"unprocessed raw_signals missing basket_decisions",
                  "recovery_interval_seconds":BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS},
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
