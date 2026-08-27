@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.7.9 — Fresh Signal Recovery + Legacy Gap Isolation"
-APP_VERSION = "0.7.9"
-POLICY_VERSION = "bco_v0.7.9_fresh_signal_recovery_legacy_gap_isolation"
+APP_NAME = "Project Exit Plan — BCO v0.8.0 — MFE + ATR2 Exit Challenger Forward Shadow"
+APP_VERSION = "0.8.0"
+POLICY_VERSION = "bco_v0.8.0_mfe_atr2_exit_challenger_forward_shadow"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -209,6 +209,22 @@ BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS = max(
 BCO_SIGNAL_CANDLE_TIMEZONE = os.getenv("BCO_SIGNAL_CANDLE_TIMEZONE", "America/Chicago").strip()
 BCO_DISPLAY_TIMEZONE = os.getenv("BCO_DISPLAY_TIMEZONE", "Europe/London").strip()
 BCO_DISPLAY_TIME_LABEL = os.getenv("BCO_DISPLAY_TIME_LABEL", "UK").strip() or "UK"
+
+
+# v0.8.0 — BCO EXIT CHALLENGERS, FORWARD SHADOW ONLY.
+# These settings are NEVER consumed by live entry/exit/stop/banking/broker code.
+BCO_EXIT_SHADOW_ENABLED = env_bool("BCO_EXIT_SHADOW_ENABLED", True)
+BCO_EXIT_SHADOW_VERSION = "bco_exit_shadow_v1_mfe50_atr2_2026_08_27"
+BCO_EXIT_SHADOW_MIN_HOLD_HOURS = 48
+BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION = 0.50
+BCO_EXIT_SHADOW_ATR_MULTIPLIER = 2.0
+BCO_EXIT_SHADOW_ATR_PERIOD = 14
+BCO_EXIT_SHADOW_ATR_LOOKBACK_BARS = 500
+BCO_EXIT_SHADOW_PAIR_TIE_R = 0.10
+BCO_EXIT_SHADOW_REVERSAL_SAVE_DELTA_R = 0.50
+BCO_EXIT_SHADOW_LARGE_WINNER_R = 2.00
+BCO_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R = 0.75
+BCO_EXIT_SHADOW_EXECUTION_AUTHORITY = False
 
 
 # Shared-account guard. This service may read account-wide NAV/margin, but all
@@ -673,6 +689,55 @@ def init_db() -> None:
                 note TEXT
             )
         """)
+
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS bco_exit_challenger_shadow (
+                id {id_type},
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                shadow_version TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                challenger TEXT NOT NULL,
+                entry_raw_signal_id BIGINT,
+                entry_signal_id TEXT,
+                entry_time TEXT,
+                entry_price DOUBLE PRECISION,
+                sl_pct DOUBLE PRECISION,
+                hard_stop_price DOUBLE PRECISION,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                last_raw_signal_id BIGINT,
+                last_signal_time TEXT,
+                hold_candles BIGINT DEFAULT 0,
+                current_price DOUBLE PRECISION,
+                current_R DOUBLE PRECISION DEFAULT 0,
+                highest_high DOUBLE PRECISION,
+                lowest_low DOUBLE PRECISION,
+                mfe_pct DOUBLE PRECISION DEFAULT 0,
+                mae_pct DOUBLE PRECISION DEFAULT 0,
+                atr14 DOUBLE PRECISION,
+                trail_price DOUBLE PRECISION,
+                mfe_floor_price DOUBLE PRECISION,
+                hypothetical_exit_time TEXT,
+                hypothetical_exit_price DOUBLE PRECISION,
+                hypothetical_exit_R DOUBLE PRECISION,
+                hypothetical_exit_reason TEXT,
+                actual_status TEXT,
+                actual_exit_time TEXT,
+                actual_exit_price DOUBLE PRECISION,
+                actual_R DOUBLE PRECISION,
+                actual_exit_reason TEXT,
+                paired_complete {bool_type} DEFAULT 0,
+                challenger_minus_current_R DOUBLE PRECISION,
+                paired_winner TEXT,
+                saved_reversal {bool_type} DEFAULT 0,
+                killed_large_winner {bool_type} DEFAULT 0,
+                note TEXT,
+                UNIQUE(trade_id, challenger)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_status ON bco_exit_challenger_shadow(status,paired_complete)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_trade ON bco_exit_challenger_shadow(trade_id,challenger)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_signal ON bco_exit_challenger_shadow(last_raw_signal_id)")
 
 
 def log_event(event_type: str, message: str, raw: Optional[Dict[str, Any]] = None) -> None:
@@ -2210,8 +2275,17 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         support=candidate_support(conn, max_raw_signal_id=raw_signal_id)
         before=basket_metrics(conn)
         state=ensure_cycle(conn,signal_time,before)
-        # Update existing trades before deciding defence/entry.
-        for t in list(before["rows"]): update_trade_on_signal(conn,t,signal,support,raw_signal_id=raw_signal_id)
+        # Update existing production trades before deciding defence/entry.
+        for t in list(before["rows"]):
+            update_trade_on_signal(conn,t,signal,support,raw_signal_id=raw_signal_id)
+
+        # v0.8.0 research-only exit challengers advance on the same immutable
+        # hourly candle. This has zero execution authority and never feeds back
+        # into production state.
+        exit_shadow = update_bco_exit_challenger_shadows(
+            conn, raw_signal_id, signal
+        )
+
         mid=basket_metrics(conn); state=ensure_cycle(conn,signal_time,mid)
         old_hwm=float(safe_float(state.get("high_water_R")) or 0.0); hwm=max(old_hwm,float(mid["basket_R"]))
         flags=latest_payload_flags(payload)
@@ -2233,6 +2307,12 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
                 state=ensure_cycle(conn,signal_time,temp_metrics); cycle=safe_str(state.get("cycle_id"))
             new_trade_id=create_trade(conn,raw_signal_id,signal,cycle)
             entry_created=bool(new_trade_id)
+            if entry_created:
+                # Forward-only: challenger rows are born only alongside NEW
+                # production trades after this deployment. No backfill exists.
+                start_bco_exit_challenger_shadows(
+                    conn, new_trade_id, raw_signal_id
+                )
         final=basket_metrics(conn)
         # If basket is now flat, close the cycle cleanly and expire waiting stages.
         if final["open_count"]<=0:
@@ -2259,7 +2339,16 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,(now_utc_iso(),raw_signal_id,signal_time,final_state.get("cycle_id"),candidate,entry_allowed,entry_created,before["open_count"],final["open_count"],before["basket_R"],final["basket_R"],final_state.get("high_water_R"),final_state.get("giveback_pct"),final["losing_pct"],final["phase"],score,status,action,detail,defence.get("closed_count"),",".join(defence.get("closed_trade_ids") or []),protection.get("banked_R"),",".join(protection.get("banked_trade_ids") or []),f"entry_block={block_reason}; raw_action={raw_action}; reasons={','.join(reasons)}"))
         record_basket_snapshot(conn, raw_signal_id, signal_time, final_state, final)
-    return {"ok":True,"raw_signal_id":raw_signal_id,"candidate":candidate,"entry_allowed":entry_allowed,"entry_created":entry_created,"trade_id":new_trade_id,"basket":snapshot()}
+    return {
+        "ok":True,
+        "raw_signal_id":raw_signal_id,
+        "candidate":candidate,
+        "entry_allowed":entry_allowed,
+        "entry_created":entry_created,
+        "trade_id":new_trade_id,
+        "basket":snapshot(),
+        "exit_challenger_shadow":exit_shadow,
+    }
 
 
 def recover_unprocessed_bco_signals(limit: Optional[int] = None) -> Dict[str, Any]:
@@ -2408,6 +2497,553 @@ def recover_unprocessed_bco_signals(limit: Optional[int] = None) -> Dict[str, An
     }
 
 
+
+# ============================================================
+# v0.8.0 — BCO MFE + ATR2 EXIT CHALLENGER FORWARD SHADOW
+# Research-only. Zero broker / execution authority.
+# ============================================================
+
+def _bco_exit_shadow_wilder_atr14(
+    conn: DBConn,
+    raw_signal_id: int,
+    period: int = BCO_EXIT_SHADOW_ATR_PERIOD,
+) -> Optional[float]:
+    """Point-in-time Wilder ATR from BCO hourly raw signals.
+
+    Historical raw bars may be used only to seed the indicator. Shadow TRADES are
+    never backfilled: challenger rows are created exclusively when a new
+    production trade is created after deployment.
+    """
+    period = max(2, int(period))
+    rows = fetchall_dict(conn.execute("""
+        SELECT id,exec_close,exec_high,exec_low,raw_json
+        FROM raw_signals
+        WHERE id<=? AND exec_close IS NOT NULL
+        ORDER BY id DESC
+        LIMIT ?
+    """, (int(raw_signal_id), max(period + 2, int(BCO_EXIT_SHADOW_ATR_LOOKBACK_BARS)))))
+    rows = list(reversed(rows))
+    if len(rows) < period + 1:
+        return None
+
+    # Prefer a genuinely exported ATR if present on the current point-in-time payload.
+    try:
+        latest_raw = json.loads(safe_str(rows[-1].get("raw_json")) or "{}")
+        latest_payload = extract_payload(latest_raw) if isinstance(latest_raw, dict) else {}
+        for key in ("atr14", "atr", "exec_atr"):
+            v = safe_float(latest_payload.get(key))
+            if v is not None and v > 0:
+                return float(v)
+    except Exception:
+        pass
+
+    trs: List[float] = []
+    prev_close: Optional[float] = None
+    for row in rows:
+        close = safe_float(row.get("exec_close"))
+        high = safe_float(row.get("exec_high"))
+        low = safe_float(row.get("exec_low"))
+        if close is None:
+            continue
+        high = float(high if high is not None else close)
+        low = float(low if low is not None else close)
+        if prev_close is None:
+            tr = max(0.0, high - low)
+        else:
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(float(tr))
+        prev_close = float(close)
+
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / float(period)
+    for tr in trs[period:]:
+        atr = ((atr * (period - 1)) + tr) / float(period)
+    return float(atr) if atr > 0 else None
+
+
+def _bco_exit_shadow_classification(actual_r: Optional[float], challenger_r: Optional[float]) -> Dict[str, Any]:
+    if actual_r is None or challenger_r is None:
+        return {
+            "paired_complete": False,
+            "delta_r": None,
+            "winner": "",
+            "saved_reversal": False,
+            "killed_large_winner": False,
+        }
+    actual = float(actual_r)
+    challenger = float(challenger_r)
+    delta = challenger - actual
+    if delta > BCO_EXIT_SHADOW_PAIR_TIE_R:
+        winner = "CHALLENGER"
+    elif delta < -BCO_EXIT_SHADOW_PAIR_TIE_R:
+        winner = "CURRENT"
+    else:
+        winner = "TIE"
+    return {
+        "paired_complete": True,
+        "delta_r": delta,
+        "winner": winner,
+        "saved_reversal": bool(
+            actual < 0
+            and challenger > actual + BCO_EXIT_SHADOW_REVERSAL_SAVE_DELTA_R
+        ),
+        "killed_large_winner": bool(
+            actual >= BCO_EXIT_SHADOW_LARGE_WINNER_R
+            and challenger < actual - BCO_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R
+        ),
+    }
+
+
+def _bco_exit_shadow_sync_actual(conn: DBConn, shadow: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy actual/current-manager outcome into the research row.
+
+    Reads the production trade table only. Never writes production state.
+    """
+    trade = fetchone_dict(conn.execute(
+        "SELECT * FROM trades WHERE trade_id=? LIMIT 1",
+        (shadow.get("trade_id"),),
+    )) or {}
+    if not trade:
+        return shadow
+
+    actual_status = safe_str(trade.get("status")).upper() or "UNKNOWN"
+    actual_exit_time = safe_str(trade.get("exit_time"))
+    actual_exit_price = safe_float(trade.get("exit_price"))
+    actual_r = safe_float(trade.get("realized_R"))
+    actual_reason = safe_str(trade.get("exit_reason"))
+
+    if actual_status in {"CLOSED", "BROKER_CLOSED"} and actual_r is None:
+        entry = safe_float(shadow.get("entry_price")) or safe_float(trade.get("entry_price"))
+        if entry and actual_exit_price:
+            actual_r = (((float(actual_exit_price) - float(entry)) / float(entry)) * 100.0) / float(BCO_SL_PCT)
+
+    shadow_closed = safe_str(shadow.get("status")).upper() == "CLOSED"
+    pair = _bco_exit_shadow_classification(
+        actual_r if actual_status in {"CLOSED", "BROKER_CLOSED"} else None,
+        safe_float(shadow.get("hypothetical_exit_R")) if shadow_closed else None,
+    )
+
+    conn.execute("""
+        UPDATE bco_exit_challenger_shadow SET
+            actual_status=?,actual_exit_time=?,actual_exit_price=?,actual_R=?,actual_exit_reason=?,
+            paired_complete=?,challenger_minus_current_R=?,paired_winner=?,
+            saved_reversal=?,killed_large_winner=?,updated_at_utc=?
+        WHERE id=?
+    """, (
+        actual_status,
+        actual_exit_time or None,
+        actual_exit_price,
+        actual_r,
+        actual_reason,
+        bool(pair["paired_complete"]),
+        pair["delta_r"],
+        pair["winner"],
+        bool(pair["saved_reversal"]),
+        bool(pair["killed_large_winner"]),
+        now_utc_iso(),
+        shadow.get("id"),
+    ))
+    return fetchone_dict(conn.execute(
+        "SELECT * FROM bco_exit_challenger_shadow WHERE id=? LIMIT 1",
+        (shadow.get("id"),),
+    )) or shadow
+
+
+def start_bco_exit_challenger_shadows(
+    conn: DBConn,
+    trade_id: str,
+    entry_raw_signal_id: int,
+) -> Dict[str, Any]:
+    """Create MFE and ATR2 research rows for a NEW production trade only.
+
+    There is intentionally no historical/backfill loop anywhere in the app.
+    """
+    if not BCO_EXIT_SHADOW_ENABLED:
+        return {"ok": True, "enabled": False, "created": 0}
+    trade = fetchone_dict(conn.execute(
+        "SELECT * FROM trades WHERE trade_id=? LIMIT 1",
+        (safe_str(trade_id),),
+    )) or {}
+    if not trade or safe_str(trade.get("status")).upper() != "OPEN":
+        return {"ok": False, "created": 0, "reason": "production_trade_not_open"}
+
+    entry = safe_float(trade.get("entry_price"))
+    if entry is None or entry <= 0:
+        return {"ok": False, "created": 0, "reason": "entry_price_missing"}
+
+    entry_signal_id = safe_str(trade.get("entry_signal_id"))
+    entry_time = safe_str(trade.get("entry_time"))
+    hard = safe_float(trade.get("hard_sl_price")) or float(entry) * (1.0 - BCO_SL_PCT / 100.0)
+    created = 0
+
+    for challenger in ("MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
+        existing = fetchone_dict(conn.execute("""
+            SELECT id FROM bco_exit_challenger_shadow
+            WHERE trade_id=? AND challenger=? LIMIT 1
+        """, (trade_id, challenger)))
+        if existing:
+            continue
+        conn.execute("""
+            INSERT INTO bco_exit_challenger_shadow(
+                created_at_utc,updated_at_utc,shadow_version,trade_id,challenger,
+                entry_raw_signal_id,entry_signal_id,entry_time,entry_price,sl_pct,
+                hard_stop_price,status,last_raw_signal_id,last_signal_time,hold_candles,
+                current_price,current_R,highest_high,lowest_low,mfe_pct,mae_pct,
+                actual_status,note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_utc_iso(), now_utc_iso(), BCO_EXIT_SHADOW_VERSION, trade_id, challenger,
+            int(entry_raw_signal_id), entry_signal_id, entry_time, float(entry), BCO_SL_PCT,
+            float(hard), int(entry_raw_signal_id), entry_time, 0,
+            float(entry), 0.0, float(entry), float(entry), 0.0, 0.0,
+            safe_str(trade.get("status")).upper(),
+            "Forward-only research shadow created from new production-accepted BCO trade. Zero execution authority.",
+        ))
+        created += 1
+    return {"ok": True, "enabled": True, "created": created, "trade_id": trade_id}
+
+
+def _bco_exit_shadow_close(
+    conn: DBConn,
+    shadow: Dict[str, Any],
+    signal_time: str,
+    exit_price: float,
+    reason: str,
+    current_price: float,
+    highest: float,
+    lowest: float,
+    hold: int,
+    atr14: Optional[float],
+    trail_price: Optional[float],
+    mfe_floor: Optional[float],
+) -> None:
+    entry = float(safe_float(shadow.get("entry_price")) or 0.0)
+    exit_r = ((((float(exit_price) - entry) / entry) * 100.0) / float(BCO_SL_PCT)) if entry > 0 else 0.0
+    current_r = ((((float(current_price) - entry) / entry) * 100.0) / float(BCO_SL_PCT)) if entry > 0 else 0.0
+    mfe_pct = max(0.0, ((highest - entry) / entry) * 100.0) if entry > 0 else 0.0
+    mae_pct = min(0.0, ((lowest - entry) / entry) * 100.0) if entry > 0 else 0.0
+    conn.execute("""
+        UPDATE bco_exit_challenger_shadow SET
+            status='CLOSED',last_signal_time=?,hold_candles=?,current_price=?,current_R=?,
+            highest_high=?,lowest_low=?,mfe_pct=?,mae_pct=?,atr14=?,
+            trail_price=?,mfe_floor_price=?,
+            hypothetical_exit_time=?,hypothetical_exit_price=?,hypothetical_exit_R=?,
+            hypothetical_exit_reason=?,updated_at_utc=?
+        WHERE id=?
+    """, (
+        signal_time, hold, current_price, current_r,
+        highest, lowest, mfe_pct, mae_pct, atr14,
+        trail_price, mfe_floor,
+        signal_time, float(exit_price), exit_r, reason, now_utc_iso(), shadow.get("id"),
+    ))
+
+
+def update_bco_exit_challenger_shadows(
+    conn: DBConn,
+    raw_signal_id: int,
+    signal: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Advance every active/incomplete forward shadow on the current BCO candle."""
+    if not BCO_EXIT_SHADOW_ENABLED:
+        return {"ok": True, "enabled": False, "updated": 0, "closed": 0}
+
+    current = safe_float(signal.get("exec_close"))
+    high = safe_float(signal.get("exec_high"))
+    low = safe_float(signal.get("exec_low"))
+    signal_time = safe_str(signal.get("timestamp_readable"))
+    if current is None:
+        return {"ok": False, "enabled": True, "reason": "exec_close_missing"}
+
+    current = float(current)
+    high = float(high if high is not None else current)
+    low = float(low if low is not None else current)
+    atr14 = _bco_exit_shadow_wilder_atr14(conn, int(raw_signal_id))
+
+    shadows = fetchall_dict(conn.execute("""
+        SELECT * FROM bco_exit_challenger_shadow
+        WHERE status='OPEN' OR COALESCE(paired_complete,0)=0
+        ORDER BY id ASC
+    """))
+
+    updated = 0
+    closed = 0
+    for shadow in shadows:
+        # Always sync Current outcome, even after challenger has already exited.
+        shadow = _bco_exit_shadow_sync_actual(conn, shadow)
+        if safe_str(shadow.get("status")).upper() != "OPEN":
+            updated += 1
+            continue
+
+        last_id = int(safe_float(shadow.get("last_raw_signal_id")) or 0)
+        if int(raw_signal_id) <= last_id:
+            continue  # recovery/idempotency guard
+
+        entry = float(safe_float(shadow.get("entry_price")) or 0.0)
+        if entry <= 0:
+            continue
+        hard = float(
+            safe_float(shadow.get("hard_stop_price"))
+            or entry * (1.0 - BCO_SL_PCT / 100.0)
+        )
+        hold = int(safe_float(shadow.get("hold_candles")) or 0) + 1
+        highest = max(float(safe_float(shadow.get("highest_high")) or entry), high)
+        lowest = min(float(safe_float(shadow.get("lowest_low")) or entry), low)
+        current_r = (((current - entry) / entry) * 100.0) / float(BCO_SL_PCT)
+        mfe_pct = max(0.0, ((highest - entry) / entry) * 100.0)
+        mae_pct = min(0.0, ((lowest - entry) / entry) * 100.0)
+        challenger = safe_str(shadow.get("challenger")).upper()
+
+        trail: Optional[float] = safe_float(shadow.get("trail_price"))
+        mfe_floor: Optional[float] = safe_float(shadow.get("mfe_floor_price"))
+        exit_price: Optional[float] = None
+        exit_reason = ""
+
+        if hold < BCO_EXIT_SHADOW_MIN_HOLD_HOURS:
+            if low <= hard:
+                exit_price = hard
+                exit_reason = "HARD_STOP_PRE48"
+        else:
+            if challenger == "ATR2_CHANDELIER":
+                if atr14 is not None and atr14 > 0:
+                    candidate_trail = highest - (BCO_EXIT_SHADOW_ATR_MULTIPLIER * float(atr14))
+                    trail = max(
+                        hard,
+                        float(trail) if trail is not None else hard,
+                        candidate_trail,
+                    )
+                    if low <= trail:
+                        exit_price = trail
+                        exit_reason = "ATR2_CHANDELIER"
+                elif low <= hard:
+                    exit_price = hard
+                    exit_reason = "HARD_STOP_ATR_UNAVAILABLE"
+
+            elif challenger == "MFE_GIVEBACK_50":
+                if highest > entry:
+                    retained_fraction = 1.0 - BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION
+                    candidate_floor = entry + ((highest - entry) * retained_fraction)
+                    mfe_floor = max(
+                        hard,
+                        float(mfe_floor) if mfe_floor is not None else hard,
+                        candidate_floor,
+                    )
+                    if low <= mfe_floor:
+                        exit_price = mfe_floor
+                        exit_reason = "MFE_GIVEBACK_50"
+                elif low <= hard:
+                    exit_price = hard
+                    exit_reason = "HARD_STOP_NO_POSITIVE_MFE"
+            else:
+                continue
+
+        if exit_price is not None:
+            _bco_exit_shadow_close(
+                conn, shadow, signal_time, float(exit_price), exit_reason,
+                current, highest, lowest, hold, atr14, trail, mfe_floor,
+            )
+            refreshed = fetchone_dict(conn.execute(
+                "SELECT * FROM bco_exit_challenger_shadow WHERE id=? LIMIT 1",
+                (shadow.get("id"),),
+            )) or shadow
+            _bco_exit_shadow_sync_actual(conn, refreshed)
+            closed += 1
+        else:
+            conn.execute("""
+                UPDATE bco_exit_challenger_shadow SET
+                    last_raw_signal_id=?,last_signal_time=?,hold_candles=?,
+                    current_price=?,current_R=?,highest_high=?,lowest_low=?,
+                    mfe_pct=?,mae_pct=?,atr14=?,trail_price=?,mfe_floor_price=?,
+                    updated_at_utc=?
+                WHERE id=?
+            """, (
+                int(raw_signal_id), signal_time, hold,
+                current, current_r, highest, lowest,
+                mfe_pct, mae_pct, atr14, trail, mfe_floor,
+                now_utc_iso(), shadow.get("id"),
+            ))
+        updated += 1
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "updated": updated,
+        "closed": closed,
+        "atr14": atr14,
+        "raw_signal_id": int(raw_signal_id),
+        "research_only": True,
+        "execution_authority": False,
+    }
+
+
+def sync_bco_exit_challenger_actual_outcomes(conn: DBConn) -> Dict[str, Any]:
+    """Refresh paired Current outcomes after broker reconciliation/transaction sync."""
+    if not BCO_EXIT_SHADOW_ENABLED:
+        return {"ok": True, "enabled": False, "updated": 0}
+    rows = fetchall_dict(conn.execute("""
+        SELECT * FROM bco_exit_challenger_shadow
+        WHERE COALESCE(paired_complete,0)=0
+        ORDER BY id ASC
+    """))
+    for row in rows:
+        _bco_exit_shadow_sync_actual(conn, row)
+    return {"ok": True, "enabled": True, "updated": len(rows)}
+
+
+def bco_exit_challenger_shadow_summary() -> Dict[str, Any]:
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute("""
+            SELECT * FROM bco_exit_challenger_shadow
+            ORDER BY id DESC
+        """))
+    out: Dict[str, Any] = {
+        "ok": True,
+        "enabled": BCO_EXIT_SHADOW_ENABLED,
+        "shadow_version": BCO_EXIT_SHADOW_VERSION,
+        "research_only": True,
+        "execution_authority": False,
+        "forward_only_no_backfill": True,
+        "challengers": {},
+        "trade_count": len({safe_str(r.get("trade_id")) for r in rows if safe_str(r.get("trade_id"))}),
+        "row_count": len(rows),
+    }
+    for challenger in ("MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
+        rr = [r for r in rows if safe_str(r.get("challenger")).upper() == challenger]
+        pairs = [r for r in rr if parse_bool(r.get("paired_complete"), False)]
+        deltas = [safe_float(r.get("challenger_minus_current_R")) for r in pairs]
+        deltas = [float(x) for x in deltas if x is not None]
+        out["challengers"][challenger] = {
+            "rows": len(rr),
+            "open": sum(1 for r in rr if safe_str(r.get("status")).upper() == "OPEN"),
+            "shadow_closed": sum(1 for r in rr if safe_str(r.get("status")).upper() == "CLOSED"),
+            "paired_complete": len(pairs),
+            "avg_delta_R": (sum(deltas) / len(deltas)) if deltas else None,
+            "challenger_wins": sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper() == "CHALLENGER"),
+            "current_wins": sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper() == "CURRENT"),
+            "ties": sum(1 for r in pairs if safe_str(r.get("paired_winner")).upper() == "TIE"),
+            "saved_reversals": sum(1 for r in pairs if parse_bool(r.get("saved_reversal"), False)),
+            "large_winners_killed": sum(1 for r in pairs if parse_bool(r.get("killed_large_winner"), False)),
+        }
+    return out
+
+
+@app.get("/bco-exit-challenger-shadow/status")
+def bco_exit_challenger_shadow_status_endpoint():
+    return bco_exit_challenger_shadow_summary()
+
+
+@app.get("/export/bco-exit-challenger-shadow.csv")
+def export_bco_exit_challenger_shadow_csv(limit: int = 50000):
+    limit = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute("""
+            SELECT * FROM bco_exit_challenger_shadow
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)))
+    return csv_response(rows, "bco-exit-challenger-shadow.csv")
+
+
+def build_bco_exit_challenger_shadow_html() -> str:
+    summary = bco_exit_challenger_shadow_summary()
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute("""
+            SELECT * FROM bco_exit_challenger_shadow
+            ORDER BY id DESC LIMIT 300
+        """))
+
+    def _fmt_r(v: Any) -> str:
+        n = safe_float(v)
+        return "—" if n is None else f"{n:.2f}R"
+
+    cards = ""
+    for key, label in (
+        ("MFE_GIVEBACK_50", "MFE 50% Giveback"),
+        ("ATR2_CHANDELIER", "ATR2 Chandelier"),
+    ):
+        s = (summary.get("challengers") or {}).get(key) or {}
+        avg = safe_float(s.get("avg_delta_R"))
+        cards += f"""
+          <div class="mini-card">
+            <div class="k">{esc(label)}</div>
+            <div class="v">{int(s.get('paired_complete') or 0)} paired</div>
+            <div class="small">
+              Open {int(s.get('open') or 0)} · Shadow closed {int(s.get('shadow_closed') or 0)} ·
+              Avg Δ {'—' if avg is None else f'{avg:+.2f}R'}<br>
+              Challenger wins {int(s.get('challenger_wins') or 0)} · Current wins {int(s.get('current_wins') or 0)} ·
+              Saved reversals {int(s.get('saved_reversals') or 0)} · Killed large winners {int(s.get('large_winners_killed') or 0)}
+            </div>
+          </div>
+        """
+
+    # Pivot latest rows by trade so Current/MFE/ATR2 are easy to compare.
+    by_trade: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    order: List[str] = []
+    for r in rows:
+        tid = safe_str(r.get("trade_id"))
+        if not tid:
+            continue
+        if tid not in by_trade:
+            by_trade[tid] = {}
+            order.append(tid)
+        by_trade[tid][safe_str(r.get("challenger")).upper()] = r
+
+    trs = ""
+    for tid in order[:80]:
+        d = by_trade.get(tid) or {}
+        mfe = d.get("MFE_GIVEBACK_50") or {}
+        atr = d.get("ATR2_CHANDELIER") or {}
+        basis = mfe or atr
+        actual_r = safe_float(basis.get("actual_R"))
+        trs += f"""
+        <tr>
+          <td>{esc(tid)}</td>
+          <td>{esc(basis.get('entry_time'))}</td>
+          <td>{_fmt_r(actual_r)}</td>
+          <td>{esc(mfe.get('status') or '—')}</td>
+          <td>{_fmt_r(mfe.get('hypothetical_exit_R') if safe_str(mfe.get('status')).upper()=='CLOSED' else mfe.get('current_R'))}</td>
+          <td>{_fmt_r(mfe.get('challenger_minus_current_R'))}</td>
+          <td>{esc(mfe.get('hypothetical_exit_reason') or '—')}</td>
+          <td>{esc(f"{safe_float(mfe.get('mfe_floor_price')):.3f}" if safe_float(mfe.get('mfe_floor_price')) is not None else '—')}</td>
+          <td>{esc(atr.get('status') or '—')}</td>
+          <td>{_fmt_r(atr.get('hypothetical_exit_R') if safe_str(atr.get('status')).upper()=='CLOSED' else atr.get('current_R'))}</td>
+          <td>{_fmt_r(atr.get('challenger_minus_current_R'))}</td>
+          <td>{esc(atr.get('hypothetical_exit_reason') or '—')}</td>
+          <td>{esc(f"{safe_float(atr.get('trail_price')):.3f}" if safe_float(atr.get('trail_price')) is not None else '—')}</td>
+          <td>{esc(f"{safe_float(atr.get('atr14')):.3f}" if safe_float(atr.get('atr14')) is not None else '—')}</td>
+        </tr>
+        """
+    if not trs:
+        trs = '<tr><td colspan="14">No forward-shadow trades yet. This is intentional: existing/historical BCO trades are not backfilled. The first new production-accepted trade after deployment will create both challenger rows.</td></tr>'
+
+    return f"""
+      <div class="section-note small">
+        <strong>Forward shadow only — ZERO broker authority.</strong>
+        New production-accepted BCO trades create two independent research copies:
+        <strong>MFE 50% giveback after 48h</strong> and <strong>2ATR Chandelier after 48h</strong>.
+        Both retain the normal {BCO_SL_PCT:.1f}% hard-stop basis. Either challenger may exit while
+        Current continues, or Current may exit while the challenger continues. No historical trade is backfilled.
+      </div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">Forward Trades Shadowed</div><div class="v">{int(summary.get('trade_count') or 0)}</div><div class="small">{esc(BCO_EXIT_SHADOW_VERSION)}</div></div>
+        {cards}
+        <div class="mini-card"><div class="k">Execution Authority</div><div class="v pos">NONE</div><div class="small">Research tables are never read by production entry, exit, stop, banking or broker code.</div></div>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr>
+          <th>Production Trade</th><th>Entry</th><th>Current Exit R</th>
+          <th>MFE State</th><th>MFE R</th><th>MFE Δ</th><th>MFE Exit</th><th>MFE Floor</th>
+          <th>ATR2 State</th><th>ATR2 R</th><th>ATR2 Δ</th><th>ATR2 Exit</th><th>ATR2 Trail</th><th>ATR14</th>
+        </tr></thead>
+        <tbody>{trs}</tbody>
+      </table></div>
+      <div class="section-note small">
+        <a href="/export/bco-exit-challenger-shadow.csv">Exit Challenger Shadow CSV</a> ·
+        <a href="/bco-exit-challenger-shadow/status">Shadow status JSON</a>.
+        Paired classifications include challenger-minus-Current R, reversal saved and large-winner killed.
+      </div>
+    """
+
+
 # -----------------------------------------------------------------------------
 # Reconciliation — only local BCO broker IDs; never touches foreign trades.
 # -----------------------------------------------------------------------------
@@ -2480,6 +3116,10 @@ def reconcile_broker() -> Dict[str,Any]:
         runtime_set(_rc,"broker_reconcile_last_at",now_utc_iso())
     tx_sync=sync_broker_transactions() if BCO_TRANSACTION_SYNC_ENABLED else {"ok":False,"skipped":True}
 
+    # Research-only paired-outcome refresh after broker transaction accounting.
+    with _db_lock, get_conn() as _shadow_conn:
+        exit_shadow_sync = sync_bco_exit_challenger_actual_outcomes(_shadow_conn)
+
     flat_reset={"reset":False,"reason":"not_flat"}
     if len(owned) == 0:
         with _db_lock,get_conn() as _flat_conn:
@@ -2505,6 +3145,7 @@ def reconcile_broker() -> Dict[str,Any]:
             "account_open_count":live.get("account_open_count"),
             "updates":updates,"local_only_cleaned":local_only_cleaned,
             "unlinked_broker_trades":unlinked_broker,"transaction_sync":tx_sync,
+            "exit_challenger_shadow_sync":exit_shadow_sync,
             "flat_basket_reset":flat_reset,"time_utc":now_utc_iso()}
 
 
@@ -3624,6 +4265,7 @@ def export_table(table: str):
         "basket-snapshots":"basket_snapshots",
         "harvest-execution-outcomes":"harvest_execution_outcomes",
         "accounting-snapshots":"accounting_snapshots",
+        "exit-challenger-shadow":"bco_exit_challenger_shadow",
     }
     if table not in allowed: raise HTTPException(status_code=404,detail="unknown export")
     with get_conn() as conn: rows=fetchall_dict(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id ASC"))
@@ -3647,6 +4289,7 @@ def export_all_zip():
         "basket-snapshots":"basket_snapshots",
         "harvest-execution-outcomes":"harvest_execution_outcomes",
         "accounting-snapshots":"accounting_snapshots",
+        "exit-challenger-shadow":"bco_exit_challenger_shadow",
     }
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
@@ -3671,6 +4314,16 @@ def export_all_zip():
             "requested_risk_gbp":BCO_RISK_PER_TRADE_GBP,
             "sl_pct":BCO_SL_PCT,
             "signal_recovery_enabled":BCO_SIGNAL_RECOVERY_ENABLED,
+            "exit_challenger_shadow":{
+                "enabled":BCO_EXIT_SHADOW_ENABLED,
+                "version":BCO_EXIT_SHADOW_VERSION,
+                "research_only":True,
+                "execution_authority":False,
+                "forward_only_no_backfill":True,
+                "mfe_giveback_fraction":BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION,
+                "atr_multiplier":BCO_EXIT_SHADOW_ATR_MULTIPLIER,
+                "min_hold_hours":BCO_EXIT_SHADOW_MIN_HOLD_HOURS,
+            },
             "analysis_tables":sorted(list(allowed.keys())),
             "generated_at_utc":now_utc_iso(),
         },indent=2))
@@ -3825,7 +4478,8 @@ def _bf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_bco_focused_research_html():
-    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus the event-driven AI Regime Observer. All AI output is research-only with zero execution authority.</div>' + \
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers and the event-driven AI Regime Observer. All research layers have zero execution authority.</div>' + \
+      '<details class="research-inner"><summary>MFE + ATR2 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_bco_exit_challenger_shadow_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _bf_table("BCO Multi-Horizon Alignment / Divergence",_bf_rows("bco_focused_alignment",100),["signal_time","state","return_4h","return_8h","return_24h","candidate"]) + \
@@ -3858,7 +4512,37 @@ def export_bco_focused_research_zip(limit:int=25000):
                     if _k not in _fields:_fields.append(_k)
             _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
         z.writestr("ai-regime-observer.csv",_aio.getvalue())
-        z.writestr("manifest.json",json.dumps({"project":"BCO","research_only":True,"generated_at_utc":now_utc_iso(),"streams":list(tables)+["ai-regime-observer.csv"]},indent=2))
+
+        with get_conn() as _esc:
+            _esrows=fetchall_dict(_esc.execute(
+                "SELECT * FROM bco_exit_challenger_shadow ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ))
+        _eso=io.StringIO()
+        if _esrows:
+            _esfields=[]
+            for _r in _esrows:
+                for _k in _r:
+                    if _k not in _esfields:_esfields.append(_k)
+            _esw=csv.DictWriter(_eso,fieldnames=_esfields,extrasaction="ignore")
+            _esw.writeheader();_esw.writerows(_esrows)
+        z.writestr("bco-exit-challenger-shadow.csv",_eso.getvalue())
+
+        z.writestr("manifest.json",json.dumps({
+            "project":"BCO",
+            "research_only":True,
+            "generated_at_utc":now_utc_iso(),
+            "streams":list(tables)+["ai-regime-observer.csv","bco-exit-challenger-shadow.csv"],
+            "exit_challenger_shadow":{
+                "version":BCO_EXIT_SHADOW_VERSION,
+                "forward_only_no_backfill":True,
+                "execution_authority":False,
+                "challengers":["MFE_GIVEBACK_50","ATR2_CHANDELIER"],
+                "min_hold_hours":BCO_EXIT_SHADOW_MIN_HOLD_HOURS,
+                "mfe_giveback_fraction":BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION,
+                "atr_multiplier":BCO_EXIT_SHADOW_ATR_MULTIPLIER,
+            },
+        },indent=2))
     return Response(content=buf.getvalue(),media_type="application/zip",headers={"Content-Disposition":'attachment; filename="bco-focused-research.zip"'})
 
 
@@ -4716,7 +5400,7 @@ def bco_standard_dashboard():
         _bco_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA BCO positions with local R, MFE/MAE, age, stops and effective risk."),
         _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO OANDA lane, accounting, execution/reconciliation and operational health."),
         _bco_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus persisted harvesting/protection stages."),
-        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "AI/regime evidence, high-water outcomes, alignment, trend efficiency and basket recovery."),
+        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "MFE/ATR2 exit challengers, AI/regime evidence, high-water outcomes, alignment, trend efficiency and basket recovery."),
     ])
     env_label = "LIVE" if OANDA_ENV == "live" else "DEMO / PRACTICE"
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Exit Plan — BCO</title>
