@@ -36,9 +36,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.0 — MFE + ATR2 Exit Challenger Forward Shadow"
-APP_VERSION = "0.8.0"
-POLICY_VERSION = "bco_v0.8.0_mfe_atr2_exit_challenger_forward_shadow"
+APP_NAME = "Project Exit Plan — BCO v0.8.1 — Exit Shadow Schema Self-Heal"
+APP_VERSION = "0.8.1"
+POLICY_VERSION = "bco_v0.8.1_exit_shadow_schema_self_heal"
+
+# v0.8.1 — operational repair only.
+# Production strategy/broker/manager rules remain identical to v0.8.0.
+# This build makes the forward exit-challenger research schema self-healing so
+# an interrupted/deferred Railway bootstrap cannot leave the Research/Evidence
+# Lab broken with UndefinedTable: bco_exit_challenger_shadow.
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -225,6 +231,16 @@ BCO_EXIT_SHADOW_REVERSAL_SAVE_DELTA_R = 0.50
 BCO_EXIT_SHADOW_LARGE_WINNER_R = 2.00
 BCO_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R = 0.75
 BCO_EXIT_SHADOW_EXECUTION_AUTHORITY = False
+
+# v0.8.1 — dedicated self-healing schema state for the research-only exit shadow.
+# This table is deliberately independent of production trading state. If Railway
+# serves the dashboard before deferred bootstrap DDL finishes (or a prior DDL
+# transaction was rolled back), any exit-shadow read/write can recreate and
+# verify the table idempotently without touching trades/basket/broker logic.
+_bco_exit_shadow_schema_lock = threading.RLock()
+_bco_exit_shadow_schema_ready = False
+_bco_exit_shadow_schema_last_error = ""
+_bco_exit_shadow_schema_checked_at = ""
 
 
 # Shared-account guard. This service may read account-wide NAV/margin, but all
@@ -738,6 +754,148 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_status ON bco_exit_challenger_shadow(status,paired_complete)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_trade ON bco_exit_challenger_shadow(trade_id,challenger)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_signal ON bco_exit_challenger_shadow(last_raw_signal_id)")
+
+
+def _ensure_bco_exit_challenger_shadow_schema_on_conn(conn: DBConn) -> None:
+    """Idempotently create/verify the v0.8 exit-challenger research table.
+
+    This is intentionally isolated from the large main init_db transaction. It
+    lets Railway recover if deferred startup DDL was interrupted or rolled back.
+    No production trade/basket/broker table is modified by this helper.
+    """
+    id_type = "BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    bool_type = "BOOLEAN" if conn.postgres else "INTEGER"
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS bco_exit_challenger_shadow (
+            id {id_type},
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            shadow_version TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            challenger TEXT NOT NULL,
+            entry_raw_signal_id BIGINT,
+            entry_signal_id TEXT,
+            entry_time TEXT,
+            entry_price DOUBLE PRECISION,
+            sl_pct DOUBLE PRECISION,
+            hard_stop_price DOUBLE PRECISION,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            last_raw_signal_id BIGINT,
+            last_signal_time TEXT,
+            hold_candles BIGINT DEFAULT 0,
+            current_price DOUBLE PRECISION,
+            current_R DOUBLE PRECISION DEFAULT 0,
+            highest_high DOUBLE PRECISION,
+            lowest_low DOUBLE PRECISION,
+            mfe_pct DOUBLE PRECISION DEFAULT 0,
+            mae_pct DOUBLE PRECISION DEFAULT 0,
+            atr14 DOUBLE PRECISION,
+            trail_price DOUBLE PRECISION,
+            mfe_floor_price DOUBLE PRECISION,
+            hypothetical_exit_time TEXT,
+            hypothetical_exit_price DOUBLE PRECISION,
+            hypothetical_exit_R DOUBLE PRECISION,
+            hypothetical_exit_reason TEXT,
+            actual_status TEXT,
+            actual_exit_time TEXT,
+            actual_exit_price DOUBLE PRECISION,
+            actual_R DOUBLE PRECISION,
+            actual_exit_reason TEXT,
+            paired_complete {bool_type} DEFAULT 0,
+            challenger_minus_current_R DOUBLE PRECISION,
+            paired_winner TEXT,
+            saved_reversal {bool_type} DEFAULT 0,
+            killed_large_winner {bool_type} DEFAULT 0,
+            note TEXT,
+            UNIQUE(trade_id, challenger)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_status ON bco_exit_challenger_shadow(status,paired_complete)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_trade ON bco_exit_challenger_shadow(trade_id,challenger)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_signal ON bco_exit_challenger_shadow(last_raw_signal_id)")
+    # Verify the relation is queryable in the same transaction/connection.
+    conn.execute("SELECT id FROM bco_exit_challenger_shadow LIMIT 1").fetchone()
+
+
+def ensure_bco_exit_challenger_shadow_schema(force: bool = False) -> Dict[str, Any]:
+    """Self-heal the forward exit-shadow schema on SQLite or Postgres.
+
+    The first successful verification is cached per process. Failures are not
+    cached, so a later dashboard/export/worker call can retry automatically.
+    """
+    global _bco_exit_shadow_schema_ready
+    global _bco_exit_shadow_schema_last_error
+    global _bco_exit_shadow_schema_checked_at
+
+    if _bco_exit_shadow_schema_ready and not force:
+        return {
+            "ok": True,
+            "ready": True,
+            "cached": True,
+            "checked_at_utc": _bco_exit_shadow_schema_checked_at,
+            "last_error": "",
+        }
+
+    with _bco_exit_shadow_schema_lock:
+        if _bco_exit_shadow_schema_ready and not force:
+            return {
+                "ok": True,
+                "ready": True,
+                "cached": True,
+                "checked_at_utc": _bco_exit_shadow_schema_checked_at,
+                "last_error": "",
+            }
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                with get_conn() as conn:
+                    _ensure_bco_exit_challenger_shadow_schema_on_conn(conn)
+                _bco_exit_shadow_schema_ready = True
+                _bco_exit_shadow_schema_last_error = ""
+                _bco_exit_shadow_schema_checked_at = now_utc_iso()
+                return {
+                    "ok": True,
+                    "ready": True,
+                    "cached": False,
+                    "attempt": attempt,
+                    "checked_at_utc": _bco_exit_shadow_schema_checked_at,
+                    "last_error": "",
+                }
+            except Exception as exc:
+                last_exc = exc
+                _bco_exit_shadow_schema_ready = False
+                _bco_exit_shadow_schema_last_error = f"{type(exc).__name__}: {exc}"
+                _bco_exit_shadow_schema_checked_at = now_utc_iso()
+                if attempt < 3:
+                    time.sleep(0.25 * attempt)
+
+        raise RuntimeError(
+            "BCO exit-challenger shadow schema could not be created/verified after 3 attempts: "
+            + (_bco_exit_shadow_schema_last_error or safe_str(last_exc))
+        )
+
+
+def bco_exit_challenger_schema_status() -> Dict[str, Any]:
+    """Read-only diagnostics for the research schema repair."""
+    try:
+        result = ensure_bco_exit_challenger_shadow_schema()
+        result.update({
+            "table": "bco_exit_challenger_shadow",
+            "research_only": True,
+            "execution_authority": False,
+        })
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ready": False,
+            "table": "bco_exit_challenger_shadow",
+            "checked_at_utc": _bco_exit_shadow_schema_checked_at,
+            "last_error": f"{type(exc).__name__}: {exc}",
+            "research_only": True,
+            "execution_authority": False,
+        }
 
 
 def log_event(event_type: str, message: str, raw: Optional[Dict[str, Any]] = None) -> None:
@@ -2661,6 +2819,7 @@ def start_bco_exit_challenger_shadows(
     """
     if not BCO_EXIT_SHADOW_ENABLED:
         return {"ok": True, "enabled": False, "created": 0}
+    _ensure_bco_exit_challenger_shadow_schema_on_conn(conn)
     trade = fetchone_dict(conn.execute(
         "SELECT * FROM trades WHERE trade_id=? LIMIT 1",
         (safe_str(trade_id),),
@@ -2747,6 +2906,7 @@ def update_bco_exit_challenger_shadows(
     """Advance every active/incomplete forward shadow on the current BCO candle."""
     if not BCO_EXIT_SHADOW_ENABLED:
         return {"ok": True, "enabled": False, "updated": 0, "closed": 0}
+    _ensure_bco_exit_challenger_shadow_schema_on_conn(conn)
 
     current = safe_float(signal.get("exec_close"))
     high = safe_float(signal.get("exec_high"))
@@ -2880,6 +3040,7 @@ def sync_bco_exit_challenger_actual_outcomes(conn: DBConn) -> Dict[str, Any]:
     """Refresh paired Current outcomes after broker reconciliation/transaction sync."""
     if not BCO_EXIT_SHADOW_ENABLED:
         return {"ok": True, "enabled": False, "updated": 0}
+    _ensure_bco_exit_challenger_shadow_schema_on_conn(conn)
     rows = fetchall_dict(conn.execute("""
         SELECT * FROM bco_exit_challenger_shadow
         WHERE COALESCE(paired_complete,0)=0
@@ -2891,6 +3052,7 @@ def sync_bco_exit_challenger_actual_outcomes(conn: DBConn) -> Dict[str, Any]:
 
 
 def bco_exit_challenger_shadow_summary() -> Dict[str, Any]:
+    schema_status = ensure_bco_exit_challenger_shadow_schema()
     with get_conn() as conn:
         rows = fetchall_dict(conn.execute("""
             SELECT * FROM bco_exit_challenger_shadow
@@ -2903,6 +3065,7 @@ def bco_exit_challenger_shadow_summary() -> Dict[str, Any]:
         "research_only": True,
         "execution_authority": False,
         "forward_only_no_backfill": True,
+        "schema_status": schema_status,
         "challengers": {},
         "trade_count": len({safe_str(r.get("trade_id")) for r in rows if safe_str(r.get("trade_id"))}),
         "row_count": len(rows),
@@ -2932,8 +3095,14 @@ def bco_exit_challenger_shadow_status_endpoint():
     return bco_exit_challenger_shadow_summary()
 
 
+@app.get("/bco-exit-challenger-shadow/schema-status")
+def bco_exit_challenger_shadow_schema_status_endpoint():
+    return bco_exit_challenger_schema_status()
+
+
 @app.get("/export/bco-exit-challenger-shadow.csv")
 def export_bco_exit_challenger_shadow_csv(limit: int = 50000):
+    ensure_bco_exit_challenger_shadow_schema()
     limit = max(1, min(int(limit), 100000))
     with get_conn() as conn:
         rows = fetchall_dict(conn.execute("""
@@ -3269,7 +3438,29 @@ def _background_bootstrap() -> None:
     _bootstrap_state["status"] = "INITIALIZING_DATABASE"
     _bootstrap_state["started_at_utc"] = now_utc_iso()
     try:
+        # v0.8.1: create the research-only exit-shadow relation independently
+        # before the large bootstrap transaction. A failure here must NEVER stop
+        # production BCO recovery/manager startup; later reads/writes will retry.
+        try:
+            ensure_bco_exit_challenger_shadow_schema(force=True)
+        except Exception as shadow_schema_exc:
+            try:
+                print(f"BCO exit-shadow pre-bootstrap schema repair warning: {shadow_schema_exc}", flush=True)
+            except Exception:
+                pass
+
         init_db()
+
+        # Verify again after the main migration. This also repairs the edge case
+        # where the first attempt was blocked by a transient Postgres DDL lock.
+        try:
+            ensure_bco_exit_challenger_shadow_schema(force=True)
+        except Exception as shadow_schema_exc:
+            try:
+                log_event("exit_shadow_schema_warning", str(shadow_schema_exc), bco_exit_challenger_schema_status())
+            except Exception:
+                pass
+
         if BCO_SIGNAL_RECOVERY_ENABLED:
             _bootstrap_state["status"] = "RECOVERING_STORED_SIGNALS"
             recovery = recover_unprocessed_bco_signals()
@@ -4268,6 +4459,8 @@ def export_table(table: str):
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
     }
     if table not in allowed: raise HTTPException(status_code=404,detail="unknown export")
+    if allowed[table] == "bco_exit_challenger_shadow":
+        ensure_bco_exit_challenger_shadow_schema()
     with get_conn() as conn: rows=fetchall_dict(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id ASC"))
     return csv_response(rows,f"bco-{table}.csv")
 
@@ -4291,6 +4484,7 @@ def export_all_zip():
         "accounting-snapshots":"accounting_snapshots",
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
     }
+    ensure_bco_exit_challenger_shadow_schema()
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         with get_conn() as conn:
@@ -4513,6 +4707,7 @@ def export_bco_focused_research_zip(limit:int=25000):
             _w=csv.DictWriter(_aio,fieldnames=_fields,extrasaction="ignore");_w.writeheader();_w.writerows(_airows)
         z.writestr("ai-regime-observer.csv",_aio.getvalue())
 
+        ensure_bco_exit_challenger_shadow_schema()
         with get_conn() as _esc:
             _esrows=fetchall_dict(_esc.execute(
                 "SELECT * FROM bco_exit_challenger_shadow ORDER BY id DESC LIMIT ?",
