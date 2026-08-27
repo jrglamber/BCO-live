@@ -36,9 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.1 — Exit Shadow Schema Self-Heal"
-APP_VERSION = "0.8.1"
-POLICY_VERSION = "bco_v0.8.1_exit_shadow_schema_self_heal"
+APP_NAME = "Project Exit Plan — BCO v0.8.2 — Postgres Boolean Exit-Shadow Fix"
+APP_VERSION = "0.8.2"
+POLICY_VERSION = "bco_v0.8.2_postgres_boolean_exit_shadow_fix"
 
 # v0.8.1 — operational repair only.
 # Production strategy/broker/manager rules remain identical to v0.8.0.
@@ -232,6 +232,10 @@ BCO_EXIT_SHADOW_LARGE_WINNER_R = 2.00
 BCO_EXIT_SHADOW_LARGE_WINNER_SACRIFICE_R = 0.75
 BCO_EXIT_SHADOW_EXECUTION_AUTHORITY = False
 
+# v0.8.2 — PostgreSQL boolean compatibility repair for exit-shadow schema.
+# Postgres BOOLEAN columns require FALSE/TRUE defaults rather than integer 0/1,
+# and boolean predicates cannot use COALESCE(boolean,0)=0. This repair changes
+# only research-shadow schema/predicates; production BCO trading logic is untouched.
 # v0.8.1 — dedicated self-healing schema state for the research-only exit shadow.
 # This table is deliberately independent of production trading state. If Railway
 # serves the dashboard before deferred bootstrap DDL finishes (or a prior DDL
@@ -359,6 +363,7 @@ def init_db() -> None:
     with _db_lock, get_conn() as conn:
         id_type = "BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
         bool_type = "BOOLEAN" if conn.postgres else "INTEGER"
+        bool_false_default = "FALSE" if conn.postgres else "0"
         # Keep timestamps as ISO TEXT to match the existing Project Exit Plan data model.
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS raw_signals (
@@ -742,11 +747,11 @@ def init_db() -> None:
                 actual_exit_price DOUBLE PRECISION,
                 actual_R DOUBLE PRECISION,
                 actual_exit_reason TEXT,
-                paired_complete {bool_type} DEFAULT 0,
+                paired_complete {bool_type} DEFAULT {bool_false_default},
                 challenger_minus_current_R DOUBLE PRECISION,
                 paired_winner TEXT,
-                saved_reversal {bool_type} DEFAULT 0,
-                killed_large_winner {bool_type} DEFAULT 0,
+                saved_reversal {bool_type} DEFAULT {bool_false_default},
+                killed_large_winner {bool_type} DEFAULT {bool_false_default},
                 note TEXT,
                 UNIQUE(trade_id, challenger)
             )
@@ -765,6 +770,7 @@ def _ensure_bco_exit_challenger_shadow_schema_on_conn(conn: DBConn) -> None:
     """
     id_type = "BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
     bool_type = "BOOLEAN" if conn.postgres else "INTEGER"
+    bool_false_default = "FALSE" if conn.postgres else "0"
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS bco_exit_challenger_shadow (
             id {id_type},
@@ -801,11 +807,11 @@ def _ensure_bco_exit_challenger_shadow_schema_on_conn(conn: DBConn) -> None:
             actual_exit_price DOUBLE PRECISION,
             actual_R DOUBLE PRECISION,
             actual_exit_reason TEXT,
-            paired_complete {bool_type} DEFAULT 0,
+            paired_complete {bool_type} DEFAULT {bool_false_default},
             challenger_minus_current_R DOUBLE PRECISION,
             paired_winner TEXT,
-            saved_reversal {bool_type} DEFAULT 0,
-            killed_large_winner {bool_type} DEFAULT 0,
+            saved_reversal {bool_type} DEFAULT {bool_false_default},
+            killed_large_winner {bool_type} DEFAULT {bool_false_default},
             note TEXT,
             UNIQUE(trade_id, challenger)
         )
@@ -2898,6 +2904,11 @@ def _bco_exit_shadow_close(
     ))
 
 
+def _bco_exit_shadow_incomplete_sql(conn: DBConn) -> str:
+    """Cross-engine SQL predicate for an incomplete paired research result."""
+    return "COALESCE(paired_complete,FALSE)=FALSE" if conn.postgres else "COALESCE(paired_complete,0)=0"
+
+
 def update_bco_exit_challenger_shadows(
     conn: DBConn,
     raw_signal_id: int,
@@ -2920,9 +2931,10 @@ def update_bco_exit_challenger_shadows(
     low = float(low if low is not None else current)
     atr14 = _bco_exit_shadow_wilder_atr14(conn, int(raw_signal_id))
 
-    shadows = fetchall_dict(conn.execute("""
+    incomplete_sql = _bco_exit_shadow_incomplete_sql(conn)
+    shadows = fetchall_dict(conn.execute(f"""
         SELECT * FROM bco_exit_challenger_shadow
-        WHERE status='OPEN' OR COALESCE(paired_complete,0)=0
+        WHERE status='OPEN' OR {incomplete_sql}
         ORDER BY id ASC
     """))
 
@@ -3041,9 +3053,10 @@ def sync_bco_exit_challenger_actual_outcomes(conn: DBConn) -> Dict[str, Any]:
     if not BCO_EXIT_SHADOW_ENABLED:
         return {"ok": True, "enabled": False, "updated": 0}
     _ensure_bco_exit_challenger_shadow_schema_on_conn(conn)
-    rows = fetchall_dict(conn.execute("""
+    incomplete_sql = _bco_exit_shadow_incomplete_sql(conn)
+    rows = fetchall_dict(conn.execute(f"""
         SELECT * FROM bco_exit_challenger_shadow
-        WHERE COALESCE(paired_complete,0)=0
+        WHERE {incomplete_sql}
         ORDER BY id ASC
     """))
     for row in rows:
