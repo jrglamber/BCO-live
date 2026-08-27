@@ -3,7 +3,7 @@
 #
 # Design sources:
 # - BCO research/live-sim v10.1.08 for BCO candidate, 3.5% SL, 48h+ management,
-#   100/200/300R banking and runner protection behaviour.
+#   runner protection and the original basket-banking implementation.
 # - Main live v10.1.26 for staged basket phases/defence, instrument ownership,
 #   OANDA safety gates, reconciliation and audit philosophy.
 #
@@ -36,10 +36,20 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.2 — Postgres Boolean Exit-Shadow Fix"
-APP_VERSION = "0.8.2"
-POLICY_VERSION = "bco_v0.8.2_postgres_boolean_exit_shadow_fix"
+APP_NAME = "Project Exit Plan — BCO v0.8.3 — 50R Harvest Ladder + Exit Shadows"
+APP_VERSION = "0.8.3"
+POLICY_VERSION = "bco_v0.8.3_50r_harvest_ladder_2026_08_27"
 
+# v0.8.3 — BCO basket-harvest simplification.
+# The production trade manager remains unchanged. Basket harvesting is tightened
+# to a coarse 50R-spaced ladder after a real ~50R BCO basket round-tripped:
+#   50R  -> bank 20% of the remaining profitable basket
+#   100R -> bank 20%
+#   150R+ -> bank 25% at every additional +50R checkpoint
+# The old separate pre-48 cohort ratchet is retired as redundant because normal
+# checkpoint banking already permits profitable whole trades younger than 48h.
+# Historical COHORT rows remain untouched for audit/research.
+#
 # v0.8.1 — operational repair only.
 # Production strategy/broker/manager rules remain identical to v0.8.0.
 # This build makes the forward exit-challenger research schema self-healing so
@@ -153,9 +163,29 @@ BCO_PROTECT_96 = float(os.getenv("BCO_PROTECT_96", "0.65"))
 BCO_PROTECT_120 = float(os.getenv("BCO_PROTECT_120", "0.75"))
 BCO_MIN_STOP_STEP_PCT = max(0.0, float(os.getenv("BCO_MIN_STOP_STEP_PCT", "0.02")))
 
-# Immediate basket banking / cohort ratchet — v10.1.26 behaviour.
-BCO_BANK_LEVELS = [(100.0, 0.20), (200.0, 0.25), (300.0, 0.50)]
-BCO_COHORT_LEVELS = [(150.0, 0.15), (200.0, 0.30), (300.0, 0.50)]
+# v0.8.3 — simplified immediate basket harvesting.
+# Bank percentages apply to the REMAINING PROFITABLE OPEN BASKET at the
+# checkpoint. Selection still uses whole profitable trades and does not require
+# a selected trade to be 48h old.
+BCO_BANK_FIRST_LEVEL_R = 50.0
+BCO_BANK_STEP_R = 50.0
+BCO_BANK_50_FRACTION = 0.20
+BCO_BANK_100_FRACTION = 0.20
+BCO_BANK_150_PLUS_FRACTION = 0.25
+BCO_BANK_MAX_LEVEL_R = max(
+    300.0, min(float(os.getenv("BCO_BANK_MAX_LEVEL_R", "5000")), 100000.0)
+)
+
+# Compatibility/display seed only. Execution itself is generated dynamically
+# every +50R and therefore does not stop at 300R.
+BCO_BANK_LEVELS = [
+    (50.0, BCO_BANK_50_FRACTION),
+    (100.0, BCO_BANK_100_FRACTION),
+    (150.0, BCO_BANK_150_PLUS_FRACTION),
+    (200.0, BCO_BANK_150_PLUS_FRACTION),
+    (250.0, BCO_BANK_150_PLUS_FRACTION),
+    (300.0, BCO_BANK_150_PLUS_FRACTION),
+]
 
 # Young/developing/mature/heavy staging copied from the current live system.
 MIN_OPEN_FOR_LIGHT_TRIM = max(1, int(float(os.getenv("MIN_OPEN_FOR_LIGHT_TRIM", "10"))))
@@ -2319,6 +2349,38 @@ def create_trade(conn: DBConn, raw_signal_id: int, signal: Dict[str, Any], cycle
     return trade_id
 
 
+
+def bco_bank_fraction_for_level(level_r: Any) -> float:
+    level = float(safe_float(level_r) or 0.0)
+    if level <= 50.0:
+        return float(BCO_BANK_50_FRACTION)
+    if level <= 100.0:
+        return float(BCO_BANK_100_FRACTION)
+    return float(BCO_BANK_150_PLUS_FRACTION)
+
+
+def bco_bank_levels_up_to(high_water_r: Any) -> List[Tuple[float, float]]:
+    """Generate every crossed/displayed +50R BCO harvest checkpoint."""
+    top = min(
+        max(0.0, float(safe_float(high_water_r) or 0.0)),
+        float(BCO_BANK_MAX_LEVEL_R),
+    )
+    out: List[Tuple[float, float]] = []
+    level = float(BCO_BANK_FIRST_LEVEL_R)
+    while level <= top + 1e-9:
+        out.append((level, bco_bank_fraction_for_level(level)))
+        level += float(BCO_BANK_STEP_R)
+    return out
+
+
+def bco_profitable_open_pool_r(conn: DBConn) -> float:
+    """Current positive-R open pool used to freeze each checkpoint target."""
+    rows = fetchall_dict(conn.execute(
+        "SELECT current_R FROM trades WHERE status='OPEN' AND COALESCE(current_R,0)>0"
+    ))
+    return sum(float(safe_float(r.get("current_R")) or 0.0) for r in rows)
+
+
 def bank_sort_key(row: Dict[str,Any]) -> Tuple[Any,...]:
     hold=int(safe_float(row.get("hold_candles")) or 0); rr=float(safe_float(row.get("current_R")) or 0.0)
     mfe=float(safe_float(row.get("mfe_pct")) or 0.0); ret=float(safe_float(row.get("return_pct")) or 0.0); give=max(0.0,mfe-ret)
@@ -2328,75 +2390,148 @@ def bank_sort_key(row: Dict[str,Any]) -> Tuple[Any,...]:
 
 
 def execute_protection(conn: DBConn, signal_time: str) -> Dict[str, Any]:
-    metrics=basket_metrics(conn); state=ensure_cycle(conn,signal_time,metrics)
-    if metrics["open_count"]<=0 or not safe_str(state.get("cycle_id")):
-        return {"banked_R":0.0,"banked_trade_ids":[],"cohort_updates":0}
-    cycle=safe_str(state.get("cycle_id")); br=float(metrics["basket_R"]); old_hwm=float(safe_float(state.get("high_water_R")) or 0.0); hwm=max(old_hwm,br)
-    conn.execute("UPDATE basket_state SET high_water_R=?,high_water_seen_at=?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
-                 (hwm,signal_time if hwm>old_hwm else state.get("high_water_seen_at"),now_utc_iso()))
-    banked=0.0; bank_ids: List[str]=[]; cohort_updates=0
-    for threshold,fraction in BCO_COHORT_LEVELS:
-        if hwm < threshold: continue
-        existing=fetchone_dict(conn.execute("SELECT id FROM protection_stages WHERE cycle_id=? AND stage_type='COHORT' AND threshold_R=?",(cycle,threshold)))
-        if existing: continue
-        candidates=[r for r in basket_metrics(conn)["rows"] if int(safe_float(r.get("hold_candles")) or 0)<48 and float(safe_float(r.get("current_R")) or 0)>0]
-        ids=[]
-        for t in candidates:
-            current=float(safe_float(t.get("current_price")) or 0.0)
-            if current>0 and set_managed_stop(conn,t,current,fraction,f"cohort_{int(threshold)}R",signal_time,"PRE48_COHORT_RATCHET"):
-                cohort_updates+=1
-            ids.append(safe_str(t.get("trade_id")))
-        conn.execute("""
-            INSERT INTO protection_stages(created_at_utc,updated_at_utc,cycle_id,stage_type,threshold_R,fraction,status,
-                armed_at_signal_time,executed_at_signal_time,cohort_trade_ids,reason)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        """, (now_utc_iso(),now_utc_iso(),cycle,"COHORT",threshold,fraction,"EXECUTED" if ids else "NO_ELIGIBLE",signal_time,signal_time,",".join(ids),"One-shot pre-48h cohort protection."))
-    for threshold,fraction in BCO_BANK_LEVELS:
-        if hwm < threshold: continue
-        stage=fetchone_dict(conn.execute("SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=?",(cycle,threshold)))
+    """v0.8.3 family-level BCO harvesting on a coarse 50R ladder."""
+    metrics = basket_metrics(conn)
+    state = ensure_cycle(conn, signal_time, metrics)
+    if metrics["open_count"] <= 0 or not safe_str(state.get("cycle_id")):
+        return {"banked_R": 0.0, "banked_trade_ids": [], "bank_stages_completed": 0}
+
+    cycle = safe_str(state.get("cycle_id"))
+    br = float(metrics["basket_R"])
+    old_hwm = float(safe_float(state.get("high_water_R")) or 0.0)
+    hwm = max(old_hwm, br)
+    conn.execute(
+        "UPDATE basket_state SET high_water_R=?,high_water_seen_at=?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
+        (hwm, signal_time if hwm > old_hwm else state.get("high_water_seen_at"), now_utc_iso()),
+    )
+
+    banked = 0.0
+    bank_ids: List[str] = []
+    stages_completed = 0
+
+    for threshold, fraction in bco_bank_levels_up_to(hwm):
+        stage = fetchone_dict(conn.execute(
+            "SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=? LIMIT 1",
+            (cycle, threshold),
+        ))
+
         if not stage:
-            lower=fetchall_dict(conn.execute("SELECT target_bank_R,status FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND threshold_R<?",(cycle,threshold)))
-            reserved=sum(float(safe_float(r.get("target_bank_R")) or 0.0) for r in lower if safe_str(r.get("status")).upper() not in {"EXECUTED","EXPIRED_FLAT"})
-            base=max(0.0,br-reserved); target=base*fraction
+            # Freeze against the remaining PROFITABLE pool at this checkpoint.
+            # Negative open trades do not reduce the agreed amount to bank.
+            pool_r = bco_profitable_open_pool_r(conn)
+            target = max(0.0, pool_r * float(fraction))
+            status = "ARMED" if target > 0 else "ARMED_WAITING_PROFITABLE_POOL"
             conn.execute("""
-                INSERT INTO protection_stages(created_at_utc,updated_at_utc,cycle_id,stage_type,threshold_R,fraction,status,target_bank_R,armed_at_signal_time,reason)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-            """,(now_utc_iso(),now_utc_iso(),cycle,"BANK",threshold,fraction,"ARMED",target,signal_time,f"Fixed-at-arm target from {base:.2f}R base."))
-            stage=fetchone_dict(conn.execute("SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=?",(cycle,threshold))) or {}
-        if safe_str(stage.get("status")).upper() in {"EXECUTED","NO_ELIGIBLE"}: continue
-        target=float(safe_float(stage.get("target_bank_R")) or 0.0)
-        eligible=[r for r in basket_metrics(conn)["rows"] if float(safe_float(r.get("current_R")) or 0.0)>0]
-        ranked=sorted(eligible,key=bank_sort_key); selected=[]; running=0.0; remaining=list(ranked)
-        while remaining and running+0.0001<target:
-            need=target-running; finish=[r for r in remaining if float(safe_float(r.get("current_R")) or 0.0)+0.0001>=need]
-            if finish:
-                bucket=min(bank_sort_key(r)[:2] for r in finish); opts=[r for r in finish if bank_sort_key(r)[:2]==bucket]
-                pick=min(opts,key=lambda r:(float(safe_float(r.get("current_R")) or 0.0)-need,bank_sort_key(r)))
-            else: pick=remaining[0]
-            selected.append(pick); running+=float(safe_float(pick.get("current_R")) or 0.0); remaining=[r for r in remaining if r.get("trade_id")!=pick.get("trade_id")]
-        if not selected:
-            conn.execute("UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',updated_at_utc=? WHERE id=?",(now_utc_iso(),stage.get("id")))
+                INSERT INTO protection_stages(
+                    created_at_utc,updated_at_utc,cycle_id,stage_type,threshold_R,
+                    fraction,status,target_bank_R,armed_at_signal_time,reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (
+                now_utc_iso(), now_utc_iso(), cycle, "BANK", threshold, fraction,
+                status, target, signal_time,
+                f"v0.8.3 target = {fraction*100:.0f}% of remaining profitable pool {pool_r:.2f}R.",
+            ))
+            stage = fetchone_dict(conn.execute(
+                "SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=? LIMIT 1",
+                (cycle, threshold),
+            )) or {}
+
+        status = safe_str(stage.get("status")).upper()
+        if status in {"EXECUTED", "NO_ELIGIBLE", "EXPIRED_FLAT"}:
             continue
-        selected_ids=[safe_str(t.get("trade_id")) for t in selected]
-        conn.execute("""UPDATE protection_stages
-                        SET status='EXECUTING',selected_trade_ids=?,updated_at_utc=?,reason=?
-                        WHERE id=?""",
-                     (",".join(selected_ids),now_utc_iso(),
-                      f"Closing whole trades against fixed target {target:.2f}R; durable retry active.",
-                      stage.get("id")))
-        ids=[]; actual=0.0
+
+        target = float(safe_float(stage.get("target_bank_R")) or 0.0)
+        if target <= 0:
+            pool_r = bco_profitable_open_pool_r(conn)
+            if pool_r <= 0:
+                conn.execute(
+                    "UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',updated_at_utc=?,reason=? WHERE id=?",
+                    (now_utc_iso(), f"{threshold:.0f}R crossed; waiting for a positive open pool.", stage.get("id")),
+                )
+                continue
+            target = pool_r * float(fraction)
+            conn.execute(
+                "UPDATE protection_stages SET target_bank_R=?,status='ARMED',updated_at_utc=?,reason=? WHERE id=?",
+                (target, now_utc_iso(), f"v0.8.3 target frozen at {fraction*100:.0f}% of {pool_r:.2f}R positive pool.", stage.get("id")),
+            )
+
+        eligible = [
+            r for r in basket_metrics(conn)["rows"]
+            if float(safe_float(r.get("current_R")) or 0.0) > 0
+        ]
+        ranked = sorted(eligible, key=bank_sort_key)
+        selected: List[Dict[str, Any]] = []
+        running = 0.0
+        remaining = list(ranked)
+
+        while remaining and running + 0.0001 < target:
+            need = target - running
+            finish = [
+                r for r in remaining
+                if float(safe_float(r.get("current_R")) or 0.0) + 0.0001 >= need
+            ]
+            if finish:
+                bucket = min(bank_sort_key(r)[:2] for r in finish)
+                opts = [r for r in finish if bank_sort_key(r)[:2] == bucket]
+                pick = min(
+                    opts,
+                    key=lambda r: (
+                        float(safe_float(r.get("current_R")) or 0.0) - need,
+                        bank_sort_key(r),
+                    ),
+                )
+            else:
+                pick = remaining[0]
+            selected.append(pick)
+            running += float(safe_float(pick.get("current_R")) or 0.0)
+            remaining = [r for r in remaining if r.get("trade_id") != pick.get("trade_id")]
+
+        if not selected:
+            conn.execute(
+                "UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',updated_at_utc=?,reason=? WHERE id=?",
+                (now_utc_iso(), f"Fixed target {target:.2f}R remains armed; no profitable whole trade available.", stage.get("id")),
+            )
+            continue
+
+        selected_ids = [safe_str(t.get("trade_id")) for t in selected]
+        conn.execute("""
+            UPDATE protection_stages
+            SET status='EXECUTING',selected_trade_ids=?,updated_at_utc=?,reason=?
+            WHERE id=?
+        """, (
+            ",".join(selected_ids), now_utc_iso(),
+            f"v0.8.3 immediate {threshold:.0f}R bank against fixed {target:.2f}R target; durable retry active.",
+            stage.get("id"),
+        ))
+
+        ids: List[str] = []
+        actual = 0.0
         for t in selected:
-            rr=float(safe_float(t.get("current_R")) or 0.0); px=float(safe_float(t.get("current_price")) or safe_float(t.get("entry_price")) or 0.0)
-            ok,val=execute_or_sim_close(conn,t,signal_time,px,f"immediate_bank_{int(threshold)}R",rr)
+            rr = float(safe_float(t.get("current_R")) or 0.0)
+            px = float(safe_float(t.get("current_price")) or safe_float(t.get("entry_price")) or 0.0)
+            ok, val = execute_or_sim_close(conn, t, signal_time, px, f"immediate_bank_{int(threshold)}R", rr)
             if ok:
-                actual+=val; ids.append(safe_str(t.get("trade_id")))
-        stage_result=finalize_harvest_stage(conn,int(stage.get("id") or 0),signal_time)
+                actual += val
+                ids.append(safe_str(t.get("trade_id")))
+
+        result = finalize_harvest_stage(conn, int(stage.get("id") or 0), signal_time)
+        if safe_str(result.get("status")).upper() == "EXECUTED":
+            stages_completed += 1
         if ids:
-            banked+=actual; bank_ids.extend(ids)
+            banked += actual
+            bank_ids.extend(ids)
+
     if banked:
-        conn.execute("UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,realized_R_cycle=COALESCE(realized_R_cycle,0)+?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
-                     (banked,banked,now_utc_iso()))
-    return {"banked_R":banked,"banked_trade_ids":bank_ids,"cohort_updates":cohort_updates}
+        conn.execute(
+            "UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,realized_R_cycle=COALESCE(realized_R_cycle,0)+?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
+            (banked, banked, now_utc_iso()),
+        )
+
+    return {
+        "banked_R": banked,
+        "banked_trade_ids": bank_ids,
+        "bank_stages_completed": stages_completed,
+    }
 
 
 def execute_defence(conn: DBConn, signal_time: str, current: float, action: str, pre_metrics: Dict[str,Any]) -> Dict[str,Any]:
@@ -3989,7 +4124,8 @@ def _bco_aiobs_state(conn, raw_signal_id, payload):
     cycle=safe_str(state.get("cycle_id"))
     if cycle:
         row=conn.execute("""SELECT COUNT(*) AS c FROM protection_stages
-                            WHERE cycle_id=? AND UPPER(COALESCE(status,'')) IN
+                            WHERE cycle_id=? AND stage_type='BANK'
+                              AND UPPER(COALESCE(status,'')) IN
                             ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
         consumed=int(row["c"] or 0) if row else 0
 
@@ -5201,40 +5337,62 @@ def _bco_standard_profit_harvesting_html():
     s = snapshot()
     b = s.get("basket") or {}
     cycle = safe_str(b.get("cycle_id"))
-    with get_conn() as conn:
-        rows = fetchall_dict(conn.execute("SELECT * FROM protection_stages WHERE cycle_id=? ORDER BY stage_type,threshold_R", (cycle,))) if cycle else []
+    hwm = float(safe_float(b.get("high_water_R")) or 0.0)
 
+    with get_conn() as conn:
+        rows = fetchall_dict(conn.execute(
+            "SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' ORDER BY threshold_R",
+            (cycle,),
+        )) if cycle else []
+
+    # Show at least through 300R and two checkpoints above the current HWM.
+    display_top = max(300.0, hwm + (2.0 * BCO_BANK_STEP_R))
+    levels = bco_bank_levels_up_to(display_top)
     banks = []
-    for threshold, fraction in BCO_BANK_LEVELS:
-        m = next((r for r in rows if safe_str(r.get("stage_type")).upper()=="BANK" and abs((safe_float(r.get("threshold_R")) or 0)-threshold)<1e-9), {})
+    for threshold, fraction in levels:
+        m = next(
+            (r for r in rows if abs((safe_float(r.get("threshold_R")) or 0.0) - threshold) < 1e-9),
+            {},
+        )
         target = safe_float(m.get("target_bank_R"))
         executed = safe_float(m.get("executed_R"))
+        status = safe_str(m.get("status") or "NOT_ARMED")
         banks.append(f'''
         <tr>
-          <td>{threshold:.0f}R</td><td>{esc(m.get("status") or "NOT_ARMED")}</td><td>{fraction*100:.0f}%</td>
+          <td>{threshold:.0f}R</td><td>{esc(status)}</td><td>{fraction*100:.0f}%</td>
           <td>{_fmt_metric(target,"R",2)}</td><td class="{_pnl_class(executed)}">{_fmt_metric(executed,"R",2)}</td>
           <td>{_money((executed or 0.0)*BCO_RISK_PER_TRADE_GBP) if executed is not None else "—"}</td>
           <td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("selected_trade_ids") or "waiting")}</td>
         </tr>''')
 
-    cohorts = []
-    for threshold, fraction in BCO_COHORT_LEVELS:
-        m = next((r for r in rows if safe_str(r.get("stage_type")).upper()=="COHORT" and abs((safe_float(r.get("threshold_R")) or 0)-threshold)<1e-9), {})
-        cohorts.append(f'''
-        <tr><td>{threshold:.0f}R</td><td>{esc(m.get("status") or "NOT_ARMED")}</td><td>{fraction*100:.0f}%</td><td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("cohort_trade_ids") or "waiting")}</td></tr>''')
+    executed_levels = {
+        int(round(float(safe_float(r.get("threshold_R")) or 0.0)))
+        for r in rows if safe_str(r.get("status")).upper() == "EXECUTED"
+    }
+    next_level = float(BCO_BANK_FIRST_LEVEL_R)
+    while int(round(next_level)) in executed_levels:
+        next_level += float(BCO_BANK_STEP_R)
+    next_fraction = bco_bank_fraction_for_level(next_level)
 
     return f'''
-      <div class="section-note">Immediate banking mirrors the Indices philosophy: when a banking level is reached, profitable whole trades can be banked immediately; selected trades do not need to be 48h old.</div>
+      <div class="section-note">
+        <strong>Simplified BCO basket harvesting.</strong> First checkpoint is 50R, then every additional +50R.
+        Bank 20% at 50R and 100R; bank 25% from 150R onward. The percentage is frozen against
+        the <strong>remaining profitable open BCO pool</strong> at that checkpoint. Profitable whole trades
+        can be banked immediately and do not need to be 48h old. Surviving trades continue under the normal Current Manager.
+      </div>
+      <div class="section-note small">
+        The former exceptional pre-48 cohort ratchet has been retired as redundant. Historical COHORT rows
+        remain in database exports for audit only; production creates and consumes BANK stages only.
+      </div>
       <div class="metric-grid">
         <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(b.get("basket_R"))}">{safe_float(b.get("basket_R")) or 0:.2f}R</div></div>
         <div class="mini-card"><div class="k">High-Water</div><div class="v {_pnl_class(b.get("high_water_R"))}">{safe_float(b.get("high_water_R")) or 0:.2f}R</div></div>
         <div class="mini-card"><div class="k">Giveback</div><div class="v">{safe_float(b.get("giveback_pct")) or 0:.1f}%</div></div>
-        <div class="mini-card"><div class="k">Banked This Cycle</div><div class="v pos">{safe_float(b.get("banked_R_cycle")) or 0:.2f}R</div></div>
+        <div class="mini-card"><div class="k">Next Harvest</div><div class="v pos">{next_level:.0f}R</div><div class="small">Bank {next_fraction*100:.0f}% of remaining profitable pool</div></div>
       </div>
-      <h3>Actual Cash-Banking Stages</h3>
+      <h3>BCO Cash-Banking Ladder</h3>
       <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Approx £ Banked</th><th>Executed At</th><th>Trade IDs</th></tr></thead><tbody>{"".join(banks)}</tbody></table></div>
-      <h3>Exceptional Pre-48h One-Shot Cohorts</h3>
-      <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Lock</th><th>Executed At</th><th>Cohort Trade IDs</th></tr></thead><tbody>{"".join(cohorts)}</tbody></table></div>
     '''
 
 
@@ -5646,4 +5804,31 @@ async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1
 
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
-    return {"status":"ok","version":APP_VERSION,"project_standard":True,"project":"BCO","environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full","trading_logic_changed":False,"manager_contract":{"minimum_hold_hours":BCO_MIN_HOLD_HOURS,"hourly_post_48h_review":True,"immediate_banking_levels":BCO_BANK_LEVELS,"exceptional_cohort_levels":BCO_COHORT_LEVELS,"staged_defence":True,"exact_instrument_ownership":True},"time_utc":now_utc_iso()}
+    return {
+        "status":"ok","version":APP_VERSION,"project_standard":True,"project":"BCO",
+        "environment":OANDA_ENV,"dashboard_mode":"dark_compact_lazy","legacy_dashboard":"/dashboard-full",
+        "trading_logic_changed":True,
+        "manager_contract":{
+            "minimum_hold_hours":BCO_MIN_HOLD_HOURS,
+            "hourly_post_48h_review":True,
+            "immediate_banking_policy":{
+                "first_level_R":BCO_BANK_FIRST_LEVEL_R,
+                "step_R":BCO_BANK_STEP_R,
+                "50R_fraction":BCO_BANK_50_FRACTION,
+                "100R_fraction":BCO_BANK_100_FRACTION,
+                "150R_plus_fraction":BCO_BANK_150_PLUS_FRACTION,
+                "continues_every_50R":True,
+                "target_basis":"remaining_profitable_open_pool",
+                "selected_trades_need_48h":False,
+            },
+            "exceptional_pre48_cohort_layer":False,
+            "staged_defence":True,
+            "exact_instrument_ownership":True,
+            "exit_shadows":{
+                "MFE_GIVEBACK_50":BCO_EXIT_SHADOW_ENABLED,
+                "ATR2_CHANDELIER":BCO_EXIT_SHADOW_ENABLED,
+                "execution_authority":False,
+            },
+        },
+        "time_utc":now_utc_iso(),
+    }
