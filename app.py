@@ -36,10 +36,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.3 — 50R Harvest Ladder + Exit Shadows"
-APP_VERSION = "0.8.3"
-POLICY_VERSION = "bco_v0.8.3_50r_harvest_ladder_2026_08_27"
+APP_NAME = "Project Exit Plan — BCO v0.8.4 — Manual New Basket Cycle + 50R Harvest + Exit Shadows"
+APP_VERSION = "0.8.4"
+POLICY_VERSION = "bco_v0.8.4_manual_economic_basket_reset_2026_08_28"
 
+# v0.8.4 — manual economic basket-cycle reset.
+# Adds the same explicit "Start new basket cycle / reset HWM" control used by
+# Metals, inside Broker / OANDA / Accounting.
+#
+# This is FAMILY accounting/protection only:
+# - archives the previous BCO family HWM and unfinished harvest stages;
+# - rebases current-cycle HWM to current open-basket R (0 if negative);
+# - creates a fresh economic cycle with 50R as the next harvest;
+# - surviving trades keep their age, MFE/MAE, stops, Current Manager state,
+#   OANDA trade IDs and MFE50/ATR2 forward-shadow rows.
+# No OANDA order is sent by the reset.
+#
 # v0.8.3 — BCO basket-harvest simplification.
 # The production trade manager remains unchanged. Basket harvesting is tightened
 # to a coarse 50R-spaced ladder after a real ~50R BCO basket round-tripped:
@@ -4989,13 +5001,16 @@ def _bco_standard_top_uncached():
 
     hwm_gbp=None
     if hwm > 0:
+        current_cycle=safe_str(basket.get("cycle_id"))
         with get_conn() as _hwm_conn:
             _hrow=fetchone_dict(_hwm_conn.execute("""
                 SELECT basket_pnl_gbp,signal_time,created_at_utc
                 FROM basket_snapshots
-                WHERE high_water_R>=? AND basket_R>=?
+                WHERE cycle_id=?
+                  AND high_water_R>=?
+                  AND basket_R>=?
                 ORDER BY id ASC LIMIT 1
-            """,(hwm-0.000001,hwm-0.000001))) or {}
+            """,(current_cycle,hwm-0.000001,hwm-0.000001))) or {}
         hwm_gbp=safe_float(_hrow.get("basket_pnl_gbp"))
         if not hwm_time:
             hwm_time=safe_str(_hrow.get("signal_time") or _hrow.get("created_at_utc"))
@@ -5460,6 +5475,359 @@ def bco_live_readiness() -> Dict[str, Any]:
     }
 
 
+
+def _bco_exact_open_reconciliation() -> Dict[str, Any]:
+    """
+    Read-only proof that the current local OPEN BCO set exactly matches OANDA.
+
+    The manual economic-cycle reset is accounting-only, but we still require
+    exact ownership before changing the family protection cycle.
+    """
+    live = bco_broker_live_snapshot()
+    if not live.get("ok"):
+        return {
+            "ok": False,
+            "reason": f"fresh OANDA BCO read failed: {safe_str(live.get('error'))}",
+            "broker": live,
+        }
+
+    owned = list(live.get("owned_open_trades") or [])
+    broker_ids = {safe_str(t.get("id")) for t in owned if safe_str(t.get("id"))}
+
+    with get_conn() as conn:
+        local_open = fetchall_dict(conn.execute("""
+            SELECT *
+            FROM trades
+            WHERE status='OPEN'
+            ORDER BY id
+        """))
+
+    local_linked_ids = {
+        safe_str(t.get("broker_trade_id"))
+        for t in local_open
+        if safe_str(t.get("broker_trade_id"))
+    }
+    local_unlinked = [
+        t for t in local_open
+        if not safe_str(t.get("broker_trade_id"))
+    ]
+    local_missing = [
+        t for t in local_open
+        if safe_str(t.get("broker_trade_id"))
+        and safe_str(t.get("broker_trade_id")) not in broker_ids
+    ]
+    broker_only = [
+        t for t in owned
+        if safe_str(t.get("id")) not in local_linked_ids
+    ]
+
+    ok = bool(
+        not local_unlinked
+        and not local_missing
+        and not broker_only
+        and len(local_open) == len(owned)
+    )
+    reasons = []
+    if local_unlinked:
+        reasons.append(f"{len(local_unlinked)} local OPEN trade(s) have no broker ID")
+    if local_missing:
+        reasons.append(f"{len(local_missing)} local OPEN trade(s) are absent from OANDA")
+    if broker_only:
+        reasons.append(f"{len(broker_only)} OANDA BCO trade(s) have no local OPEN row")
+    if len(local_open) != len(owned):
+        reasons.append(f"open-count mismatch local={len(local_open)} broker={len(owned)}")
+
+    return {
+        "ok": ok,
+        "reason": "EXACT" if ok else "; ".join(reasons),
+        "local_open_count": len(local_open),
+        "broker_open_count": len(owned),
+        "local_unlinked_trade_ids": [safe_str(t.get("trade_id")) for t in local_unlinked],
+        "local_missing_broker_ids": [safe_str(t.get("broker_trade_id")) for t in local_missing],
+        "broker_only_trade_ids": [safe_str(t.get("id")) for t in broker_only],
+        "broker": live,
+    }
+
+
+def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
+    """
+    Start a fresh BCO ECONOMIC/FAMILY basket cycle without touching trades.
+
+    This deliberately does NOT:
+      - close or open an OANDA position;
+      - alter trade age / hold_candles;
+      - alter MFE / MAE / current_R;
+      - alter hard or managed stops;
+      - alter Current Manager decisions/history;
+      - alter MFE50 or ATR2 challenger rows.
+
+    It DOES:
+      - archive unfinished BANK stages from the previous economic cycle;
+      - retain all historical basket_snapshots;
+      - rebase basket_state HWM to current open basket R (0 if negative);
+      - create a new cycle_id and reassign currently-open trades to that family
+        cycle for FUTURE review/snapshot bookkeeping;
+      - reset cycle banked/realized counters;
+      - make 50R the next harvest checkpoint again.
+    """
+    init_db()
+
+    # Let normal reconciliation/transaction sync run first, then require exact
+    # ownership. The reset itself has zero broker-write authority.
+    try:
+        reconcile_result = reconcile_broker()
+    except Exception as exc:
+        reconcile_result = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    exact = _bco_exact_open_reconciliation()
+    if not exact.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot start a new BCO basket cycle until OANDA/local ownership is exact. "
+                + safe_str(exact.get("reason"))
+            ),
+        )
+
+    with _db_lock, get_conn() as conn:
+        metrics = basket_metrics(conn)
+        if int(metrics.get("open_count") or 0) <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="BCO basket is already flat; the normal flat-cycle reset already applies.",
+            )
+
+        current_r = float(safe_float(metrics.get("basket_R")) or 0.0)
+        current_gbp = float(safe_float(metrics.get("basket_pnl_gbp")) or 0.0)
+
+        # Same safety as Metals: a manual economic reset should not be used to
+        # jump over an already-earned first harvest checkpoint.
+        if current_r >= float(BCO_BANK_FIRST_LEVEL_R):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Current BCO basket is already {current_r:.2f}R. "
+                    "Manual new-cycle reset is only allowed below the first 50R harvest checkpoint."
+                ),
+            )
+
+        state = fetchone_dict(conn.execute(
+            "SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+        )) or {}
+
+        previous = {
+            "cycle_id": safe_str(state.get("cycle_id")),
+            "high_water_R": float(safe_float(state.get("high_water_R")) or 0.0),
+            "high_water_seen_at": safe_str(state.get("high_water_seen_at")),
+            "basket_R": float(safe_float(state.get("basket_R")) or 0.0),
+            "basket_pnl_gbp": float(safe_float(state.get("basket_pnl_gbp")) or 0.0),
+            "banked_R_cycle": float(safe_float(state.get("banked_R_cycle")) or 0.0),
+            "realized_R_cycle": float(safe_float(state.get("realized_R_cycle")) or 0.0),
+            "status": safe_str(state.get("status")),
+        }
+
+        observed_at = now_utc_iso()
+        clean = re.sub(r"[^0-9A-Za-z]", "", observed_at)[-20:]
+        new_cycle = f"BCO_LONG_MANUAL_{clean}"
+        new_hwm = max(0.0, current_r)
+        new_hwm_seen_at = observed_at if new_hwm > 0 else None
+
+        old_cycle = safe_str(previous.get("cycle_id"))
+        if old_cycle:
+            conn.execute("""
+                UPDATE protection_stages
+                SET status=CASE
+                        WHEN status IN ('EXECUTED','NO_ELIGIBLE','EXPIRED_FLAT')
+                            THEN status
+                        ELSE 'MANUAL_ECONOMIC_RESET_ARCHIVED'
+                    END,
+                    updated_at_utc=?,
+                    reason=CASE
+                        WHEN status IN ('EXECUTED','NO_ELIGIBLE','EXPIRED_FLAT')
+                            THEN reason
+                        ELSE COALESCE(reason,'') || ' | archived by manual BCO economic basket-cycle reset'
+                    END
+                WHERE cycle_id=?
+            """, (observed_at, old_cycle))
+
+        # New family state. Current basket R is preserved; only the cycle HWM
+        # and cycle-level counters are rebased.
+        conn.execute("""
+            UPDATE basket_state
+            SET status='ACTIVE',
+                cycle_id=?,
+                cycle_started_at=?,
+                open_count=?,
+                basket_R=?,
+                basket_pnl_gbp=?,
+                high_water_R=?,
+                high_water_seen_at=?,
+                giveback_pct=0,
+                realized_R_cycle=0,
+                banked_R_cycle=0,
+                manager_detail=?,
+                updated_at_utc=?
+            WHERE singleton_key='BCO_LONG'
+        """, (
+            new_cycle,
+            observed_at,
+            int(metrics.get("open_count") or 0),
+            current_r,
+            current_gbp,
+            new_hwm,
+            new_hwm_seen_at,
+            (
+                "MANUAL_ECONOMIC_CYCLE_RESET: previous family HWM/harvest cycle archived; "
+                "surviving trades unchanged; next family harvest starts again at 50R."
+            ),
+            observed_at,
+        ))
+
+        # Open trades continue unchanged, but future reviews/snapshots need to
+        # belong to the newly-started FAMILY cycle.
+        conn.execute("""
+            UPDATE trades
+            SET cycle_id=?,
+                updated_at_utc=?
+            WHERE status='OPEN'
+        """, (new_cycle, observed_at))
+
+        # Permanent audit boundary in basket snapshots. Old snapshots remain
+        # untouched and therefore retain the previous HWM for research.
+        latest_signal = fetchone_dict(conn.execute(
+            "SELECT id,timestamp_readable FROM raw_signals ORDER BY id DESC LIMIT 1"
+        )) or {}
+        latest_raw_id = int(safe_float(latest_signal.get("id")) or 0)
+        signal_time = safe_str(latest_signal.get("timestamp_readable")) or observed_at
+
+        conn.execute("""
+            INSERT INTO basket_snapshots(
+                created_at_utc,raw_signal_id,signal_time,cycle_id,open_count,
+                basket_R,basket_pnl_gbp,high_water_R,giveback_pct,losing_pct,
+                basket_phase,tide_score,tide_status,manager_action,manager_detail
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            observed_at,
+            latest_raw_id,
+            signal_time,
+            new_cycle,
+            int(metrics.get("open_count") or 0),
+            current_r,
+            current_gbp,
+            new_hwm,
+            0.0,
+            float(safe_float(metrics.get("losing_pct")) or 0.0),
+            safe_str(metrics.get("phase")),
+            safe_float(state.get("tide_score")) or 0.0,
+            safe_str(state.get("tide_status")),
+            safe_str(state.get("manager_action")),
+            (
+                "MANUAL_ECONOMIC_CYCLE_RESET boundary. Previous cycle "
+                f"{old_cycle or 'none'} archived at HWM "
+                f"{float(previous.get('high_water_R') or 0.0):.2f}R. "
+                "No OANDA trade/stop/age/exit-shadow state changed."
+            ),
+        ))
+
+        conn.commit()
+
+    log_event(
+        "manual_economic_basket_cycle_reset",
+        "Manual BCO economic basket-cycle/HWM reset from Broker/OANDA/Accounting.",
+        {
+            "previous": previous,
+            "new_cycle_id": new_cycle,
+            "new_hwm_R": new_hwm,
+            "current_basket_R": current_r,
+            "current_basket_pnl_gbp": current_gbp,
+            "open_count": int(metrics.get("open_count") or 0),
+            "next_harvest_R": BCO_BANK_FIRST_LEVEL_R,
+            "reconciliation": exact,
+            "reconcile_result": reconcile_result,
+            "broker_write_authority": False,
+            "individual_trade_state_unchanged": True,
+            "exit_shadow_state_unchanged": True,
+        },
+    )
+
+    # Make the reset visible in the top tiles immediately.
+    try:
+        with _BCO_STD_TOP_LOCK:
+            _BCO_STD_TOP_CACHE["payload"] = None
+            _BCO_STD_TOP_CACHE["expires_at"] = 0.0
+    except Exception:
+        pass
+
+    # Verify persisted state after commit.
+    with get_conn() as conn:
+        verify = fetchone_dict(conn.execute(
+            "SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+        )) or {}
+        next_stage = fetchone_dict(conn.execute("""
+            SELECT *
+            FROM protection_stages
+            WHERE cycle_id=? AND stage_type='BANK'
+            ORDER BY threshold_R ASC LIMIT 1
+        """, (new_cycle,))) or {}
+
+    return {
+        "ok": True,
+        "status": "NEW_ECONOMIC_BASKET_STARTED",
+        "message": (
+            "New BCO economic basket cycle started. No broker orders were sent; "
+            "surviving trades retain their age, stops, manager state and exit shadows."
+        ),
+        "previous_cycle_id": previous.get("cycle_id"),
+        "previous_hwm_R": previous.get("high_water_R"),
+        "new_cycle_id": new_cycle,
+        "current_basket_R": current_r,
+        "current_basket_pnl_gbp": current_gbp,
+        "new_hwm_R": safe_float(verify.get("high_water_R")) or 0.0,
+        "new_hwm_seen_at": safe_str(verify.get("high_water_seen_at")),
+        "next_harvest_R": BCO_BANK_FIRST_LEVEL_R,
+        "new_cycle_stage_rows": 1 if next_stage else 0,
+        "open_count": int(metrics.get("open_count") or 0),
+        "reconciliation": exact,
+        "broker_write_authority": False,
+        "individual_trade_state_unchanged": True,
+        "exit_shadow_state_unchanged": True,
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.post("/broker/start-new-basket-cycle")
+async def bco_manual_start_new_basket_cycle(
+    request: Request,
+    x_webhook_secret: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+
+    body_secret = safe_str(body.get("webhook_secret") or body.get("secret"))
+    query_secret = safe_str(request.query_params.get("secret") or "")
+
+    if (
+        x_webhook_secret != WEBHOOK_SECRET
+        and body_secret != WEBHOOK_SECRET
+        and query_secret != WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid WEBHOOK_SECRET")
+
+    if safe_str(body.get("confirm")) != "START_NEW_BCO_BASKET":
+        raise HTTPException(
+            status_code=400,
+            detail="Missing confirm=START_NEW_BCO_BASKET",
+        )
+
+    return bco_manual_start_new_basket_cycle_impl()
+
+
 @app.get("/broker/live-readiness")
 def bco_live_readiness_endpoint():
     return bco_live_readiness()
@@ -5565,6 +5933,26 @@ def _bco_standard_broker_html():
       <td>{_money(preview.get('effective_risk_gbp'))}</td><td>{esc(preview.get('units') or preview.get('order_units') or '-')}</td>
       <td>{_fmt_metric(preview.get('entry_price'),3)}</td><td>{_fmt_metric(preview.get('sl_price'),3)}</td>
       <td class='{'pos' if preview.get('ok') else 'warn'}'>{'OK' if preview.get('ok') else 'BLOCKED'}</td></tr></tbody></table></div>
+
+      <h3>Manual Economic Basket Cycle</h3>
+      <div class="section-note">
+        <strong>Start New Basket Cycle / Reset HWM</strong><br>
+        Use this when the previous BCO family campaign has economically ended but
+        some trades remain open. It archives the old family HWM/harvest cycle,
+        rebases HWM to the current basket and makes <strong>50R the next harvest again</strong>.
+        <br><strong>No trades are closed or modified.</strong> Existing trade ages,
+        MFE/MAE, hard/managed stops, Current Manager state and MFE50/ATR2 shadows
+        remain unchanged.
+      </div>
+      <div style="padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <button type="button"
+          onclick="startNewBCOBasketCycle()"
+          style="padding:10px 14px;border:1px solid #58a6ff;border-radius:8px;background:#0f172a;color:#d8ecff;cursor:pointer;font-weight:800;">
+          Start new basket cycle / reset HWM
+        </button>
+        <span class="small">Requires exact BCO OANDA ↔ local reconciliation and WEBHOOK_SECRET confirmation.</span>
+      </div>
+      <div id="bco-new-cycle-result" class="section-note small" style="display:none;"></div>
 
       <h3>Actual OANDA BCO Open Trades</h3>
       <div class="table-scroll"><table><thead><tr><th>Broker ID</th><th>Instrument</th><th>Units</th><th>Entry</th><th>UPL</th><th>Margin</th><th>Open Time</th></tr></thead>
@@ -5799,7 +6187,42 @@ ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}
 ${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'RECOVERING',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}${{Number(g.legacy_unprocessed_count||0)>0?' · legacy audit gaps '+eh(g.legacy_unprocessed_count)+' (non-executable)':''}}`:'Waiting for BCO signal'):`Fresh pending ${{eh(g.processing_lag||0)}} · candidate pending ${{eh(g.pending_candidate_count||0)}} · auto-retry every ${{eh(g.recovery_interval_seconds||10)}}s${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'warn')}}
 ${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?(g.latest_time_display?`Latest candle · ${{eh(g.latest_time_display)}}`:'Signal received'):(g.latest_time_display?`Waiting · latest ${{eh(g.latest_time_display)}}`:'Waiting'))}}
 ${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
-async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
+async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}
+
+async function startNewBCOBasketCycle(){{
+ const box=document.getElementById('bco-new-cycle-result');
+ const msg='Start a NEW BCO economic basket cycle?\\n\\nThis archives the old family HWM/harvest cycle and makes 50R the next harvest again.\\n\\nNO OANDA trades, stops, ages, Current Manager state or exit shadows will be changed.';
+ if(!window.confirm(msg))return;
+ const secret=window.prompt('Enter WEBHOOK_SECRET to confirm the BCO economic basket-cycle reset:','');
+ if(!secret){{if(box){{box.style.display='block';box.textContent='Cancelled: WEBHOOK_SECRET not supplied.';}}return;}}
+ if(box){{box.style.display='block';box.textContent='Starting new BCO economic basket cycle…';}}
+ try{{
+   const r=await fetch('/broker/start-new-basket-cycle',{{
+     method:'POST',
+     headers:{{'Content-Type':'application/json','x-webhook-secret':secret}},
+     body:JSON.stringify({{confirm:'START_NEW_BCO_BASKET'}}),
+     cache:'no-store'
+   }});
+   const txt=await r.text();
+   let d={{}};try{{d=JSON.parse(txt)}}catch(_e){{}}
+   if(!r.ok)throw new Error(d.detail||d.error||txt||`HTTP ${{r.status}}`);
+   if(box){{
+     box.innerHTML='<strong>New BCO basket cycle started.</strong> Previous HWM '
+       +Number(d.previous_hwm_R||0).toFixed(2)+'R → new HWM '
+       +Number(d.new_hwm_R||0).toFixed(2)+'R. Next harvest: '
+       +Number(d.next_harvest_R||50).toFixed(0)+'R. No broker orders sent.';
+   }}
+   await loadTop(true);
+   for(const key of ['broker','manager-protection']){{
+     const el=document.querySelector(`details.lazy-section[data-section="${{key}}"]`);
+     if(el){{el.dataset.loaded='0';if(el.open)await loadSection(el);}}
+   }}
+ }}catch(e){{
+   if(box){{box.style.display='block';box.innerHTML='<span class="neg"><strong>Reset blocked:</strong> '+eh(e.message||e)+'</span>';}}
+ }}
+}}
+
+document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
 </script></body></html>'''
 
 @app.get("/dashboard-standard-status")
@@ -5822,6 +6245,7 @@ def bco_standard_status():
                 "selected_trades_need_48h":False,
             },
             "exceptional_pre48_cohort_layer":False,
+            "manual_economic_basket_cycle_reset":True,
             "staged_defence":True,
             "exact_instrument_ownership":True,
             "exit_shadows":{
