@@ -36,10 +36,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.4 — Manual New Basket Cycle + 50R Harvest + Exit Shadows"
-APP_VERSION = "0.8.4"
-POLICY_VERSION = "bco_v0.8.4_manual_economic_basket_reset_2026_08_28"
+APP_NAME = "Project Exit Plan — BCO v0.8.5 — Research Capture Repair + Idempotent Flat Reset"
+APP_VERSION = "0.8.5"
+POLICY_VERSION = "bco_v0.8.5_weekly_research_capture_repair_2026_08_30"
 
+# v0.8.5 — weekly-review research/housekeeping repair only.
+# Production entry, basket-defence, 48h+ manager, harvesting, broker safety,
+# AI observer and MFE/ATR2 challenger rules are unchanged.
+# - Focused recovery/high-water research now freezes its trigger state BEFORE
+#   defence/harvest/flat-reset can mutate basket_state.
+# - 6/12/24/48h focused outcomes use durable economic cycle R
+#   (closed realised R + still-open current R) so going flat no longer turns a
+#   real outcome into a misleading 0R reset artifact.
+# - Flat-basket reset is idempotent: once already cleanly FLAT, the reconcile
+#   worker performs no repeated UPDATE and emits no repeated reset event.
+# Existing historical research rows are retained untouched for audit.
+#
 # v0.8.4 — manual economic basket-cycle reset.
 # Adds the same explicit "Start new basket cycle / reset HWM" control used by
 # Metals, inside Broker / OANDA / Accounting.
@@ -2050,6 +2062,31 @@ def reset_flat_bco_basket_state(
         "status": safe_str(state.get("status")),
     }
 
+    # v0.8.5: this function is called by the minute-level reconcile worker as
+    # well as on the signal that actually finishes a basket. Once the family
+    # state is already cleanly FLAT there is nothing left to reset. Returning a
+    # no-op here prevents thousands of duplicate DB writes/system events while
+    # preserving the first genuine ACTIVE -> FLAT reset and its audit record.
+    already_flat = (
+        safe_str(state.get("status")).upper() == "FLAT"
+        and not safe_str(state.get("cycle_id"))
+        and int(safe_float(state.get("open_count")) or 0) == 0
+        and abs(float(safe_float(state.get("basket_R")) or 0.0)) < 1e-12
+        and abs(float(safe_float(state.get("basket_pnl_gbp")) or 0.0)) < 1e-12
+        and abs(float(safe_float(state.get("high_water_R")) or 0.0)) < 1e-12
+        and not safe_str(state.get("high_water_seen_at"))
+        and abs(float(safe_float(state.get("giveback_pct")) or 0.0)) < 1e-12
+        and abs(float(safe_float(state.get("realized_R_cycle")) or 0.0)) < 1e-12
+        and abs(float(safe_float(state.get("banked_R_cycle")) or 0.0)) < 1e-12
+    )
+    if already_flat:
+        return {
+            "reset": False,
+            "reason": "already_flat_reset",
+            "previous": previous,
+            "local_open": 0,
+        }
+
     conn.execute("""
         UPDATE basket_state
         SET status='FLAT',
@@ -2602,6 +2639,38 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         flags=latest_payload_flags(payload)
         score,status,raw_action,reasons,giveback=calculate_tide_turn_status(candidate,int(support.get("candidate_true_last_3") or 0),hwm,float(mid["basket_R"]),float(mid["losing_pct"]),flags["close20"],flags["close50"],flags["hist_up"],flags["rsi_up"],flags["ctx_bull"],flags["d_bull"])
         action,detail=calculate_tiered_basket_defence(status,giveback,float(mid["losing_pct"]),float(mid["basket_R"]),int(mid["open_count"]),candidate,int(support.get("candidate_true_last_3") or 0))
+
+        # v0.8.5 research-only point-in-time freeze. The previous focused
+        # recorder ran after deterministic processing; if this signal flattened
+        # the basket, basket_state had already been reset to 0R/0HWM and the
+        # recovery row captured false zeros. Freeze exactly the state that
+        # produced the manager action before defence/harvest/flat reset. This
+        # function has zero execution authority and failures must never block
+        # production processing.
+        focused_point_capture = {"ok": True, "research_only": True, "skipped": True}
+        focused_point_fn = globals().get("record_bco_focused_point_in_time")
+        if callable(focused_point_fn):
+            try:
+                focused_point_capture = focused_point_fn(
+                    conn=conn,
+                    raw_signal_id=raw_signal_id,
+                    signal_time=signal_time,
+                    cycle_id=safe_str(state.get("cycle_id")),
+                    status=status,
+                    action=action,
+                    open_count=int(mid["open_count"]),
+                    basket_r=float(mid["basket_R"]),
+                    high_water_r=float(hwm),
+                    giveback_pct=float(giveback),
+                    banked_r=float(safe_float(state.get("banked_R_cycle")) or 0.0),
+                )
+            except Exception as research_exc:
+                focused_point_capture = {
+                    "ok": False,
+                    "research_only": True,
+                    "error": f"{type(research_exc).__name__}: {research_exc}",
+                }
+
         defence=execute_defence(conn,signal_time,float(current),action,mid) if BCO_AUTO_MANAGEMENT_ENABLED else {"closed_count":0,"closed_trade_ids":[],"realized_R":0.0}
         after_def=basket_metrics(conn)
         protection=execute_protection(conn,signal_time)
@@ -2659,6 +2728,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         "trade_id":new_trade_id,
         "basket":snapshot(),
         "exit_challenger_shadow":exit_shadow,
+        "focused_research_point_capture":focused_point_capture,
     }
 
 
@@ -4720,28 +4790,36 @@ BCO_FOCUSED_THRESHOLDS=[40,60,75,100,150,200,300,400,500,600]
 BCO_FOCUSED_HORIZONS=[6,12,24,48]
 BCO_FOCUSED_EFFICIENCY_LOOKBACKS=[8,12,24]
 
-def ensure_bco_focused_research_tables():
-    with get_conn() as conn:
-        idt="BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_efficiency (
-            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT, signal_time TEXT, lookback_candles BIGINT,
-            candles_found BIGINT, net_move_pct DOUBLE PRECISION, path_travelled_pct DOUBLE PRECISION,
-            efficiency DOUBLE PRECISION, state TEXT, UNIQUE(raw_signal_id,lookback_candles))""")
-        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_alignment (
-            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, signal_time TEXT, state TEXT,
-            return_4h DOUBLE PRECISION, return_8h DOUBLE PRECISION, return_24h DOUBLE PRECISION, candidate BIGINT)""")
-        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_recovery (
-            id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, cycle_id TEXT, trigger_signal_time TEXT,
-            trigger_status TEXT, trigger_action TEXT, trigger_open_count BIGINT, trigger_r DOUBLE PRECISION,
-            trigger_hwm_r DOUBLE PRECISION, trigger_giveback_pct DOUBLE PRECISION,
-            outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
-            completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT)""")
-        conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_highwater (
-            id {idt}, created_at_utc TEXT NOT NULL, cycle_id TEXT, threshold_r DOUBLE PRECISION,
-            trigger_raw_signal_id BIGINT, trigger_signal_time TEXT, trigger_r DOUBLE PRECISION,
-            trigger_hwm_r DOUBLE PRECISION,trigger_giveback_pct DOUBLE PRECISION,trigger_banked_r DOUBLE PRECISION,
-            outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
-            completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT,UNIQUE(cycle_id,threshold_r))""")
+def ensure_bco_focused_research_tables(conn: Optional[DBConn] = None):
+    """Create focused-research tables on the caller transaction when supplied.
+
+    Using the process_signal connection avoids opening a second SQLite/Postgres
+    transaction while production processing is mid-flight. Existing callers may
+    continue to call this with no arguments.
+    """
+    if conn is None:
+        with get_conn() as owned_conn:
+            return ensure_bco_focused_research_tables(owned_conn)
+    idt="BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_efficiency (
+        id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT, signal_time TEXT, lookback_candles BIGINT,
+        candles_found BIGINT, net_move_pct DOUBLE PRECISION, path_travelled_pct DOUBLE PRECISION,
+        efficiency DOUBLE PRECISION, state TEXT, UNIQUE(raw_signal_id,lookback_candles))""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_alignment (
+        id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, signal_time TEXT, state TEXT,
+        return_4h DOUBLE PRECISION, return_8h DOUBLE PRECISION, return_24h DOUBLE PRECISION, candidate BIGINT)""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_recovery (
+        id {idt}, created_at_utc TEXT NOT NULL, raw_signal_id BIGINT UNIQUE, cycle_id TEXT, trigger_signal_time TEXT,
+        trigger_status TEXT, trigger_action TEXT, trigger_open_count BIGINT, trigger_r DOUBLE PRECISION,
+        trigger_hwm_r DOUBLE PRECISION, trigger_giveback_pct DOUBLE PRECISION,
+        outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
+        completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT)""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_focused_highwater (
+        id {idt}, created_at_utc TEXT NOT NULL, cycle_id TEXT, threshold_r DOUBLE PRECISION,
+        trigger_raw_signal_id BIGINT, trigger_signal_time TEXT, trigger_r DOUBLE PRECISION,
+        trigger_hwm_r DOUBLE PRECISION,trigger_giveback_pct DOUBLE PRECISION,trigger_banked_r DOUBLE PRECISION,
+        outcome_6_r DOUBLE PRECISION,outcome_12_r DOUBLE PRECISION,outcome_24_r DOUBLE PRECISION,outcome_48_r DOUBLE PRECISION,
+        completed_48 BIGINT DEFAULT 0,updated_at_utc TEXT,UNIQUE(cycle_id,threshold_r))""")
 
 def _bf_return(conn,raw_id,lookback):
     rows=conn.execute("SELECT exec_close FROM raw_signals WHERE exec_close IS NOT NULL AND id<=? ORDER BY id DESC LIMIT ?",(int(raw_id),int(lookback)+1)).fetchall()
@@ -4749,17 +4827,56 @@ def _bf_return(conn,raw_id,lookback):
     if len(closes)<2 or not closes[0]:return None
     return (closes[-1]/closes[0]-1)*100
 
-def _bf_state():
-    with get_conn() as conn:row=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'").fetchone()
+def _bf_state(conn: Optional[DBConn] = None):
+    """Current family basket state, retained as a display/fallback helper."""
+    if conn is None:
+        with get_conn() as owned_conn:
+            return _bf_state(owned_conn)
+    row=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'").fetchone()
     d=dict(row) if row else {}
     return {"cycle_id":safe_str(d.get("cycle_id")),"open_count":int(safe_float(d.get("open_count")) or 0),
             "r":safe_float(d.get("basket_R")) or 0.0,"hwm":safe_float(d.get("high_water_R")) or 0.0,
             "giveback":safe_float(d.get("giveback_pct")) or 0.0,"status":safe_str(d.get("tide_status") or d.get("status") or "FLAT").upper(),
             "action":safe_str(d.get("manager_action") or ""),"banked_r":safe_float(d.get("banked_R_cycle")) or 0.0}
 
-def _bf_elapsed(conn,raw_id):
-    row=conn.execute("SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals WHERE id>? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''",(int(raw_id),)).fetchone()
+
+def _bf_cycle_economic_r(conn: DBConn, cycle_id: Any) -> Optional[float]:
+    """Durable economic R for one BCO family cycle.
+
+    Closed trades contribute their realised R; still-open trades contribute
+    current R. Unlike basket_state.basket_R this survives the normal flat reset,
+    so research horizons do not collapse to a false 0R when a basket finishes.
+    """
+    cycle=safe_str(cycle_id)
+    if not cycle:
+        return None
+    row=conn.execute("""
+        SELECT
+          COUNT(*) AS c,
+          COALESCE(SUM(
+            CASE
+              WHEN UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED')
+                THEN COALESCE(realized_R,current_R,0)
+              WHEN UPPER(COALESCE(status,''))='OPEN'
+                THEN COALESCE(current_R,0)
+              ELSE 0
+            END
+          ),0) AS economic_r
+        FROM trades
+        WHERE cycle_id=?
+    """,(cycle,)).fetchone()
+    if not row or int(safe_float(row["c"]) or 0) <= 0:
+        return None
+    return float(safe_float(row["economic_r"]) or 0.0)
+
+
+def _bf_elapsed(conn,raw_id,max_raw_id: Optional[int] = None):
+    if max_raw_id is not None and int(max_raw_id or 0) > 0:
+        row=conn.execute("SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals WHERE id>? AND id<=? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''",(int(raw_id),int(max_raw_id))).fetchone()
+    else:
+        row=conn.execute("SELECT COUNT(DISTINCT timestamp_readable) AS c FROM raw_signals WHERE id>? AND timestamp_readable IS NOT NULL AND timestamp_readable!=''",(int(raw_id),)).fetchone()
     return int(row["c"] if row else 0)
+
 
 def _bf_eff_state(x):
     x=safe_float(x)
@@ -4768,6 +4885,94 @@ def _bf_eff_state(x):
     if x<0.40:return "MIXED"
     if x<0.60:return "TRENDING"
     return "CLEAN_TREND"
+
+
+def record_bco_focused_point_in_time(
+    conn: DBConn,
+    raw_signal_id: int,
+    signal_time: str,
+    cycle_id: str,
+    status: str,
+    action: str,
+    open_count: int,
+    basket_r: float,
+    high_water_r: float,
+    giveback_pct: float,
+    banked_r: float,
+) -> Dict[str, Any]:
+    """Freeze focused research triggers before production state can mutate.
+
+    Called by process_signal immediately after deterministic tide/defence is
+    calculated and BEFORE any defence, harvest, new entry or flat-cycle reset.
+    Inserts research rows only; no production table is read by trading logic.
+    """
+    ensure_bco_focused_research_tables(conn)
+    rid=int(raw_signal_id or 0)
+    st=safe_str(status).upper()
+    act=safe_str(action)
+    cycle=safe_str(cycle_id)
+    oc=int(open_count or 0)
+    br=float(safe_float(basket_r) or 0.0)
+    hwm=float(safe_float(high_water_r) or 0.0)
+    give=float(safe_float(giveback_pct) or 0.0)
+    banked=float(safe_float(banked_r) or 0.0)
+
+    warn=(
+        oc>0 and (
+            st in {"AMBER","RED","CRITICAL"}
+            or give>=40.0
+            or br<0.0
+            or any(k in act.upper() for k in ("PAUSE","CLOSE","REDUCE","DEFENCE","DEFENSE"))
+        )
+    )
+    recovery_inserted=False
+    if warn:
+        conn.execute("""INSERT INTO bco_focused_recovery
+            (created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,trigger_status,trigger_action,
+             trigger_open_count,trigger_r,trigger_hwm_r,trigger_giveback_pct,updated_at_utc)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+            (now_utc_iso(),rid,cycle,signal_time,st,act,oc,br,hwm,give,now_utc_iso()))
+        recovery_inserted=True
+
+    highwater_inserted=0
+    if cycle and oc>0:
+        for th in BCO_FOCUSED_THRESHOLDS:
+            if hwm>=float(th):
+                before=conn.execute(
+                    "SELECT id FROM bco_focused_highwater WHERE cycle_id=? AND threshold_r=? LIMIT 1",
+                    (cycle,float(th)),
+                ).fetchone()
+                conn.execute("""INSERT INTO bco_focused_highwater
+                    (created_at_utc,cycle_id,threshold_r,trigger_raw_signal_id,trigger_signal_time,
+                     trigger_r,trigger_hwm_r,trigger_giveback_pct,trigger_banked_r,updated_at_utc)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING""",
+                    (now_utc_iso(),cycle,float(th),rid,signal_time,br,hwm,give,banked,now_utc_iso()))
+                if not before:
+                    highwater_inserted+=1
+
+    return {
+        "ok":True,
+        "research_only":True,
+        "execution_authority":False,
+        "trigger_basis":"pre_defence_point_in_time",
+        "recovery_triggered":bool(warn),
+        "recovery_inserted":recovery_inserted,
+        "highwater_rows_inserted":highwater_inserted,
+    }
+
+
+def _bf_outcome_r(conn: DBConn, research_row: Dict[str, Any]) -> float:
+    """Outcome basis for focused research horizons.
+
+    Prefer durable cycle economic R. The current basket-state R is used only as
+    a compatibility fallback for legacy rows that predate a stored cycle id.
+    """
+    cycle=safe_str(research_row.get("cycle_id"))
+    economic=_bf_cycle_economic_r(conn,cycle)
+    if economic is not None:
+        return float(economic)
+    return float(_bf_state(conn).get("r") or 0.0)
+
 
 def record_bco_focused_research(raw_signal_id):
     try:
@@ -4795,32 +5000,38 @@ def record_bco_focused_research(raw_signal_id):
                 (created_at_utc,raw_signal_id,signal_time,state,return_4h,return_8h,return_24h,candidate)
                 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
                 (now_utc_iso(),raw_signal_id,sig,al,r4,r8,r24,1 if parse_bool(d.get("candidate_8h"),False) else 0))
-            st=_bf_state()
+
+            # v0.8.5: fill future horizons from durable economic cycle R rather
+            # than basket_state.basket_R. A genuine cycle that has gone flat now
+            # retains its realised outcome instead of becoming a false 0R.
             for table in ("bco_focused_recovery","bco_focused_highwater"):
                 for pr in conn.execute(f"SELECT * FROM {table} WHERE COALESCE(completed_48,0)=0 ORDER BY id ASC LIMIT 500").fetchall():
-                    pd=dict(pr);tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_bf_elapsed(conn,tid);sets=[];vals2=[]
+                    pd=dict(pr);tid=int(pd.get("raw_signal_id") or pd.get("trigger_raw_signal_id") or 0);elapsed=_bf_elapsed(conn,tid,raw_signal_id);sets=[];vals2=[]
+                    outcome_r=_bf_outcome_r(conn,pd)
                     for h in BCO_FOCUSED_HORIZONS:
                         col=f"outcome_{h}_r"
                         if elapsed>=h and safe_float(pd.get(col)) is None:
-                            sets.append(f"{col}=?");vals2.append(st["r"])
+                            sets.append(f"{col}=?");vals2.append(outcome_r)
                             if h==48:sets.append("completed_48=?");vals2.append(1)
                     if sets:
                         sets.append("updated_at_utc=?");vals2.extend([now_utc_iso(),int(pd["id"])])
                         conn.execute(f"UPDATE {table} SET {', '.join(sets)} WHERE id=?",tuple(vals2))
-            warn=st["open_count"]>0 and (st["status"] in {"AMBER","RED","CRITICAL"} or st["giveback"]>=40 or st["r"]<0 or any(k in st["action"].upper() for k in ("PAUSE","CLOSE","REDUCE","DEFENCE","DEFENSE")))
-            if warn:
-                conn.execute("""INSERT INTO bco_focused_recovery
-                    (created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,trigger_status,trigger_action,trigger_open_count,trigger_r,trigger_hwm_r,trigger_giveback_pct,updated_at_utc)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
-                    (now_utc_iso(),raw_signal_id,st["cycle_id"],sig,st["status"],st["action"],st["open_count"],st["r"],st["hwm"],st["giveback"],now_utc_iso()))
-            if st["cycle_id"] and st["open_count"]>0:
-                for th in BCO_FOCUSED_THRESHOLDS:
-                    if st["hwm"]>=th:
-                        conn.execute("""INSERT INTO bco_focused_highwater
-                            (created_at_utc,cycle_id,threshold_r,trigger_raw_signal_id,trigger_signal_time,trigger_r,trigger_hwm_r,trigger_giveback_pct,trigger_banked_r,updated_at_utc)
-                            VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,threshold_r) DO NOTHING""",
-                            (now_utc_iso(),st["cycle_id"],th,raw_signal_id,sig,st["r"],st["hwm"],st["giveback"],st["banked_r"],now_utc_iso()))
-        return {"ok":True,"research_only":True}
+
+            # Compatibility fallback only. Normal v0.8.5 signals are already
+            # captured pre-defence by record_bco_focused_point_in_time(). If a
+            # caller invokes this recorder outside process_signal, use the
+            # current state rather than silently dropping research completely.
+            existing=conn.execute("SELECT id FROM bco_focused_recovery WHERE raw_signal_id=? LIMIT 1",(raw_signal_id,)).fetchone()
+            if not existing:
+                st=_bf_state(conn)
+                warn=st["open_count"]>0 and (st["status"] in {"AMBER","RED","CRITICAL"} or st["giveback"]>=40 or st["r"]<0 or any(k in st["action"].upper() for k in ("PAUSE","CLOSE","REDUCE","DEFENCE","DEFENSE")))
+                if warn:
+                    conn.execute("""INSERT INTO bco_focused_recovery
+                        (created_at_utc,raw_signal_id,cycle_id,trigger_signal_time,trigger_status,trigger_action,trigger_open_count,trigger_r,trigger_hwm_r,trigger_giveback_pct,updated_at_utc)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_signal_id) DO NOTHING""",
+                        (now_utc_iso(),raw_signal_id,st["cycle_id"],sig,st["status"],st["action"],st["open_count"],st["r"],st["hwm"],st["giveback"],now_utc_iso()))
+
+            return {"ok":True,"research_only":True,"outcome_basis":"cycle_economic_R"}
     except Exception as exc:return {"ok":False,"research_only":True,"error":f"{type(exc).__name__}: {exc}"}
 
 def _bf_rows(table,limit=5000):
@@ -4833,7 +5044,7 @@ def _bf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_bco_focused_research_html():
-    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers and the event-driven AI Regime Observer. All research layers have zero execution authority.</div>' + \
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers and the event-driven AI Regime Observer. All research layers have zero execution authority. <strong>v0.8.5:</strong> recovery/HWM triggers are frozen pre-defence and future horizons use durable cycle economic R; pre-v0.8.5 zero-reset artifacts are retained only for audit and should not be treated as evidence.</div>' + \
       '<details class="research-inner"><summary>MFE + ATR2 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_bco_exit_challenger_shadow_html() + '</div></details>' + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
