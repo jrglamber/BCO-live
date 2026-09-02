@@ -36,10 +36,31 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.5 — Research Capture Repair + Idempotent Flat Reset"
-APP_VERSION = "0.8.5"
-POLICY_VERSION = "bco_v0.8.5_weekly_research_capture_repair_2026_08_30"
+APP_NAME = "Project Exit Plan — BCO v0.8.7 — Accounting Performance + Live Readiness"
+APP_VERSION = "0.8.7"
+POLICY_VERSION = "bco_v0.8.7_accounting_performance_2026_09_02"
 
+# v0.8.7 — accounting visibility only.
+# Adds BCO-isolated weekly/monthly performance accounting to the existing
+# Broker / OANDA / Accounting dashboard. Calendar periods are resolved in the
+# configured UK display timezone. Each period shows realised net GBP/R plus an
+# economic/mark-to-market view: realised net + change in BCO broker open P&L
+# across the period boundary. No strategy, sizing, exit, defence, harvesting,
+# AI, research or broker-execution rule is changed.
+#
+# v0.8.6 — live-readiness operational hardening only.
+# Production strategy rules are unchanged. Broker entry success now requires an
+# actual OANDA tradeOpened fill (trade id + positive units + fill price); HTTP
+# success with an orderCancelTransaction/orderRejectTransaction (including
+# MARKET_HALTED) is classified as ENTRY_FAILED. Pre-order instrument/pricing
+# preview failures receive only a small bounded retry; order POSTs themselves
+# are never blindly retried, avoiding duplicate live orders after ambiguous I/O.
+# Exit shadows can no longer be born from unfilled broker entries, and legacy
+# shadows linked to ENTRY_FAILED trades self-classify INVALID_ENTRY.
+# AI regime snapshots still freeze before deterministic processing, but current
+# basket R/HWM/giveback are reconstructed point-in-time from the incoming candle
+# rather than stale prior-candle basket_state/current_R values.
+#
 # v0.8.5 — weekly-review research/housekeeping repair only.
 # Production entry, basket-defence, 48h+ manager, harvesting, broker safety,
 # AI observer and MFE/ATR2 challenger rules are unchanged.
@@ -179,6 +200,8 @@ BCO_MIN_HOLD_HOURS = max(1, int(float(os.getenv("BCO_MIN_HOLD_HOURS", "48"))))
 BCO_MAX_OPEN_TRADES = max(1, int(float(os.getenv("BCO_MAX_OPEN_TRADES", "250"))))
 BCO_FRESH_SIGNAL_MAX_AGE_SECONDS = max(60, int(float(os.getenv("BCO_FRESH_SIGNAL_MAX_AGE_SECONDS", "7200"))))
 BCO_EXECUTION_MULTIPLIER = 1.00  # hard lock; research cannot alter live sizing.
+BCO_ENTRY_PREVIEW_MAX_ATTEMPTS = max(1, min(int(float(os.getenv("BCO_ENTRY_PREVIEW_MAX_ATTEMPTS", "3"))), 5))
+BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS = max(0.1, min(float(os.getenv("BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS", "0.35")), 2.0))
 
 # Managed runner protection, mirroring the current live philosophy.
 BCO_PROTECT_48 = float(os.getenv("BCO_PROTECT_48", "0.25"))
@@ -1281,8 +1304,22 @@ def oanda_write(path: str, method: str, body: Dict[str, Any], instrument: str, a
         audit(action, False, trade_id=trade_id, broker_trade_id=broker_trade_id, instrument=instrument, message=reason, raw=body)
         return {"ok": False, "blocked": True, "error": reason}
     resp = oanda_request(path, method=method, body=body)
-    audit(action, bool(resp.get("ok")), trade_id=trade_id, broker_trade_id=broker_trade_id, instrument=instrument,
-          message="ok" if resp.get("ok") else safe_str(resp.get("error")), raw=resp.get("data") or resp)
+    audit_success = bool(resp.get("ok"))
+    audit_message = "ok" if audit_success else safe_str(resp.get("error"))
+    # v0.8.6: OANDA may return HTTP 2xx for an order that is immediately
+    # cancelled (for example MARKET_HALTED). For OPEN_BCO audit semantics,
+    # success means an actual tradeOpened fill exists, not merely HTTP success.
+    if safe_str(action).upper() == "OPEN_BCO" and audit_success:
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        fill_tx = data.get("orderFillTransaction") if isinstance(data.get("orderFillTransaction"), dict) else {}
+        trade_opened = fill_tx.get("tradeOpened") if isinstance(fill_tx.get("tradeOpened"), dict) else {}
+        cancel_tx = data.get("orderCancelTransaction") if isinstance(data.get("orderCancelTransaction"), dict) else {}
+        reject_tx = data.get("orderRejectTransaction") if isinstance(data.get("orderRejectTransaction"), dict) else {}
+        if cancel_tx or reject_tx or not safe_str(trade_opened.get("tradeID")):
+            audit_success = False
+            audit_message = safe_str(cancel_tx.get("reason") or reject_tx.get("reason") or "broker_open_not_filled")
+    audit(action, audit_success, trade_id=trade_id, broker_trade_id=broker_trade_id, instrument=instrument,
+          message=audit_message, raw=resp.get("data") or resp)
     return resp
 
 
@@ -1943,34 +1980,67 @@ def process_broker_action_queue(limit: int = 50) -> Dict[str, Any]:
         runtime_set(conn, "broker_action_queue_last_run", now_utc_iso())
     return {"ok": True, "processed": processed, "success": success, "failed": failed, "time_utc": now_utc_iso()}
 
+def _bco_oanda_order_failure_reason(resp: Dict[str, Any]) -> str:
+    """Return an explicit OANDA order failure/cancel reason when present."""
+    data = resp.get("data") if isinstance(resp, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    for key in ("orderRejectTransaction", "orderCancelTransaction"):
+        tx = data.get(key)
+        if isinstance(tx, dict):
+            reason = safe_str(tx.get("reason") or tx.get("rejectReason"))
+            if reason:
+                return reason
+    return safe_str(data.get("errorCode") or data.get("errorMessage") or resp.get("error") or resp.get("response"))
+
+
+def _bco_valid_open_fill(fill: Dict[str, Any]) -> Tuple[bool, str]:
+    """A live entry exists only when OANDA returns a concrete tradeOpened fill."""
+    broker_trade_id = safe_str(fill.get("broker_trade_id"))
+    units = float(safe_float(fill.get("units")) or 0.0)
+    price = float(safe_float(fill.get("price")) or 0.0)
+    if not broker_trade_id:
+        return False, "missing_trade_opened_id"
+    if units <= 0:
+        return False, "missing_or_zero_filled_units"
+    if price <= 0:
+        return False, "missing_fill_price"
+    return True, "filled"
+
+
 def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
-    preview = risk_preview(BCO_RISK_PER_TRADE_GBP)
+    # Bounded retry applies ONLY to pre-order read/preview failures. Never
+    # blindly retry an order POST: an ambiguous I/O failure may still have
+    # reached OANDA, and a second POST could duplicate live risk.
+    preview: Dict[str, Any] = {}
+    preview_attempts = 0
+    for attempt in range(1, BCO_ENTRY_PREVIEW_MAX_ATTEMPTS + 1):
+        preview_attempts = attempt
+        preview = risk_preview(BCO_RISK_PER_TRADE_GBP)
+        if preview.get("ok") or preview.get("blocked"):
+            break
+        if attempt < BCO_ENTRY_PREVIEW_MAX_ATTEMPTS:
+            time.sleep(BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS * attempt)
+
     if not preview.get("ok"):
-        return {"ok": False, "error": preview.get("error"), "preview": preview}
+        return {"ok": False, "error": preview.get("error") or "entry preview unavailable", "preview": preview, "preview_attempts": preview_attempts, "order_submitted": False}
     if not preview.get("acceptable_risk_overage"):
-        return {"ok": False, "blocked": True, "error": "risk overage exceeds guardrail", "preview": preview}
+        return {"ok": False, "blocked": True, "error": "risk overage exceeds guardrail", "preview": preview, "preview_attempts": preview_attempts, "order_submitted": False}
     if not preview.get("acceptable_spread"):
-        return {"ok": False, "blocked": True, "error": "spread exceeds guardrail", "preview": preview}
+        return {"ok": False, "blocked": True, "error": "spread exceeds guardrail", "preview": preview, "preview_attempts": preview_attempts, "order_submitted": False}
     units = preview["units"]
     stop = preview["stop_price"]
-    stop_text = safe_str(preview.get("stop_price_formatted"))
-    if not stop_text:
-        stop_text = format_oanda_price(stop, int(preview.get("display_precision") or 0))
-    # Whole-unit BCO instruments should be sent as whole-unit strings where possible.
+    stop_text = safe_str(preview.get("stop_price_formatted")) or format_oanda_price(stop, int(preview.get("display_precision") or 0))
     units_precision = int(preview.get("units_precision") or 0)
     units_text = f"{float(units):.{units_precision}f}"
-    body = {"order": {
-        "type": "MARKET", "instrument": BCO_OANDA_INSTRUMENT, "units": units_text,
-        "timeInForce": "FOK", "positionFill": "DEFAULT",
-        "stopLossOnFill": {"price": stop_text}
-    }}
+    body = {"order": {"type": "MARKET", "instrument": BCO_OANDA_INSTRUMENT, "units": units_text, "timeInForce": "FOK", "positionFill": "DEFAULT", "stopLossOnFill": {"price": stop_text}}}
     resp = oanda_write(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", "POST", body, BCO_OANDA_INSTRUMENT, "OPEN_BCO", trade_id=local_trade_id)
     fill = extract_fill(resp)
-    audit("OPEN_BCO_DETAILS", bool(resp.get("ok")), trade_id=local_trade_id, broker_trade_id=fill.get("broker_trade_id"),
-          instrument=BCO_OANDA_INSTRUMENT, requested_units=units, filled_units=fill.get("units"), intended_price=preview.get("entry_price"),
-          actual_price=fill.get("price"), spread_pct=preview.get("spread_pct"), requested_risk_gbp=BCO_RISK_PER_TRADE_GBP,
-          effective_risk_gbp=preview.get("effective_risk_gbp"), message="broker open result", raw=resp.get("data") or resp)
-    return {"ok": bool(resp.get("ok")), "response": resp, "fill": fill, "preview": preview}
+    fill_valid, fill_reason = _bco_valid_open_fill(fill)
+    explicit_failure = _bco_oanda_order_failure_reason(resp)
+    accepted = bool(resp.get("ok")) and fill_valid and not explicit_failure
+    failure_reason = "" if accepted else (explicit_failure or fill_reason or safe_str(resp.get("error")) or "broker_entry_not_filled")
+    audit("OPEN_BCO_DETAILS", accepted, trade_id=local_trade_id, broker_trade_id=fill.get("broker_trade_id"), instrument=BCO_OANDA_INSTRUMENT, requested_units=units, filled_units=fill.get("units"), intended_price=preview.get("entry_price"), actual_price=fill.get("price"), spread_pct=preview.get("spread_pct"), requested_risk_gbp=BCO_RISK_PER_TRADE_GBP, effective_risk_gbp=preview.get("effective_risk_gbp"), message="broker open filled" if accepted else f"broker open NOT filled: {failure_reason}", raw=resp.get("data") or resp)
+    return {"ok": accepted, "error": failure_reason if not accepted else "", "market_halted": safe_str(failure_reason).upper() == "MARKET_HALTED", "response": resp, "fill": fill, "preview": preview, "preview_attempts": preview_attempts, "order_submitted": True, "fill_valid": fill_valid, "fill_validation": fill_reason}
 
 
 def update_broker_stop(broker_trade_id: str, stop_price: float, local_trade_id: str) -> Dict[str, Any]:
@@ -2384,6 +2454,10 @@ def create_trade(conn: DBConn, raw_signal_id: int, signal: Dict[str, Any], cycle
         result=open_bco_broker_trade(trade_id)
         if result.get("ok"):
             fill=result.get("fill") or {}; prev=result.get("preview") or {}
+            fill_valid, fill_reason = _bco_valid_open_fill(fill)
+            if not fill_valid:
+                conn.execute("UPDATE trades SET status='ENTRY_FAILED',exit_reason=?,updated_at_utc=? WHERE trade_id=?", (f"invalid_broker_fill:{fill_reason}",now_utc_iso(),trade_id))
+                return None
             broker_trade_id=safe_str(fill.get("broker_trade_id")); fill_price=safe_float(fill.get("price")) or entry
             effective=safe_float(prev.get("effective_risk_gbp")) or BCO_RISK_PER_TRADE_GBP
             broker_stop=fill_price*(1-BCO_SL_PCT/100.0)
@@ -2989,6 +3063,13 @@ def _bco_exit_shadow_sync_actual(conn: DBConn, shadow: Dict[str, Any]) -> Dict[s
         return shadow
 
     actual_status = safe_str(trade.get("status")).upper() or "UNKNOWN"
+    if actual_status == "ENTRY_FAILED":
+        conn.execute("""
+            UPDATE bco_exit_challenger_shadow SET status='INVALID_ENTRY',actual_status='ENTRY_FAILED',
+                paired_complete=?,paired_winner='',challenger_minus_current_R=NULL,
+                saved_reversal=?,killed_large_winner=?,note=?,updated_at_utc=? WHERE id=?
+        """, (False, False, False, "v0.8.6 invalidated: production broker entry never filled; exclude from exit-challenger evidence.", now_utc_iso(), shadow.get("id")))
+        return fetchone_dict(conn.execute("SELECT * FROM bco_exit_challenger_shadow WHERE id=? LIMIT 1", (shadow.get("id"),))) or shadow
     actual_exit_time = safe_str(trade.get("exit_time"))
     actual_exit_price = safe_float(trade.get("exit_price"))
     actual_r = safe_float(trade.get("realized_R"))
@@ -3049,6 +3130,8 @@ def start_bco_exit_challenger_shadows(
     )) or {}
     if not trade or safe_str(trade.get("status")).upper() != "OPEN":
         return {"ok": False, "created": 0, "reason": "production_trade_not_open"}
+    if BCO_AUTO_ENTRY_ENABLED and not safe_str(trade.get("broker_trade_id")):
+        return {"ok": False, "created": 0, "reason": "broker_entry_not_filled"}
 
     entry = safe_float(trade.get("entry_price"))
     if entry is None or entry <= 0:
@@ -4151,94 +4234,49 @@ def build_ai_regime_observer_html():
 
 
 def _bco_aiobs_state(conn, raw_signal_id, payload):
-    """
-    Point-in-time BCO observer state using the SAME basket state basis as the
-    production manager/dashboard, rather than rebuilding from stale trade rows.
+    """Freeze current-candle BCO observer state before deterministic processing.
+
+    basket_state/current_R are prior-candle values at this point in the webhook
+    flow, so revalue currently-open trades at the incoming candle close. Research
+    only: no production state is changed.
     """
     sig=conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1",(int(raw_signal_id),)).fetchone()
     sig=dict(sig) if sig else {}
     state=conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1").fetchone()
     state=dict(state) if state else {}
-
     rows=conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id").fetchall()
     open_rows=[dict(r) for r in rows]
-
-    # Use actual wall-clock/manager age where available for maturity count.
-    mature=0
-    for t in open_rows:
-        hold=int(safe_float(t.get("hold_candles")) or 0)
-        if hold >= 48:
-            mature += 1
-
+    mature=sum(1 for t in open_rows if int(safe_float(t.get("hold_candles")) or 0) >= 48)
     candidate=bool(sig.get("candidate_8h"))
-
-    # Production basket_state is the authoritative manager state.
-    # Fallback only if older DB rows do not have the expected columns populated.
-    basket_r=(
-        safe_float(state.get("current_basket_R"))
-        if safe_float(state.get("current_basket_R")) is not None
-        else safe_float(state.get("basket_R"))
-    )
-    if basket_r is None:
-        basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows)
+    incoming_price=safe_float(payload.get("exec_close") or payload.get("close") or payload.get("rule_entry_price")) if isinstance(payload,dict) else None
+    if incoming_price is None:
+        incoming_price=safe_float(sig.get("exec_close"))
+    point_r_values=[]
+    if incoming_price is not None and float(incoming_price)>0:
+        px=float(incoming_price)
+        for t in open_rows:
+            entry=safe_float(t.get("entry_price"))
+            if entry is None or float(entry)<=0:
+                point_r_values.append(float(safe_float(t.get("current_R")) or 0.0)); continue
+            pct=((px-float(entry))/float(entry))*100.0
+            if safe_str(t.get("direction")).lower()=="short": pct=-pct
+            sl=float(safe_float(t.get("sl_pct")) or BCO_SL_PCT)
+            point_r_values.append((pct/sl) if sl>0 else 0.0)
+        basket_r=sum(point_r_values); basket_source="incoming_candle_revaluation"
+    else:
+        basket_r=sum(float(safe_float(t.get("current_R")) or 0.0) for t in open_rows); basket_source="trade_current_R_fallback"
     basket_r=float(basket_r or 0.0)
-
-    hwm=(
-        safe_float(state.get("high_water_R"))
-        if safe_float(state.get("high_water_R")) is not None
-        else safe_float(state.get("high_water_r"))
-    )
-    hwm=float(hwm or 0.0)
-
-    give=(
-        safe_float(state.get("giveback_pct"))
-        if safe_float(state.get("giveback_pct")) is not None
-        else 0.0
-    )
-    give=float(give or 0.0)
-
-    # If giveback percentage is absent/stale but R HWM is available, derive
-    # an R-basis fallback for observer context only.
-    if hwm > 0 and give <= 0 and basket_r < hwm:
-        give=max(0.0,(hwm-basket_r)/hwm*100.0)
-
+    prior_hwm=safe_float(state.get("high_water_R"))
+    if prior_hwm is None: prior_hwm=safe_float(state.get("high_water_r"))
+    prior_hwm=float(prior_hwm or 0.0)
+    hwm=max(prior_hwm,basket_r) if open_rows else prior_hwm
+    give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     consumed=0
     cycle=safe_str(state.get("cycle_id"))
     if cycle:
-        row=conn.execute("""SELECT COUNT(*) AS c FROM protection_stages
-                            WHERE cycle_id=? AND stage_type='BANK'
-                              AND UPPER(COALESCE(status,'')) IN
-                            ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
+        row=conn.execute("""SELECT COUNT(*) AS c FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND UPPER(COALESCE(status,'')) IN ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
         consumed=int(row["c"] or 0) if row else 0
-
-    return {
-        "asset":"BCO",
-        "candidate":candidate,
-        "side":"long" if candidate else "",
-        "open_count":len(open_rows),
-        "mature_48h_plus":mature,
-
-        # Explicit provenance for future audit/export.
-        "basket_state_source":"basket_state:BCO_LONG",
-        "basket_r":basket_r,
-        "high_water_r":hwm,
-        "giveback_pct":give,
-
-        "giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),
-        "high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),
-        "consumed_bank_stages":consumed,
-        "cycle_id":cycle,
-        "tide_status":safe_str(
-            state.get("tide_status")
-            or state.get("status")
-            or state.get("phase")
-        ),
-        "manager_action":safe_str(
-            state.get("manager_action")
-            or state.get("recommended_action")
-            or state.get("action")
-        ),
-    }
+    return {"asset":"BCO","candidate":candidate,"side":"long" if candidate else "","open_count":len(open_rows),"mature_48h_plus":mature,"basket_state_source":basket_source,"incoming_price":incoming_price,"basket_r":basket_r,"high_water_r":hwm,"prior_high_water_r":prior_hwm,"giveback_pct":give,"giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),"high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),"consumed_bank_stages":consumed,"cycle_id":cycle,"tide_status":safe_str(state.get("tide_status") or state.get("status") or state.get("phase")),"manager_action":safe_str(state.get("manager_action") or state.get("recommended_action") or state.get("action"))}
 
 
 def capture_ai_regime_snapshot(raw_signal_id, payload):
@@ -4281,7 +4319,7 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
             "current_signal":_aiobs_scalar_features(payload),
             "event_state":current,
             "recent_history":[],
-            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing. Basket R/HWM/giveback come from production basket_state:BCO_LONG.",
+            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing. v0.8.6 revalues open trades at the incoming candle for point-in-time basket R; prior HWM/cycle context comes from basket_state:BCO_LONG.",
         }
         recent=conn.execute("""SELECT timestamp_readable,candidate_8h,exec_close,signal_side
                                FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT 6""",(int(raw_signal_id),)).fetchall()
@@ -5189,6 +5227,223 @@ def _pnl_class(v):
         return ""
     return "pos" if n > 0 else "neg"
 
+
+def _bco_period_boundary_iso(local_dt: datetime) -> str:
+    """Convert a display-timezone calendar boundary to UTC ISO text."""
+    if local_dt.tzinfo is None:
+        local_dt = local_dt.replace(tzinfo=_bco_zone(BCO_DISPLAY_TIMEZONE))
+    return local_dt.astimezone(timezone.utc).isoformat()
+
+
+def _bco_accounting_boundary_open_pl(
+    conn: DBConn,
+    boundary_utc_iso: str,
+) -> Dict[str, Any]:
+    """Best persisted BCO open-P/L observation at a calendar boundary.
+
+    Prefer the last accounting snapshot at/before the boundary. If the system
+    had no earlier snapshot (for example immediately after first deployment),
+    use the first snapshot after the boundary and disclose its timestamp.
+    """
+    row = fetchone_dict(conn.execute("""
+        SELECT created_at_utc,bco_open_pl
+        FROM accounting_snapshots
+        WHERE created_at_utc<=?
+        ORDER BY created_at_utc DESC,id DESC LIMIT 1
+    """, (boundary_utc_iso,)))
+    relation = "AT_OR_BEFORE"
+    if not row:
+        row = fetchone_dict(conn.execute("""
+            SELECT created_at_utc,bco_open_pl
+            FROM accounting_snapshots
+            WHERE created_at_utc>?
+            ORDER BY created_at_utc ASC,id ASC LIMIT 1
+        """, (boundary_utc_iso,)))
+        relation = "AFTER_FALLBACK"
+    return {
+        "open_pnl": safe_float((row or {}).get("bco_open_pl")),
+        "snapshot_time_utc": safe_str((row or {}).get("created_at_utc")),
+        "relation": relation if row else "MISSING",
+    }
+
+
+def _bco_realised_period(
+    conn: DBConn,
+    start_utc_iso: Optional[str] = None,
+    end_utc_iso: Optional[str] = None,
+) -> Dict[str, Any]:
+    clauses = ["status IN ('CLOSED','BROKER_CLOSED')"]
+    params: List[Any] = []
+    if start_utc_iso:
+        clauses.append("exit_time>=?")
+        params.append(start_utc_iso)
+    if end_utc_iso:
+        clauses.append("exit_time<?")
+        params.append(end_utc_iso)
+    row = fetchone_dict(conn.execute(f"""
+        SELECT COUNT(*) AS trade_count,
+               COALESCE(SUM(realized_pnl_gbp),0) AS realized_pnl_gbp,
+               COALESCE(SUM(realized_R),0) AS realized_R,
+               COALESCE(SUM(broker_realized_pl_home),0) AS broker_pl_gbp,
+               COALESCE(SUM(financing_home),0) AS financing_gbp
+        FROM trades
+        WHERE {' AND '.join(clauses)}
+    """, tuple(params))) or {}
+    return {
+        "trade_count": int(safe_float(row.get("trade_count")) or 0),
+        "realized_pnl_gbp": float(safe_float(row.get("realized_pnl_gbp")) or 0.0),
+        "realized_R": float(safe_float(row.get("realized_R")) or 0.0),
+        "broker_pl_gbp": float(safe_float(row.get("broker_pl_gbp")) or 0.0),
+        "financing_gbp": float(safe_float(row.get("financing_gbp")) or 0.0),
+    }
+
+
+def bco_accounting_performance_summary(
+    current_open_pnl: Optional[float] = None,
+) -> Dict[str, Any]:
+    """BCO-only weekly/monthly realised and economic P&L.
+
+    Economic P&L for a calendar period is:
+      realised net P&L in the period + ending BCO broker open P&L
+      - BCO broker open P&L at the period start.
+
+    This correctly attributes movement in baskets spanning week/month boundaries
+    instead of treating all still-open profit as zero. It intentionally uses BCO
+    trade/accounting rows only; shared-account NAV or foreign-strategy P&L is not
+    imported.
+    """
+    display_tz = _bco_zone(BCO_DISPLAY_TIMEZONE)
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(display_tz)
+
+    week_start_local = (now_local - timedelta(days=now_local.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    last_week_start_local = week_start_local - timedelta(days=7)
+
+    month_start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prior_month_day = month_start_local - timedelta(days=1)
+    last_month_start_local = prior_month_day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    boundaries = {
+        "this_week_start": _bco_period_boundary_iso(week_start_local),
+        "last_week_start": _bco_period_boundary_iso(last_week_start_local),
+        "this_month_start": _bco_period_boundary_iso(month_start_local),
+        "last_month_start": _bco_period_boundary_iso(last_month_start_local),
+        "now": now_utc.isoformat(),
+    }
+
+    with get_conn() as conn:
+        current_open = safe_float(current_open_pnl)
+        current_open_source = "BROKER_LIVE" if current_open is not None else "ACCOUNTING_SNAPSHOT"
+        current_open_time = now_utc_iso()
+        if current_open is None:
+            latest = fetchone_dict(conn.execute("""
+                SELECT created_at_utc,bco_open_pl
+                FROM accounting_snapshots ORDER BY id DESC LIMIT 1
+            """)) or {}
+            current_open = safe_float(latest.get("bco_open_pl"))
+            current_open_time = safe_str(latest.get("created_at_utc"))
+        if current_open is None:
+            current_open = 0.0
+            current_open_source = "ZERO_FALLBACK"
+
+        def period(
+            key: str,
+            label: str,
+            start_iso: str,
+            end_iso: Optional[str],
+            end_open_override: Optional[float] = None,
+            end_label: str = "period end",
+        ) -> Dict[str, Any]:
+            realised = _bco_realised_period(conn, start_iso, end_iso)
+            start_basis = _bco_accounting_boundary_open_pl(conn, start_iso)
+            if end_open_override is not None:
+                end_basis = {
+                    "open_pnl": float(end_open_override),
+                    "snapshot_time_utc": current_open_time,
+                    "relation": current_open_source,
+                }
+            elif end_iso:
+                end_basis = _bco_accounting_boundary_open_pl(conn, end_iso)
+            else:
+                end_basis = {"open_pnl": None, "snapshot_time_utc": "", "relation": "MISSING"}
+
+            start_open = safe_float(start_basis.get("open_pnl"))
+            end_open = safe_float(end_basis.get("open_pnl"))
+            economic = None
+            if start_open is not None and end_open is not None:
+                economic = float(realised["realized_pnl_gbp"]) + float(end_open) - float(start_open)
+            return {
+                "key": key,
+                "label": label,
+                "start_utc": start_iso,
+                "end_utc": end_iso or boundaries["now"],
+                "realized_pnl_gbp": realised["realized_pnl_gbp"],
+                "realized_R": realised["realized_R"],
+                "trade_count": realised["trade_count"],
+                "broker_pl_gbp": realised["broker_pl_gbp"],
+                "financing_gbp": realised["financing_gbp"],
+                "start_open_pnl_gbp": start_open,
+                "end_open_pnl_gbp": end_open,
+                "economic_pnl_gbp": economic,
+                "start_snapshot_time_utc": start_basis.get("snapshot_time_utc"),
+                "end_snapshot_time_utc": end_basis.get("snapshot_time_utc"),
+                "start_basis_relation": start_basis.get("relation"),
+                "end_basis_relation": end_basis.get("relation"),
+                "end_basis_label": end_label,
+            }
+
+        periods = [
+            period(
+                "THIS_WEEK", "This week", boundaries["this_week_start"], None,
+                end_open_override=float(current_open), end_label="current broker open P/L",
+            ),
+            period(
+                "LAST_WEEK", "Last week", boundaries["last_week_start"], boundaries["this_week_start"],
+            ),
+            period(
+                "THIS_MONTH", "This month", boundaries["this_month_start"], None,
+                end_open_override=float(current_open), end_label="current broker open P/L",
+            ),
+            period(
+                "LAST_MONTH", "Last month", boundaries["last_month_start"], boundaries["this_month_start"],
+            ),
+        ]
+
+        lifetime = _bco_realised_period(conn)
+        lifetime_economic = float(lifetime["realized_pnl_gbp"]) + float(current_open)
+
+    by_key = {p["key"]: p for p in periods}
+    return {
+        "ok": True,
+        "timezone": BCO_DISPLAY_TIMEZONE,
+        "calendar_basis": "Monday-start week; calendar month in configured display timezone",
+        "current_open_pnl_gbp": float(current_open),
+        "current_open_pnl_source": current_open_source,
+        "periods": periods,
+        "by_key": by_key,
+        "lifetime": {
+            "label": "Lifetime",
+            "realized_pnl_gbp": lifetime["realized_pnl_gbp"],
+            "realized_R": lifetime["realized_R"],
+            "trade_count": lifetime["trade_count"],
+            "current_open_pnl_gbp": float(current_open),
+            "economic_pnl_gbp": lifetime_economic,
+            "broker_pl_gbp": lifetime["broker_pl_gbp"],
+            "financing_gbp": lifetime["financing_gbp"],
+        },
+        "note": "Economic P&L = realised net + change in BCO broker open P&L. Open-position financing is reflected when broker close accounting settles it.",
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/broker/accounting-performance")
+def bco_accounting_performance_endpoint():
+    live = bco_broker_live_snapshot()
+    current_open = safe_float(live.get("owned_unrealized_pl")) if live.get("ok") else None
+    return bco_accounting_performance_summary(current_open_pnl=current_open)
+
 def _bco_standard_top_uncached():
     s=snapshot();basket=s.get("basket") or {};lm=s.get("live_local_basket") or {}
     acct=s.get("account") or {};broker=s.get("broker_live") or {};safety=s.get("broker_safety") or {}
@@ -6051,6 +6306,9 @@ def _bco_standard_broker_html():
     broker = s.get("broker_live") or {}
     preview = risk_preview()
     ready = bco_live_readiness()
+    perf = bco_accounting_performance_summary(
+        current_open_pnl=safe_float(broker.get("owned_unrealized_pl"))
+    )
 
     with get_conn() as conn:
         txs = fetchall_dict(conn.execute("""
@@ -6112,6 +6370,41 @@ def _bco_standard_broker_html():
         f"<td>{_money(a.get('bco_realized_pl'))}</td><td>{_money(a.get('bco_financing'))}</td></tr>"
         for a in accounting
     )
+    perf_by_key = perf.get("by_key") or {}
+    perf_lifetime = perf.get("lifetime") or {}
+    perf_week = perf_by_key.get("THIS_WEEK") or {}
+    perf_month = perf_by_key.get("THIS_MONTH") or {}
+
+    def _perf_economic_text(row: Dict[str, Any]) -> str:
+        value = safe_float(row.get("economic_pnl_gbp"))
+        return "n/a" if value is None else _money(value)
+
+    def _perf_date_label(row: Dict[str, Any]) -> str:
+        def local_date(v: Any) -> str:
+            raw = safe_str(v)
+            if not raw:
+                return "—"
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(_bco_zone(BCO_DISPLAY_TIMEZONE)).strftime("%d %b %Y")
+            except Exception:
+                return raw[:10]
+        return f"{local_date(row.get('start_utc'))} → {local_date(row.get('end_utc'))}"
+
+    performance_rows = "".join(
+        f"<tr><td><strong>{esc(r.get('label'))}</strong><div class='small'>{esc(_perf_date_label(r))}</div></td>"
+        f"<td class='{_pnl_class(r.get('economic_pnl_gbp'))}'>{_perf_economic_text(r)}</td>"
+        f"<td class='{_pnl_class(r.get('realized_pnl_gbp'))}'>{_money(r.get('realized_pnl_gbp'))}</td>"
+        f"<td class='{_pnl_class(r.get('realized_R'))}'>{_fmt_metric(r.get('realized_R'),'R')}</td>"
+        f"<td>{int(r.get('trade_count') or 0)}</td>"
+        f"<td>{_money(r.get('start_open_pnl_gbp')) if safe_float(r.get('start_open_pnl_gbp')) is not None else 'n/a'}</td>"
+        f"<td>{_money(r.get('end_open_pnl_gbp')) if safe_float(r.get('end_open_pnl_gbp')) is not None else 'n/a'}</td>"
+        f"<td>{_money(r.get('financing_gbp'))}</td></tr>"
+        for r in (perf.get("periods") or [])
+    )
+
     readiness_rows = "".join(
         f"<tr><td>{esc(c.get('name'))}</td><td class='{'pos' if c.get('ok') else 'neg'}'>{'PASS' if c.get('ok') else 'CHECK'}</td><td>{esc(c.get('detail'))}</td></tr>"
         for c in ready.get("checks") or []
@@ -6132,6 +6425,29 @@ def _bco_standard_broker_html():
         <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if not local_missing and not broker_only else 'neg'}">{'SAFE' if not local_missing and not broker_only else 'CHECK'}</div><div class="small">Local missing {len(local_missing)} · broker-only {len(broker_only)}</div></div>
         <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
         <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{BCO_RISK_PER_TRADE_GBP:.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL · 1.00x locked</div></div>
+      </div>
+
+      <h3>BCO Profit Performance</h3>
+      <div class="section-note small">
+        <strong>BCO-only accounting.</strong> Week boundaries start Monday and month boundaries use
+        {esc(BCO_DISPLAY_TIMEZONE)}. <strong>Economic P&amp;L</strong> is realised net profit plus the change
+        in BCO broker open P&amp;L across the period, so a basket spanning a week/month boundary is not
+        misrepresented just because trades remain open. Shared-account/foreign-strategy P&amp;L is excluded.
+      </div>
+      <div class="metric-grid">
+        <div class="mini-card"><div class="k">This Week — Economic</div><div class="v {_pnl_class(perf_week.get('economic_pnl_gbp'))}">{_perf_economic_text(perf_week)}</div><div class="small">Realised {_money(perf_week.get('realized_pnl_gbp'))} · {_fmt_metric(perf_week.get('realized_R'),'R')} · {int(perf_week.get('trade_count') or 0)} closes</div></div>
+        <div class="mini-card"><div class="k">This Month — Economic</div><div class="v {_pnl_class(perf_month.get('economic_pnl_gbp'))}">{_perf_economic_text(perf_month)}</div><div class="small">Realised {_money(perf_month.get('realized_pnl_gbp'))} · {_fmt_metric(perf_month.get('realized_R'),'R')} · {int(perf_month.get('trade_count') or 0)} closes</div></div>
+        <div class="mini-card"><div class="k">Current Open BCO P&amp;L</div><div class="v {_pnl_class(perf.get('current_open_pnl_gbp'))}">{_money(perf.get('current_open_pnl_gbp'))}</div><div class="small">Source {esc(perf.get('current_open_pnl_source'))}</div></div>
+        <div class="mini-card"><div class="k">Lifetime — Economic</div><div class="v {_pnl_class(perf_lifetime.get('economic_pnl_gbp'))}">{_money(perf_lifetime.get('economic_pnl_gbp'))}</div><div class="small">Realised {_money(perf_lifetime.get('realized_pnl_gbp'))} · {_fmt_metric(perf_lifetime.get('realized_R'),'R')} · {int(perf_lifetime.get('trade_count') or 0)} closes</div></div>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Period</th><th>Economic P&amp;L</th><th>Realised Net</th><th>Realised R</th><th>Closed Trades</th><th>Start Open P/L</th><th>End / Current Open P/L</th><th>Financing in Closed Trades</th></tr></thead>
+        <tbody>{performance_rows or '<tr><td colspan="8">No BCO performance periods available yet.</td></tr>'}</tbody>
+      </table></div>
+      <div class="section-note small">
+        Economic P&amp;L = realised net + ending/current BCO broker open P&amp;L − starting BCO broker open P&amp;L.
+        Open-position financing is reflected when broker close accounting settles it.
+        <a href="/broker/accounting-performance">performance JSON</a>.
       </div>
 
       <h3>Live Promotion Readiness</h3>
