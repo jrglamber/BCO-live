@@ -36,9 +36,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.7 — Accounting Performance + Live Readiness"
-APP_VERSION = "0.8.7"
-POLICY_VERSION = "bco_v0.8.7_accounting_performance_2026_09_02"
+APP_NAME = "Project Exit Plan — BCO v0.8.8 — Audit Bookkeeping + Accounting Performance"
+APP_VERSION = "0.8.8"
+POLICY_VERSION = "bco_v0.8.8_audit_bookkeeping_2026_09_04"
+
+# v0.8.8 — audit/bookkeeping repair only.
+# PostgreSQL exit-shadow pairing aliases + idempotent cycle realised-R reconciliation.
+# No production strategy rule changed.
 
 # v0.8.7 — accounting visibility only.
 # Adds BCO-isolated weekly/monthly performance accounting to the existing
@@ -409,6 +413,12 @@ _BCO_DB_COMPAT_ALIASES = {
     "protected_r": "protected_R",
     "basket_r_before": "basket_R_before",
     "basket_r_after": "basket_R_after",
+    # v0.8.8: PostgreSQL folds unquoted mixed-case identifiers to lower-case.
+    # These research fields were previously omitted, leaving valid closed
+    # challenger/current pairs stuck as paired_complete=false in Postgres.
+    "hypothetical_exit_r": "hypothetical_exit_R",
+    "actual_r": "actual_R",
+    "challenger_minus_current_r": "challenger_minus_current_R",
 }
 
 def _bco_row_compat(row: Any) -> Dict[str, Any]:
@@ -1526,6 +1536,7 @@ def mark_trade_closed_from_broker(
         rr, net, broker_pl, financing,
         rr, exit_price, now_utc_iso(), trade.get("trade_id")
     ))
+    refresh_current_cycle_realized_r(conn)
     audit(
         "BROKER_CLOSE_ACCOUNTED", True,
         trade_id=trade.get("trade_id"),
@@ -2098,6 +2109,48 @@ def basket_metrics(conn: DBConn) -> Dict[str, Any]:
             "losing_pct":losing/count*100.0 if count else 0.0,"phase":basket_phase_from_count(count)}
 
 
+def refresh_current_cycle_realized_r(conn: DBConn) -> Dict[str, Any]:
+    """Reconcile current family-cycle realised R from authoritative trades.
+
+    v0.8.8 bookkeeping repair. This deliberately SETS the cycle total from the
+    closed-trade ledger instead of incrementing it on individual execution paths.
+    That makes broker transaction replay, harvest finalisation and reconciliation
+    idempotent and means all closure types (managed stop, defence, normal manager
+    exit and bank) are represented exactly once.
+    """
+    state = fetchone_dict(conn.execute(
+        "SELECT cycle_id,realized_R_cycle FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+    )) or {}
+    cycle = safe_str(state.get("cycle_id"))
+    if not cycle:
+        return {"ok": True, "updated": False, "reason": "no_active_cycle", "realized_R_cycle": 0.0}
+
+    row = fetchone_dict(conn.execute(
+        """
+        SELECT COALESCE(SUM(realized_R),0) AS realized_R_cycle_calc
+        FROM trades
+        WHERE cycle_id=? AND status IN ('CLOSED','BROKER_CLOSED')
+        """,
+        (cycle,),
+    )) or {}
+    calculated = float(safe_float(row.get("realized_R_cycle_calc")) or 0.0)
+    stored = float(safe_float(state.get("realized_R_cycle")) or 0.0)
+    changed = abs(calculated - stored) > 1e-9
+    if changed:
+        conn.execute(
+            "UPDATE basket_state SET realized_R_cycle=?,updated_at_utc=? WHERE singleton_key='BCO_LONG' AND cycle_id=?",
+            (calculated, now_utc_iso(), cycle),
+        )
+    return {
+        "ok": True,
+        "updated": changed,
+        "cycle_id": cycle,
+        "previous_realized_R_cycle": stored,
+        "realized_R_cycle": calculated,
+        "source": "authoritative_closed_trades",
+    }
+
+
 
 def reset_flat_bco_basket_state(
     conn: DBConn,
@@ -2308,6 +2361,7 @@ def mark_trade_closed(conn: DBConn, trade: Dict[str, Any], signal_time: str, exi
         UPDATE trades SET status='CLOSED',exit_time=?,exit_price=?,exit_reason=?,realized_R=?,realized_pnl_gbp=?,
             current_R=?,current_price=?,updated_at_utc=? WHERE trade_id=?
     """, (signal_time, exit_price, reason, rr, pnl, rr, exit_price, now_utc_iso(), trade.get("trade_id")))
+    refresh_current_cycle_realized_r(conn)
     return rr
 
 
@@ -2646,9 +2700,12 @@ def execute_protection(conn: DBConn, signal_time: str) -> Dict[str, Any]:
 
     if banked:
         conn.execute(
-            "UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,realized_R_cycle=COALESCE(realized_R_cycle,0)+?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
-            (banked, banked, now_utc_iso()),
+            "UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,updated_at_utc=? WHERE singleton_key='BCO_LONG'",
+            (banked, now_utc_iso()),
         )
+        # realized_R_cycle is reconciled from the closed-trade ledger by the
+        # close path itself; do not increment it again here.
+        refresh_current_cycle_realized_r(conn)
 
     return {
         "banked_R": banked,
@@ -3598,6 +3655,11 @@ def reconcile_broker() -> Dict[str,Any]:
         runtime_set(_rc,"broker_reconcile_last_at",now_utc_iso())
     tx_sync=sync_broker_transactions() if BCO_TRANSACTION_SYNC_ENABLED else {"ok":False,"skipped":True}
 
+    # v0.8.8: self-heal the active cycle's realised-R ledger from trades. This
+    # also repairs an already-running cycle immediately after deployment.
+    with _db_lock, get_conn() as _cycle_conn:
+        cycle_realized_sync = refresh_current_cycle_realized_r(_cycle_conn)
+
     # Research-only paired-outcome refresh after broker transaction accounting.
     with _db_lock, get_conn() as _shadow_conn:
         exit_shadow_sync = sync_bco_exit_challenger_actual_outcomes(_shadow_conn)
@@ -3627,6 +3689,7 @@ def reconcile_broker() -> Dict[str,Any]:
             "account_open_count":live.get("account_open_count"),
             "updates":updates,"local_only_cleaned":local_only_cleaned,
             "unlinked_broker_trades":unlinked_broker,"transaction_sync":tx_sync,
+            "cycle_realized_R_sync":cycle_realized_sync,
             "exit_challenger_shadow_sync":exit_shadow_sync,
             "flat_basket_reset":flat_reset,"time_utc":now_utc_iso()}
 
