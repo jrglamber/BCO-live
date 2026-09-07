@@ -1,4 +1,4 @@
-# BCO Live v0.1.1 — instrument price precision fix
+# BCO Live v0.8.9 — read-only aggregate portfolio summary
 # Project Exit Plan
 #
 # Design sources:
@@ -36,9 +36,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.8 — Audit Bookkeeping + Accounting Performance"
-APP_VERSION = "0.8.8"
+APP_NAME = "Project Exit Plan — BCO v0.8.9 — Aggregate Link + Audit Bookkeeping + Accounting Performance"
+APP_VERSION = "0.8.9"
 POLICY_VERSION = "bco_v0.8.8_audit_bookkeeping_2026_09_04"
+AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
+
+# v0.8.9 — read-only aggregate dashboard adapter only.
+# No production strategy, sizing, exit, harvesting, AI, research or broker-write rule changed.
 
 # v0.8.8 — audit/bookkeeping repair only.
 # PostgreSQL exit-shadow pairing aliases + idempotent cycle realised-R reconciliation.
@@ -5681,6 +5685,71 @@ def bco_standard_top_snapshot(force=False):
 @app.get("/dashboard/top")
 def bco_standard_top_route(force: bool = False):
     return bco_standard_top_snapshot(force=force)
+
+
+# ============================================================
+# BCO v0.8.9 - READ-ONLY AGGREGATE PORTFOLIO SUMMARY
+# ============================================================
+# Thin adapter over the same snapshot used by /dashboard/top.
+# In practice/demo mode BCO remains visible in its top block but is excluded
+# from the aggregate service's live-money portfolio totals.
+def _aggregate_summary_authorized(x_aggregate_secret: Optional[str]) -> None:
+    if AGGREGATE_SOURCE_SECRET and safe_str(x_aggregate_secret) != AGGREGATE_SOURCE_SECRET:
+        raise HTTPException(status_code=403, detail="aggregate source secret rejected")
+
+
+@app.get("/api/portfolio-summary")
+def aggregate_portfolio_summary(
+    x_aggregate_secret: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _aggregate_summary_authorized(x_aggregate_secret)
+
+    top = bco_standard_top_snapshot(force=False)
+    account = top.get("account") or {}
+    accounting = top.get("accounting") or {}
+    strategy = top.get("strategy") or {}
+    signals = top.get("signals") or {}
+    config = top.get("config") or {}
+    mode = safe_str(top.get("mode") or OANDA_ENV).strip().lower()
+
+    return {
+        "schema_version": 1,
+        "strategy": "bco",
+        "label": "BCO",
+        "mode": mode,
+        "status": "enabled",
+        "source_build": APP_VERSION,
+        "updated_at_utc": safe_str(top.get("time_utc") or now_utc_iso()),
+        "nav_gbp": safe_float(account.get("nav")),
+        "risk_per_trade_gbp": safe_float(config.get("risk_per_trade_gbp")),
+        "basket": {
+            "direction": "LONG",
+            "open_trades": int(safe_float(strategy.get("open_trades")) or 0),
+            "pnl_gbp": safe_float(strategy.get("headline_pnl")),
+            "pnl_r": safe_float(strategy.get("basket_r")),
+            "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
+            "high_water_r": safe_float(strategy.get("high_water_r")),
+            "high_water_at_utc": safe_str(strategy.get("high_water_time")) or None,
+            "giveback_gbp": safe_float(strategy.get("giveback_gbp")),
+            "giveback_r": safe_float(strategy.get("giveback_r")),
+        },
+        "accounting": {
+            "realised_today_gbp": None,
+            "realised_week_gbp": safe_float(accounting.get("week_pnl")),
+            "realised_month_gbp": safe_float(accounting.get("month_pnl")),
+            "realised_all_time_gbp": safe_float(strategy.get("realized_pnl")),
+        },
+        "health": {
+            "broker_ok": account.get("nav") is not None,
+            "database_ok": True,
+            "worker_ok": signals.get("processor_ok"),
+            "last_signal_at_utc": safe_str(signals.get("latest_time")) or None,
+            "note": (
+                "BCO LONG. Practice/demo remains excluded from live portfolio totals "
+                "until the BCO service is explicitly promoted to live."
+            ),
+        },
+    }
 
 
 def _bco_standard_signal_html():
