@@ -36,11 +36,20 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.9 — Aggregate Link + Audit Bookkeeping + Accounting Performance"
-APP_VERSION = "0.8.9"
-POLICY_VERSION = "bco_v0.8.8_audit_bookkeeping_2026_09_04"
+APP_NAME = "Project Exit Plan — BCO v0.8.10 — Broker-Basis High Water + Aggregate Link + Audit Bookkeeping"
+APP_VERSION = "0.8.10"
+POLICY_VERSION = "bco_v0.8.10_broker_basis_high_water_2026_09_09"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.10 — display/accounting consistency repair only.
+# Cash high-water and cash giveback now use the same broker-P&L basis as the
+# current Broker P&L tile. The £ high-water is sourced from the persisted
+# OANDA BCO open-P&L accounting snapshot nearest the exact R-high-water
+# candle; if that persisted broker observation is unavailable, the app uses
+# an effective-risk weighted reconstruction for that same candle. The old
+# misleading fallback high_water_R × nominal £5 is removed. No entry, exit,
+# sizing, basket defence, harvesting, AI, research or broker-write rule changed.
+#
 # v0.8.9 — read-only aggregate dashboard adapter only.
 # No production strategy, sizing, exit, harvesting, AI, research or broker-write rule changed.
 
@@ -5511,6 +5520,220 @@ def bco_accounting_performance_endpoint():
     current_open = safe_float(live.get("owned_unrealized_pl")) if live.get("ok") else None
     return bco_accounting_performance_summary(current_open_pnl=current_open)
 
+
+def _bco_stored_time_to_utc(value: Any) -> Optional[datetime]:
+    """Resolve stored BCO timestamps to an aware UTC datetime.
+
+    TradingView candle/entry timestamps may be naive and are interpreted in the
+    configured BCO signal timezone. Broker/accounting timestamps are normally
+    offset-aware ISO values and retain their supplied offset.
+    """
+    s = safe_str(value)
+    if not s:
+        return None
+
+    # First accept normal ISO strings, including broker UTC "Z" timestamps.
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_bco_zone(BCO_SIGNAL_CANDLE_TIMEZONE))
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt).replace(
+                tzinfo=_bco_zone(BCO_SIGNAL_CANDLE_TIMEZONE)
+            )
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def _bco_broker_open_pl_near_time(
+    conn: DBConn,
+    target_time: Any,
+    max_distance_seconds: float = 5400.0,
+) -> Dict[str, Any]:
+    """Return persisted broker BCO open P&L nearest a point-in-time candle.
+
+    accounting_snapshots.bco_open_pl is the authoritative broker-basis open P&L
+    already used by BCO accounting. Restricting the lookup to a bounded window
+    prevents an old unrelated snapshot from being presented as the HWM cash value.
+    """
+    target_dt = _bco_stored_time_to_utc(target_time)
+    if target_dt is None:
+        return {
+            "open_pnl_gbp": None,
+            "snapshot_time_utc": "",
+            "distance_seconds": None,
+            "source": "MISSING_TARGET_TIME",
+        }
+
+    span = timedelta(seconds=max(60.0, float(max_distance_seconds)))
+    lo = (target_dt - span).isoformat()
+    hi = (target_dt + span).isoformat()
+    rows = fetchall_dict(conn.execute("""
+        SELECT created_at_utc,bco_open_pl
+        FROM accounting_snapshots
+        WHERE created_at_utc>=? AND created_at_utc<=?
+          AND bco_open_pl IS NOT NULL
+        ORDER BY created_at_utc ASC,id ASC
+    """, (lo, hi)))
+
+    best = None
+    best_distance = None
+    for row in rows:
+        row_dt = _bco_stored_time_to_utc(row.get("created_at_utc"))
+        value = safe_float(row.get("bco_open_pl"))
+        if row_dt is None or value is None:
+            continue
+        distance = abs((row_dt - target_dt).total_seconds())
+        if best_distance is None or distance < best_distance:
+            best = row
+            best_distance = distance
+
+    return {
+        "open_pnl_gbp": safe_float((best or {}).get("bco_open_pl")),
+        "snapshot_time_utc": safe_str((best or {}).get("created_at_utc")),
+        "distance_seconds": best_distance,
+        "source": "BROKER_ACCOUNTING_SNAPSHOT_AT_R_HWM" if best else "NO_NEARBY_ACCOUNTING_SNAPSHOT",
+    }
+
+
+def _bco_effective_risk_open_pl_at_hwm(
+    conn: DBConn,
+    cycle_id: str,
+    hwm_time: Any,
+    hwm_price: Optional[float],
+) -> Dict[str, Any]:
+    """Fallback £ reconstruction at the SAME R-HWM candle.
+
+    This is used only when no nearby persisted OANDA accounting snapshot exists.
+    It values trades that were open at the HWM candle using their actual stored
+    effective £ risk, rather than the nominal £5 strategy request.
+    """
+    target_dt = _bco_stored_time_to_utc(hwm_time)
+    price = safe_float(hwm_price)
+    if target_dt is None or price is None or price <= 0 or not safe_str(cycle_id):
+        return {
+            "open_pnl_gbp": None,
+            "trade_count": 0,
+            "source": "EFFECTIVE_RISK_RECONSTRUCTION_UNAVAILABLE",
+        }
+
+    rows = fetchall_dict(conn.execute(
+        "SELECT * FROM trades WHERE cycle_id=? ORDER BY id ASC",
+        (safe_str(cycle_id),),
+    ))
+    total = 0.0
+    count = 0
+    for trade in rows:
+        if safe_str(trade.get("status")).upper() == "ENTRY_FAILED":
+            continue
+        entry_dt = _bco_stored_time_to_utc(trade.get("entry_time"))
+        if entry_dt is None or entry_dt > target_dt:
+            continue
+        exit_dt = _bco_stored_time_to_utc(trade.get("exit_time"))
+        if exit_dt is not None and exit_dt < target_dt:
+            continue
+
+        entry = safe_float(trade.get("entry_price"))
+        sl_pct = safe_float(trade.get("sl_pct")) or BCO_SL_PCT
+        effective_risk = (
+            safe_float(trade.get("effective_risk_gbp"))
+            or safe_float(trade.get("requested_risk_gbp"))
+        )
+        if entry is None or entry <= 0 or sl_pct <= 0 or effective_risk is None:
+            continue
+
+        rr = (((float(price) - float(entry)) / float(entry)) * 100.0) / float(sl_pct)
+        total += rr * float(effective_risk)
+        count += 1
+
+    return {
+        "open_pnl_gbp": total if count else None,
+        "trade_count": count,
+        "source": "EFFECTIVE_RISK_RECONSTRUCTION_AT_R_HWM" if count else "EFFECTIVE_RISK_RECONSTRUCTION_EMPTY",
+    }
+
+
+def _bco_cash_hwm_at_r_hwm(
+    conn: DBConn,
+    cycle_id: str,
+    hwm_r: float,
+    hwm_time: Any,
+) -> Dict[str, Any]:
+    """Cash value of the basket at the exact model-R HWM observation.
+
+    Priority:
+      1) persisted OANDA BCO open P&L nearest that candle;
+      2) effective-risk weighted reconstruction at that candle.
+    Never fall back to hwm_r × nominal requested £ risk.
+    """
+    if float(hwm_r or 0.0) <= 0 or not safe_str(cycle_id):
+        return {
+            "high_water_gbp": 0.0,
+            "source": "FLAT_OR_NO_HWM",
+            "broker_snapshot_time_utc": "",
+            "broker_snapshot_distance_seconds": None,
+            "hwm_signal_time": safe_str(hwm_time),
+            "hwm_signal_price": None,
+        }
+
+    hwm_row = fetchone_dict(conn.execute("""
+        SELECT raw_signal_id,signal_time,created_at_utc,basket_R,high_water_R
+        FROM basket_snapshots
+        WHERE cycle_id=? AND high_water_R>=?
+        ORDER BY id ASC LIMIT 1
+    """, (safe_str(cycle_id), float(hwm_r) - 0.000001))) or {}
+
+    exact_signal_time = safe_str(hwm_time) or safe_str(
+        hwm_row.get("signal_time") or hwm_row.get("created_at_utc")
+    )
+    raw_signal_id = int(safe_float(hwm_row.get("raw_signal_id")) or 0)
+    hwm_price = None
+    if raw_signal_id > 0:
+        raw = fetchone_dict(conn.execute(
+            "SELECT exec_close FROM raw_signals WHERE id=? LIMIT 1",
+            (raw_signal_id,),
+        )) or {}
+        hwm_price = safe_float(raw.get("exec_close"))
+
+    broker_basis = _bco_broker_open_pl_near_time(conn, exact_signal_time)
+    broker_value = safe_float(broker_basis.get("open_pnl_gbp"))
+    if broker_value is not None:
+        return {
+            "high_water_gbp": float(broker_value),
+            "source": broker_basis.get("source"),
+            "broker_snapshot_time_utc": broker_basis.get("snapshot_time_utc"),
+            "broker_snapshot_distance_seconds": broker_basis.get("distance_seconds"),
+            "hwm_signal_time": exact_signal_time,
+            "hwm_signal_price": hwm_price,
+        }
+
+    reconstructed = _bco_effective_risk_open_pl_at_hwm(
+        conn, cycle_id, exact_signal_time, hwm_price
+    )
+    return {
+        "high_water_gbp": safe_float(reconstructed.get("open_pnl_gbp")),
+        "source": reconstructed.get("source"),
+        "broker_snapshot_time_utc": "",
+        "broker_snapshot_distance_seconds": None,
+        "hwm_signal_time": exact_signal_time,
+        "hwm_signal_price": hwm_price,
+        "reconstructed_trade_count": int(reconstructed.get("trade_count") or 0),
+    }
+
+
 def _bco_standard_top_uncached():
     s=snapshot();basket=s.get("basket") or {};lm=s.get("live_local_basket") or {}
     acct=s.get("account") or {};broker=s.get("broker_live") or {};safety=s.get("broker_safety") or {}
@@ -5532,23 +5755,29 @@ def _bco_standard_top_uncached():
         hwm = 0.0
         hwm_time = ""
 
-    hwm_gbp=None
-    if hwm > 0:
-        current_cycle=safe_str(basket.get("cycle_id"))
+    # v0.8.10: £ high-water must use the SAME broker-P&L basis as the
+    # current Broker P&L tile. The R high-water remains the deterministic
+    # basket-manager measure; cash is the persisted OANDA BCO open P&L nearest
+    # that exact HWM candle (with an effective-risk reconstruction fallback).
+    # Never use hwm × nominal requested £5: BCO's real £/R varies with OANDA
+    # whole-unit sizing and quote/home conversion.
+    current_cycle=safe_str(basket.get("cycle_id"))
+    hwm_cash = {
+        "high_water_gbp": 0.0 if authoritative_flat else None,
+        "source": "FLAT_OR_NO_HWM" if authoritative_flat else "UNRESOLVED",
+        "broker_snapshot_time_utc": "",
+        "broker_snapshot_distance_seconds": None,
+        "hwm_signal_time": hwm_time,
+        "hwm_signal_price": None,
+    }
+    if hwm > 0 and current_cycle:
         with get_conn() as _hwm_conn:
-            _hrow=fetchone_dict(_hwm_conn.execute("""
-                SELECT basket_pnl_gbp,signal_time,created_at_utc
-                FROM basket_snapshots
-                WHERE cycle_id=?
-                  AND high_water_R>=?
-                  AND basket_R>=?
-                ORDER BY id ASC LIMIT 1
-            """,(current_cycle,hwm-0.000001,hwm-0.000001))) or {}
-        hwm_gbp=safe_float(_hrow.get("basket_pnl_gbp"))
+            hwm_cash = _bco_cash_hwm_at_r_hwm(
+                _hwm_conn, current_cycle, hwm, hwm_time
+            )
         if not hwm_time:
-            hwm_time=safe_str(_hrow.get("signal_time") or _hrow.get("created_at_utc"))
-    if hwm_gbp is None:
-        hwm_gbp=hwm*float(BCO_RISK_PER_TRADE_GBP)
+            hwm_time=safe_str(hwm_cash.get("hwm_signal_time"))
+    hwm_gbp=safe_float(hwm_cash.get("high_water_gbp"))
     give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     current_open_basket_gbp=safe_float(lm.get("basket_pnl_gbp")) or 0.0
     realized_pnl=safe_float(closed.get("p")) or 0.0
@@ -5563,11 +5792,15 @@ def _bco_standard_top_uncached():
     current_giveback_basis_r=basket_r
 
     giveback_r=max(0.0,hwm-current_giveback_basis_r)
-    giveback_gbp=max(0.0,float(hwm_gbp or 0.0)-current_giveback_basis_gbp)
+    giveback_gbp=(
+        max(0.0,float(hwm_gbp)-current_giveback_basis_gbp)
+        if hwm_gbp is not None
+        else None
+    )
     giveback_cash_pct=(
-        (giveback_gbp/float(hwm_gbp)*100.0)
-        if hwm_gbp is not None and float(hwm_gbp)>0
-        else 0.0
+        (float(giveback_gbp)/float(hwm_gbp)*100.0)
+        if giveback_gbp is not None and hwm_gbp is not None and float(hwm_gbp)>0
+        else None
     )
     now=datetime.now(timezone.utc);ws=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
     with get_conn() as conn:
@@ -5636,7 +5869,11 @@ def _bco_standard_top_uncached():
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
                   "open_trades":broker_open,"local_open_trades":local_open,
                   "mature_48h_plus":mature,"oldest_hold":oldest,"basket_r":basket_r,
-                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,"giveback_basis_r":current_giveback_basis_r,
+                  "high_water_r":hwm,"high_water_gbp":hwm_gbp,"high_water_time":hwm_time,
+                  "high_water_gbp_source":safe_str(hwm_cash.get("source")),
+                  "high_water_gbp_snapshot_time_utc":safe_str(hwm_cash.get("broker_snapshot_time_utc")),
+                  "high_water_gbp_snapshot_distance_seconds":safe_float(hwm_cash.get("broker_snapshot_distance_seconds")),
+                  "giveback_basis_r":current_giveback_basis_r,
                   "giveback_basis_gbp":current_giveback_basis_gbp,
                   "giveback_r":giveback_r,"giveback_gbp":giveback_gbp,
                   "giveback_pct":giveback_cash_pct,
@@ -5730,6 +5967,8 @@ def aggregate_portfolio_summary(
             "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
             "high_water_r": safe_float(strategy.get("high_water_r")),
             "high_water_at_utc": safe_str(strategy.get("high_water_time")) or None,
+            "high_water_gbp_source": safe_str(strategy.get("high_water_gbp_source")) or None,
+            "high_water_gbp_snapshot_at_utc": safe_str(strategy.get("high_water_gbp_snapshot_time_utc")) or None,
             "giveback_gbp": safe_float(strategy.get("giveback_gbp")),
             "giveback_r": safe_float(strategy.get("giveback_r")),
         },
@@ -6831,12 +7070,12 @@ details{{background:var(--panel);border:1px solid var(--border);border-radius:10
 <div class="links"><a href="/dashboard-full">Full legacy dashboard</a><a href="/health">Health</a><a href="/snapshot">Broker control JSON</a></div><div class="export-actions"><a class="export-btn" href="/export/all.zip">⬇ BCO Analysis ZIP</a><a class="export-btn research" href="/export/bco-focused-research.zip">⬇ BCO Research ZIP</a></div><h2>Details</h2>{sections}</div>
 <script>
 function eh(v){{return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}}function money(v){{const n=Number(v);if(!Number.isFinite(n))return'n/a';return(n<0?'-':'')+'£'+Math.abs(n).toLocaleString('en-GB',{{minimumFractionDigits:2,maximumFractionDigits:2}})}}function cls(v){{const n=Number(v);return!Number.isFinite(n)||n===0?'':(n>0?'pos':'neg')}}function card(l,v,s='',c=''){{return`<div class="card"><div class="label">${{eh(l)}}</div><div class="value ${{c}}">${{v}}</div><div class="small">${{s}}</div></div>`}}function localTime(iso){{if(!iso)return'';const d=new Date(iso);if(Number.isNaN(d.getTime()))return eh(iso);return new Intl.DateTimeFormat('en-GB',{{timeZone:'Europe/London',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZoneName:'short'}}).format(d)}}
-async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}},ac=d.accounting||{{}};const gb=Number(s.giveback_pct||0),gbc=gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
+async function loadTop(force=false){{const st=document.getElementById('topStatus'),t0=performance.now();try{{const r=await fetch('/dashboard/top'+(force?'?force=true':''),{{cache:'no-store'}});const d=await r.json();if(!r.ok||d.status!=='ok')throw new Error(d.error||`HTTP ${{r.status}}`);const a=d.account||{{}},s=d.strategy||{{}},g=d.signals||{{}},c=d.config||{{}},ac=d.accounting||{{}};const gbRaw=Number(s.giveback_pct),gb=Number.isFinite(gbRaw)?gbRaw:null,gbc=gb===null?'':gb>=70?'neg':gb>=40?'warn':'pos';document.getElementById('topTiles').innerHTML=`
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
 ${{card('Broker P&L',money(s.headline_pnl),`Open broker P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
 ${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
-${{card('Giveback',`${{money(s.giveback_gbp)}} · ${{Number(s.giveback_pct||0).toFixed(1)}}%`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,Number(s.giveback_pct||0)>=50?'neg':Number(s.giveback_pct||0)>=25?'warn':'pos')}}</div>
+${{card('Giveback',`${{money(s.giveback_gbp)}}${{gb===null?'':' · '+gb.toFixed(1)+'%'}}`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,gb===null?'':gb>=50?'neg':gb>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
