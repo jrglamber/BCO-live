@@ -36,11 +36,39 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.10 — Broker-Basis High Water + Aggregate Link + Audit Bookkeeping"
-APP_VERSION = "0.8.10"
-POLICY_VERSION = "bco_v0.8.10_broker_basis_high_water_2026_09_09"
+APP_NAME = "Project Exit Plan — BCO v0.8.12 — ATR2 Next-Cycle Promotion + Classic Control"
+APP_VERSION = "0.8.12"
+POLICY_VERSION = "bco_v0.8.12_atr2_next_cycle_promotion_2026_09_10"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.12 — cycle-bound exit-manager promotion.
+# - The basket active at first v0.8.12 bootstrap is permanently pinned to
+#   CLASSIC, so deployment cannot change the manager mid-cycle.
+# - Every subsequent new BCO basket is pinned to ATR2_CHANDELIER by default.
+# - ATR2 production keeps the 3.5% hard stop and 48h minimum hold, then arms a
+#   2ATR Chandelier stop from completed hourly information. A newly calculated
+#   trail is never treated as if it existed earlier in the same candle.
+# - For ATR2 cycles, deterministic tide/defence still blocks new entries when
+#   appropriate, but mechanical basket-defence closures are suppressed so ATR2
+#   owns trade exits. The existing 50R family harvesting layer remains active.
+# - CLASSIC_MANAGER is added as a forward research shadow/control; MFE50 remains
+#   research-only. New v2 ATR2/MFE shadows use executable next-interval stop
+#   sequencing matching production; existing v1 rows retain their historical
+#   same-candle research semantics and are never rewritten.
+# - PRACTICE -> LIVE is NOT automatic. When both local and OANDA BCO exposure are
+#   flat the app reports READY_FOR_MANUAL_LIVE_CUTOVER; Railway/OANDA live
+#   credentials and safety gates still require an explicit manual cutover.
+# No entry signal rule, 50R harvesting rule, AI authority, or £5 risk target changed.
+#
+# v0.8.11 — BCO execution sizing refinement only.
+# The £5 target risk is unchanged. When broker unit precision forces a discrete
+# size, the app now prefers the next allowed unit step ABOVE the target only
+# when effective risk remains within BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT
+# (default 10%, i.e. max £5.50 for a £5 target). Otherwise it falls back to
+# the lower allowed unit size. Existing broker spread/risk guardrails remain
+# in force. No entry signal, exit, basket defence, harvesting, AI or research
+# rule changed.
+#
 # v0.8.10 — display/accounting consistency repair only.
 # Cash high-water and cash giveback now use the same broker-P&L basis as the
 # current Broker P&L tile. The £ high-water is sourced from the persisted
@@ -219,6 +247,11 @@ BCO_FRESH_SIGNAL_MAX_AGE_SECONDS = max(60, int(float(os.getenv("BCO_FRESH_SIGNAL
 BCO_EXECUTION_MULTIPLIER = 1.00  # hard lock; research cannot alter live sizing.
 BCO_ENTRY_PREVIEW_MAX_ATTEMPTS = max(1, min(int(float(os.getenv("BCO_ENTRY_PREVIEW_MAX_ATTEMPTS", "3"))), 5))
 BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS = max(0.1, min(float(os.getenv("BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS", "0.35")), 2.0))
+# v0.8.11: prefer the next broker-valid unit step when it lands just above
+# target risk, but never more than this dedicated sizing tolerance.
+BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT = max(
+    0.0, min(float(os.getenv("BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT", "10")), 100.0)
+)
 
 # Managed runner protection, mirroring the current live philosophy.
 BCO_PROTECT_48 = float(os.getenv("BCO_PROTECT_48", "0.25"))
@@ -314,8 +347,23 @@ BCO_DISPLAY_TIME_LABEL = os.getenv("BCO_DISPLAY_TIME_LABEL", "UK").strip() or "U
 # v0.8.0 — BCO EXIT CHALLENGERS, FORWARD SHADOW ONLY.
 # These settings are NEVER consumed by live entry/exit/stop/banking/broker code.
 BCO_EXIT_SHADOW_ENABLED = env_bool("BCO_EXIT_SHADOW_ENABLED", True)
-BCO_EXIT_SHADOW_VERSION = "bco_exit_shadow_v1_mfe50_atr2_2026_08_27"
+BCO_EXIT_SHADOW_VERSION = "bco_exit_shadow_v2_executable_controls_2026_09_10"
 BCO_EXIT_SHADOW_MIN_HOLD_HOURS = 48
+
+# v0.8.12 production manager promotion. The active basket at first bootstrap
+# is pinned CLASSIC. New cycles after that anchor use ATR2 by default.
+BCO_EXIT_MANAGER_CLASSIC = "CLASSIC"
+BCO_EXIT_MANAGER_ATR2 = "ATR2_CHANDELIER"
+_BCO_NEW_MANAGER_RAW = os.getenv("BCO_NEW_CYCLE_EXIT_MANAGER", BCO_EXIT_MANAGER_ATR2).strip().upper()
+BCO_NEW_CYCLE_EXIT_MANAGER = (
+    _BCO_NEW_MANAGER_RAW
+    if _BCO_NEW_MANAGER_RAW in {BCO_EXIT_MANAGER_CLASSIC, BCO_EXIT_MANAGER_ATR2}
+    else BCO_EXIT_MANAGER_ATR2
+)
+BCO_EXIT_MANAGER_PROMOTION_STATE_KEY = "bco_exit_manager_promotion_v1_initialized"
+BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY = "bco_exit_manager_promotion_anchor_cycle"
+BCO_EXIT_MANAGER_ANCHOR_PENDING_KEY = "bco_exit_manager_promotion_anchor_pending"
+BCO_EXIT_MANAGER_LAST_COMPLETED_KEY = "bco_exit_manager_last_completed"
 BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION = 0.50
 BCO_EXIT_SHADOW_ATR_MULTIPLIER = 2.0
 BCO_EXIT_SHADOW_ATR_PERIOD = 14
@@ -1411,6 +1459,88 @@ def format_oanda_price(value: float, precision: int) -> str:
     return f"{float(value):.{p}f}"
 
 
+
+def bco_choose_discrete_units(
+    raw_units: float,
+    units_precision: int,
+    minimum_trade_size: float,
+    risk_per_unit_home: float,
+    target_risk_gbp: float,
+    round_up_max_overage_pct: float = BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT,
+) -> Dict[str, Any]:
+    """Choose the broker-valid BCO size closest to the £ risk target.
+
+    v0.8.11 policy:
+      - calculate the lower and upper broker-valid unit steps around raw size;
+      - prefer the UPPER step when it reaches/exceeds target risk and is no more
+        than the configured overage tolerance above target;
+      - otherwise use the LOWER step;
+      - always respect the broker minimum trade size.
+
+    For BCO_USD with tradeUnitsPrecision=0 this means, for example, raw 1.98
+    units can become 2 units when 2 units risk <= £5.50 for a £5 target, while
+    a materially oversized 2-unit risk falls back to 1 unit.
+    """
+    raw = max(0.0, float(raw_units or 0.0))
+    precision = max(0, int(units_precision or 0))
+    minimum = max(0.0, float(minimum_trade_size or 0.0))
+    risk_per_unit = max(0.0, float(risk_per_unit_home or 0.0))
+    target = max(0.0, float(target_risk_gbp or 0.0))
+    tolerance = max(0.0, float(round_up_max_overage_pct or 0.0))
+
+    step = 10.0 ** (-precision)
+    scale = 10 ** precision
+
+    lower_units = math.floor(raw * scale + 1e-12) / scale
+    upper_units = math.ceil(raw * scale - 1e-12) / scale
+
+    lower_units = max(lower_units, minimum)
+    upper_units = max(upper_units, minimum)
+
+    lower_risk = lower_units * risk_per_unit
+    upper_risk = upper_units * risk_per_unit
+
+    max_round_up_risk = target * (1.0 + tolerance / 100.0)
+    can_round_up = bool(
+        target > 0
+        and risk_per_unit > 0
+        and upper_units >= lower_units
+        and upper_risk >= target - 1e-12
+        and upper_risk <= max_round_up_risk + 1e-12
+    )
+
+    if can_round_up:
+        chosen_units = upper_units
+        chosen_risk = upper_risk
+        method = "ROUND_UP_WITHIN_TOLERANCE" if upper_units > lower_units + 1e-12 else "EXACT_TARGET_STEP"
+    else:
+        chosen_units = lower_units
+        chosen_risk = lower_risk
+        method = "LOWER_STEP"
+
+    # If the minimum itself is the only broker-valid size, keep it and let the
+    # existing risk-overage guardrail decide whether the order may execute.
+    used_minimum = bool(chosen_units <= minimum + (step / 10.0))
+
+    overage_pct = ((chosen_risk / target) - 1.0) * 100.0 if target > 0 else 0.0
+
+    return {
+        "units": chosen_units,
+        "effective_risk_gbp": chosen_risk,
+        "risk_overage_pct": overage_pct,
+        "rounding_method": method,
+        "raw_units": raw,
+        "lower_units": lower_units,
+        "upper_units": upper_units,
+        "lower_effective_risk_gbp": lower_risk,
+        "upper_effective_risk_gbp": upper_risk,
+        "round_up_max_overage_pct": tolerance,
+        "max_round_up_risk_gbp": max_round_up_risk,
+        "used_minimum_trade_size": used_minimum,
+        "units_step": step,
+    }
+
+
 def risk_preview(target_risk_gbp: float = BCO_RISK_PER_TRADE_GBP) -> Dict[str, Any]:
     inst = BCO_OANDA_INSTRUMENT
     if not inst:
@@ -1431,20 +1561,35 @@ def risk_preview(target_risk_gbp: float = BCO_RISK_PER_TRADE_GBP) -> Dict[str, A
     precision = int(safe_float(details.get("tradeUnitsPrecision")) or 0)
     display_precision = int(safe_float(details.get("displayPrecision")) or 0)
     minimum = float(safe_float(details.get("minimumTradeSize")) or 1.0)
-    units = floor_to_precision(raw_units, precision)
-    used_min = False
-    if units < minimum:
-        units = minimum
-        used_min = True
-    effective_risk = units * risk_per_unit_home
-    overage_pct = ((effective_risk / target_risk_gbp) - 1.0) * 100.0 if target_risk_gbp > 0 else 0.0
+
+    sizing = bco_choose_discrete_units(
+        raw_units=raw_units,
+        units_precision=precision,
+        minimum_trade_size=minimum,
+        risk_per_unit_home=risk_per_unit_home,
+        target_risk_gbp=float(target_risk_gbp),
+        round_up_max_overage_pct=BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT,
+    )
+    units = float(sizing["units"])
+    effective_risk = float(sizing["effective_risk_gbp"])
+    overage_pct = float(sizing["risk_overage_pct"])
+
     return {
         "ok": True, "instrument": inst, "target_risk_gbp": target_risk_gbp, "entry_price": entry,
         "stop_price": sl_price, "stop_price_formatted": format_oanda_price(sl_price, display_precision),
         "display_precision": display_precision, "sl_pct": BCO_SL_PCT, "units": units, "raw_units": raw_units,
-        "units_precision": precision, "minimum_trade_size": minimum, "used_minimum_trade_size": used_min,
+        "units_precision": precision, "minimum_trade_size": minimum,
+        "used_minimum_trade_size": bool(sizing.get("used_minimum_trade_size")),
         "effective_risk_gbp": effective_risk, "risk_overage_pct": overage_pct,
+        "rounding_method": sizing.get("rounding_method"),
+        "lower_units": sizing.get("lower_units"), "upper_units": sizing.get("upper_units"),
+        "lower_effective_risk_gbp": sizing.get("lower_effective_risk_gbp"),
+        "upper_effective_risk_gbp": sizing.get("upper_effective_risk_gbp"),
+        "round_up_max_overage_pct": BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT,
+        "max_round_up_risk_gbp": sizing.get("max_round_up_risk_gbp"),
         "spread_pct": price.get("spread_pct"), "home_loss_conversion_factor": home_factor,
+        # Existing hard broker guardrail remains authoritative. The v0.8.11
+        # chooser itself is stricter when deliberately rounding ABOVE target.
         "acceptable_risk_overage": overage_pct <= BROKER_MAX_RISK_OVERAGE_PCT,
         "acceptable_spread": (safe_float(price.get("spread_pct")) or 0.0) <= BROKER_MAX_SPREAD_PCT,
     }
@@ -1480,6 +1625,120 @@ def runtime_set(conn: DBConn, key: str, value: Any) -> None:
             INSERT INTO runtime_state(key,value,updated_at_utc) VALUES(?,?,?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
         """, (key, val, now_utc_iso()))
+
+
+
+def _bco_cycle_manager_runtime_key(cycle_id: str) -> str:
+    return "bco_exit_manager_cycle::" + safe_str(cycle_id)
+
+
+def initialize_bco_exit_manager_promotion_state(conn: DBConn) -> Dict[str, Any]:
+    """One-time v0.8.12 migration that protects the already-active basket.
+
+    If deployment occurs while BCO is active, that existing cycle is anchored
+    to CLASSIC. If deployment occurs while flat, no legacy cycle is anchored
+    and the next cycle receives the configured new-cycle manager (ATR2 by default).
+    """
+    initialized = runtime_get(conn, BCO_EXIT_MANAGER_PROMOTION_STATE_KEY, "")
+    if initialized:
+        anchor = runtime_get(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, "")
+        pending = parse_bool(runtime_get(conn, BCO_EXIT_MANAGER_ANCHOR_PENDING_KEY, "false"), False)
+        return {
+            "initialized": True,
+            "anchor_cycle_id": anchor,
+            "anchor_pending": pending,
+            "next_cycle_manager": BCO_NEW_CYCLE_EXIT_MANAGER,
+        }
+
+    state = fetchone_dict(conn.execute(
+        "SELECT cycle_id,status,open_count FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+    )) or {}
+    open_row = fetchone_dict(conn.execute(
+        "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+    )) or {}
+    # The trade ledger is authoritative for whether legacy exposure actually
+    # exists. basket_state.open_count can be stale briefly around reconciliation.
+    open_count = int(safe_float(open_row.get("c")) or 0)
+    cycle = safe_str(state.get("cycle_id"))
+
+    if not cycle and open_count > 0:
+        row = fetchone_dict(conn.execute(
+            """SELECT cycle_id,COUNT(*) AS c
+               FROM trades
+               WHERE status='OPEN' AND COALESCE(cycle_id,'')<>''
+               GROUP BY cycle_id ORDER BY c DESC LIMIT 1"""
+        )) or {}
+        cycle = safe_str(row.get("cycle_id"))
+
+    anchor_pending = bool(open_count > 0 and not cycle)
+    if open_count > 0 and cycle:
+        runtime_set(conn, _bco_cycle_manager_runtime_key(cycle), BCO_EXIT_MANAGER_CLASSIC)
+        runtime_set(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, cycle)
+    else:
+        runtime_set(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, "")
+
+    runtime_set(conn, BCO_EXIT_MANAGER_ANCHOR_PENDING_KEY, "true" if anchor_pending else "false")
+    runtime_set(conn, "bco_exit_manager_default_new_cycle", BCO_NEW_CYCLE_EXIT_MANAGER)
+    runtime_set(conn, BCO_EXIT_MANAGER_PROMOTION_STATE_KEY, now_utc_iso())
+
+    return {
+        "initialized": True,
+        "anchor_cycle_id": cycle if open_count > 0 else "",
+        "anchor_pending": anchor_pending,
+        "open_count_at_init": open_count,
+        "next_cycle_manager": BCO_NEW_CYCLE_EXIT_MANAGER,
+    }
+
+
+def bco_cycle_exit_manager(conn: DBConn, cycle_id: str, assign: bool = True) -> str:
+    """Return/pin the manager for one economic basket cycle."""
+    cycle = safe_str(cycle_id)
+    if not cycle:
+        return BCO_NEW_CYCLE_EXIT_MANAGER
+
+    initialize_bco_exit_manager_promotion_state(conn)
+    key = _bco_cycle_manager_runtime_key(cycle)
+    existing = runtime_get(conn, key, "").upper()
+    if existing in {BCO_EXIT_MANAGER_CLASSIC, BCO_EXIT_MANAGER_ATR2}:
+        return existing
+    if not assign:
+        return ""
+
+    anchor = runtime_get(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, "")
+    anchor_pending = parse_bool(
+        runtime_get(conn, BCO_EXIT_MANAGER_ANCHOR_PENDING_KEY, "false"), False
+    )
+
+    if anchor_pending and not anchor:
+        manager = BCO_EXIT_MANAGER_CLASSIC
+        runtime_set(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, cycle)
+        runtime_set(conn, BCO_EXIT_MANAGER_ANCHOR_PENDING_KEY, "false")
+    elif cycle == anchor and anchor:
+        manager = BCO_EXIT_MANAGER_CLASSIC
+    else:
+        manager = BCO_NEW_CYCLE_EXIT_MANAGER
+
+    runtime_set(conn, key, manager)
+    runtime_set(conn, "bco_exit_manager_last_assigned_cycle", cycle)
+    runtime_set(conn, "bco_exit_manager_last_assigned_manager", manager)
+    return manager
+
+
+def bco_exit_manager_status(conn: DBConn) -> Dict[str, Any]:
+    initialize_bco_exit_manager_promotion_state(conn)
+    state = fetchone_dict(conn.execute(
+        "SELECT cycle_id,status,open_count FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+    )) or {}
+    cycle = safe_str(state.get("cycle_id"))
+    current = bco_cycle_exit_manager(conn, cycle) if cycle else ""
+    return {
+        "current_cycle_id": cycle,
+        "current_manager": current or "FLAT",
+        "next_cycle_manager": BCO_NEW_CYCLE_EXIT_MANAGER,
+        "anchor_cycle_id": runtime_get(conn, BCO_EXIT_MANAGER_ANCHOR_CYCLE_KEY, ""),
+        "last_completed": runtime_get(conn, BCO_EXIT_MANAGER_LAST_COMPLETED_KEY, ""),
+        "promotion_initialized_at": runtime_get(conn, BCO_EXIT_MANAGER_PROMOTION_STATE_KEY, ""),
+    }
 
 
 def _iso_age_seconds(value: Any) -> Optional[float]:
@@ -2223,6 +2482,20 @@ def reset_flat_bco_basket_state(
             "local_open": 0,
         }
 
+    previous_cycle = safe_str(previous.get("cycle_id"))
+    if previous_cycle:
+        previous_manager = bco_cycle_exit_manager(conn, previous_cycle, assign=True)
+        runtime_set(
+            conn,
+            BCO_EXIT_MANAGER_LAST_COMPLETED_KEY,
+            json.dumps({
+                "cycle_id": previous_cycle,
+                "manager": previous_manager,
+                "completed_at": observed_at or now_utc_iso(),
+                "reason": safe_str(reason),
+            }, separators=(",", ":")),
+        )
+
     conn.execute("""
         UPDATE basket_state
         SET status='FLAT',
@@ -2269,7 +2542,10 @@ def ensure_cycle(conn: DBConn, signal_time: str, metrics: Dict[str, Any]) -> Dic
                 realized_R_cycle=0,banked_R_cycle=0,updated_at_utc=? WHERE singleton_key='BCO_LONG'
         """, (cycle, signal_time, signal_time, now_utc_iso()))
         conn.execute("UPDATE trades SET cycle_id=? WHERE status='OPEN' AND (cycle_id IS NULL OR cycle_id='')", (cycle,))
+        bco_cycle_exit_manager(conn, cycle, assign=True)
         state = fetchone_dict(conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'")) or {}
+    elif safe_str(state.get("cycle_id")):
+        bco_cycle_exit_manager(conn, safe_str(state.get("cycle_id")), assign=True)
     return state
 
 
@@ -2430,7 +2706,242 @@ def set_managed_stop(conn: DBConn, trade: Dict[str, Any], current: float, fracti
     return True
 
 
+
+def set_atr2_managed_stop(
+    conn: DBConn,
+    trade: Dict[str, Any],
+    current: float,
+    candidate_stop: float,
+    signal_time: str,
+    atr14: Optional[float],
+) -> bool:
+    """Tighten the real/simulated stop to the executable ATR2 level.
+
+    The stop is calculated only after the completed hourly candle and therefore
+    protects the NEXT interval. It never claims a newly calculated stop was
+    available earlier in the same candle.
+    """
+    entry = float(safe_float(trade.get("entry_price")) or 0.0)
+    hard = float(
+        safe_float(trade.get("hard_sl_price"))
+        or (entry * (1.0 - BCO_SL_PCT / 100.0) if entry > 0 else 0.0)
+    )
+    old = safe_float(trade.get("managed_stop_price"))
+    if entry <= 0 or current <= 0:
+        return False
+
+    new = max(hard, float(candidate_stop))
+    if old is not None:
+        new = max(new, float(old))
+
+    # A long protective stop must remain below the current executable market.
+    if new >= float(current):
+        return False
+
+    min_step = entry * BCO_MIN_STOP_STEP_PCT / 100.0
+    if old is not None and new <= float(old) + min_step:
+        return False
+
+    broker_id = safe_str(trade.get("broker_trade_id"))
+    if broker_id and not BCO_AUTO_MANAGEMENT_ENABLED:
+        return False
+
+    write_success = True
+    if broker_id and BCO_AUTO_MANAGEMENT_ENABLED:
+        wr = update_broker_stop(broker_id, new, safe_str(trade.get("trade_id")))
+        write_success = bool(wr.get("ok"))
+        if not write_success:
+            conn.execute("""
+                INSERT INTO managed_stop_events(
+                    created_at_utc,signal_time,cycle_id,trade_id,broker_trade_id,
+                    hold_candles,event_type,rule_stage,old_stop_price,new_stop_price,
+                    protect_fraction,protected_R,broker_write_success,note
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                now_utc_iso(), signal_time, trade.get("cycle_id"), trade.get("trade_id"),
+                broker_id, trade.get("hold_candles"), "POST48_ATR2_STOP",
+                "ATR2_CHANDELIER", old, new, None,
+                ((new-entry)/entry*100.0)/BCO_SL_PCT, False,
+                f"ATR2 broker stop write failed; queued retry. ATR14={safe_float(atr14)}",
+            ))
+            enqueue_broker_action(
+                conn, "UPDATE_STOP", trade, "POST48_ATR2_STOP:ATR2_CHANDELIER",
+                desired_stop_price=new,
+                error=safe_str(wr.get("error") or "ATR2 stop write failed"),
+            )
+            return False
+
+    conn.execute(
+        """UPDATE trades
+           SET managed_stop_price=?,managed_stop_stage='ATR2_CHANDELIER',updated_at_utc=?
+           WHERE trade_id=?""",
+        (new, now_utc_iso(), trade.get("trade_id")),
+    )
+    conn.execute("""
+        INSERT INTO managed_stop_events(
+            created_at_utc,signal_time,cycle_id,trade_id,broker_trade_id,
+            hold_candles,event_type,rule_stage,old_stop_price,new_stop_price,
+            protect_fraction,protected_R,broker_write_success,note
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        now_utc_iso(), signal_time, trade.get("cycle_id"), trade.get("trade_id"),
+        broker_id, trade.get("hold_candles"), "POST48_ATR2_STOP",
+        "ATR2_CHANDELIER", old, new, None,
+        ((new-entry)/entry*100.0)/BCO_SL_PCT, write_success,
+        f"Executable next-interval ATR2 trail. ATR14={safe_float(atr14)}; multiplier={BCO_EXIT_SHADOW_ATR_MULTIPLIER:.2f}.",
+    ))
+    return True
+
+
+def update_trade_on_signal_atr2(
+    conn: DBConn,
+    trade: Dict[str, Any],
+    signal: Dict[str, Any],
+    support: Dict[str, Any],
+    raw_signal_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Production ATR2 manager for cycles pinned ATR2_CHANDELIER."""
+    signal_time = safe_str(signal.get("timestamp_readable"))
+    current = safe_float(signal.get("exec_close"))
+    hi = safe_float(signal.get("exec_high"))
+    lo = safe_float(signal.get("exec_low"))
+    entry = safe_float(trade.get("entry_price"))
+    if current is None or entry is None or entry <= 0:
+        return {"closed": False, "manager": BCO_EXIT_MANAGER_ATR2}
+
+    current = float(current)
+    hi = float(hi if hi is not None else current)
+    lo = float(lo if lo is not None else current)
+    hold = int(safe_float(trade.get("hold_candles")) or 0) + 1
+    managed = safe_float(trade.get("managed_stop_price"))
+    hard = float(
+        safe_float(trade.get("hard_sl_price"))
+        or entry * (1.0 - BCO_SL_PCT / 100.0)
+    )
+
+    # For simulated/local positions, only a stop armed on the PRIOR completed
+    # candle can be hit by this candle. Broker-linked trades remain OANDA-authoritative.
+    if not safe_str(trade.get("broker_trade_id")):
+        if managed is not None and lo <= float(managed):
+            rr_stop = ((float(managed)-entry)/entry*100.0)/BCO_SL_PCT
+            ok, _ = execute_or_sim_close(
+                conn, trade, signal_time, float(managed),
+                "managed_stop:ATR2_CHANDELIER", rr_stop,
+            )
+            return {"closed": ok, "reason": "atr2_prior_trail", "R": rr_stop, "manager": BCO_EXIT_MANAGER_ATR2}
+        if lo <= hard:
+            ok, _ = execute_or_sim_close(
+                conn, trade, signal_time, hard, "emergency_sl", -1.0
+            )
+            return {"closed": ok, "reason": "emergency_sl", "R": -1.0, "manager": BCO_EXIT_MANAGER_ATR2}
+
+    highest = max(float(safe_float(trade.get("highest_high")) or entry), hi)
+    lowest = min(float(safe_float(trade.get("lowest_low")) or entry), lo)
+    ret = (current-entry)/entry*100.0
+    mfe = max(0.0, (highest-entry)/entry*100.0)
+    mae = min(0.0, (lowest-entry)/entry*100.0)
+    rr = ret/BCO_SL_PCT
+
+    record_fixed_48_outcome(conn, trade, signal_time, current, rr, mfe, mae, hold)
+    d48 = safe_str(trade.get("decision_48"))
+    d72 = safe_str(trade.get("decision_72"))
+    if hold >= 48 and not d48:
+        d48 = "atr2_active"
+    if hold >= 72 and not d72:
+        d72 = "atr2_active"
+
+    conn.execute("""
+        UPDATE trades SET
+            current_price=?,hold_candles=?,highest_high=?,lowest_low=?,
+            return_pct=?,mfe_pct=?,mae_pct=?,current_R=?,
+            decision_48=?,decision_72=?,updated_at_utc=?
+        WHERE trade_id=?
+    """, (
+        current, hold, highest, lowest, ret, mfe, mae, rr,
+        d48, d72, now_utc_iso(), trade.get("trade_id"),
+    ))
+
+    if hold < BCO_MIN_HOLD_HOURS:
+        return {"closed": False, "R": rr, "hold": hold, "manager": BCO_EXIT_MANAGER_ATR2}
+
+    atr14 = (
+        _bco_exit_shadow_wilder_atr14(conn, int(raw_signal_id))
+        if raw_signal_id is not None and int(raw_signal_id or 0) > 0
+        else None
+    )
+    reg = regime(conn, max_raw_signal_id=raw_signal_id)
+
+    refreshed = dict(trade)
+    refreshed.update({
+        "current_R": rr,
+        "current_price": current,
+        "hold_candles": hold,
+        "highest_high": highest,
+        "lowest_low": lowest,
+        "mfe_pct": mfe,
+        "mae_pct": mae,
+        "decision_48": d48,
+        "decision_72": d72,
+        "managed_stop_price": managed,
+    })
+
+    if atr14 is None or float(atr14) <= 0:
+        record_manager_review(
+            conn, raw_signal_id, refreshed, signal_time, hold, current, rr, mfe, mae,
+            reg, support, "ATR2_WAIT_ATR", "ATR14 unavailable; existing hard/managed stop retained.",
+            d48, d72,
+        )
+        return {
+            "closed": False, "R": rr, "hold": hold,
+            "manager": BCO_EXIT_MANAGER_ATR2, "atr14": atr14,
+        }
+
+    prior_floor = max(hard, float(managed) if managed is not None else hard)
+    raw_trail = highest - (BCO_EXIT_SHADOW_ATR_MULTIPLIER * float(atr14))
+    next_trail = max(prior_floor, raw_trail)
+
+    # If the completed candle CLOSE is already below the newly calculated
+    # Chandelier level, it is executable to close now at market. We do not
+    # retrospectively award the higher trail price inside this candle.
+    if current <= next_trail:
+        reason = "atr2_close_below_new_trail"
+        record_manager_review(
+            conn, raw_signal_id, refreshed, signal_time, hold, current, rr, mfe, mae,
+            reg, support, "CLOSE_REQUESTED", reason, d48, d72,
+        )
+        ok, realized = execute_or_sim_close(
+            conn, refreshed, signal_time, current, reason, rr
+        )
+        return {
+            "closed": ok, "reason": reason, "R": rr, "realized_R": realized,
+            "hold": hold, "manager": BCO_EXIT_MANAGER_ATR2,
+            "atr14": float(atr14), "trail": next_trail,
+        }
+
+    armed = set_atr2_managed_stop(
+        conn, refreshed, current, next_trail, signal_time, float(atr14)
+    )
+    record_manager_review(
+        conn, raw_signal_id, refreshed, signal_time, hold, current, rr, mfe, mae,
+        reg, support, "ATR2_TRAIL",
+        f"2ATR Chandelier {'tightened' if armed else 'held'}; executable next interval.",
+        d48, d72,
+    )
+    return {
+        "closed": False, "R": rr, "hold": hold,
+        "manager": BCO_EXIT_MANAGER_ATR2,
+        "atr14": float(atr14), "trail": next_trail, "stop_tightened": armed,
+    }
+
+
 def update_trade_on_signal(conn: DBConn, trade: Dict[str, Any], signal: Dict[str, Any], support: Dict[str, Any], raw_signal_id: Optional[int] = None) -> Dict[str, Any]:
+    cycle_manager = bco_cycle_exit_manager(conn, safe_str(trade.get("cycle_id")), assign=True)
+    if cycle_manager == BCO_EXIT_MANAGER_ATR2:
+        return update_trade_on_signal_atr2(
+            conn, trade, signal, support, raw_signal_id=raw_signal_id
+        )
+
+    # CLASSIC branch retained byte-for-byte below apart from this dispatcher.
     signal_time = safe_str(signal.get("timestamp_readable")); current = safe_float(signal.get("exec_close")); hi = safe_float(signal.get("exec_high")); lo = safe_float(signal.get("exec_low"))
     entry = safe_float(trade.get("entry_price"))
     if current is None or entry is None or entry <= 0: return {"closed":False}
@@ -2815,7 +3326,32 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
                     "error": f"{type(research_exc).__name__}: {research_exc}",
                 }
 
-        defence=execute_defence(conn,signal_time,float(current),action,mid) if BCO_AUTO_MANAGEMENT_ENABLED else {"closed_count":0,"closed_trade_ids":[],"realized_R":0.0}
+        active_cycle_id = safe_str(state.get("cycle_id"))
+        active_cycle_manager = (
+            bco_cycle_exit_manager(conn, active_cycle_id, assign=True)
+            if active_cycle_id else BCO_NEW_CYCLE_EXIT_MANAGER
+        )
+        defence_suppressed = bool(
+            active_cycle_manager == BCO_EXIT_MANAGER_ATR2
+            and action_close_fraction(action) > 0
+        )
+        if BCO_AUTO_MANAGEMENT_ENABLED and not defence_suppressed:
+            defence=execute_defence(conn,signal_time,float(current),action,mid)
+        else:
+            defence={
+                "closed_count":0,
+                "closed_trade_ids":[],
+                "realized_R":0.0,
+                "suppressed_by_exit_manager": (
+                    active_cycle_manager if defence_suppressed else ""
+                ),
+            }
+        if defence_suppressed:
+            detail = (
+                detail
+                + " | ATR2 production owns trade exits; tide state still governs entry blocking, "
+                  "but mechanical basket-defence closures are suppressed."
+            )
         after_def=basket_metrics(conn)
         protection=execute_protection(conn,signal_time)
         after_prot=basket_metrics(conn)
@@ -2856,6 +3392,10 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
                     tide_score=?,tide_status=?,manager_action=?,manager_detail=?,updated_at_utc=? WHERE singleton_key='BCO_LONG'
             """,(signal_time,final["open_count"],final["basket_R"],final["basket_pnl_gbp"],hwm2,float(final["basket_R"]),signal_time,give2,final["losing_pct"],final["phase"],score,status,action,detail,now_utc_iso()))
         final_state=fetchone_dict(conn.execute("SELECT * FROM basket_state WHERE singleton_key='BCO_LONG'")) or {}
+        final_cycle_manager = (
+            bco_cycle_exit_manager(conn, safe_str(final_state.get("cycle_id")), assign=True)
+            if safe_str(final_state.get("cycle_id")) else "FLAT"
+        )
         conn.execute("""
             INSERT INTO basket_decisions(created_at_utc,raw_signal_id,signal_time,cycle_id,candidate,entry_allowed,entry_created,
                 open_before,open_after,basket_R_before,basket_R_after,high_water_R,giveback_pct,losing_pct,basket_phase,tide_score,
@@ -2873,6 +3413,8 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         "basket":snapshot(),
         "exit_challenger_shadow":exit_shadow,
         "focused_research_point_capture":focused_point_capture,
+        "exit_manager": final_cycle_manager,
+        "next_cycle_exit_manager": BCO_NEW_CYCLE_EXIT_MANAGER,
     }
 
 
@@ -3182,13 +3724,287 @@ def _bco_exit_shadow_sync_actual(conn: DBConn, shadow: Dict[str, Any]) -> Dict[s
     )) or shadow
 
 
+
+
+def _bco_update_executable_challenger_shadow_row(
+    conn: DBConn,
+    shadow: Dict[str, Any],
+    raw_signal_id: int,
+    signal: Dict[str, Any],
+) -> bool:
+    """Advance a v2 ATR2/MFE shadow using executable candle sequencing.
+
+    A protection level calculated from a completed candle is armed for the NEXT
+    interval. Only a level already present before this candle can be treated as
+    an intrabar stop. If the completed candle closes through a newly calculated
+    level, the shadow exits at that close rather than awarding a retrospective
+    fill at a price that was not yet armed.
+    """
+    current = safe_float(signal.get("exec_close"))
+    if current is None:
+        return False
+    current = float(current)
+    high = float(safe_float(signal.get("exec_high")) or current)
+    low = float(safe_float(signal.get("exec_low")) or current)
+    signal_time = safe_str(signal.get("timestamp_readable"))
+
+    entry = float(safe_float(shadow.get("entry_price")) or 0.0)
+    if entry <= 0:
+        return False
+    hard = float(
+        safe_float(shadow.get("hard_stop_price"))
+        or entry * (1.0 - BCO_SL_PCT / 100.0)
+    )
+    challenger = safe_str(shadow.get("challenger")).upper()
+    prior_trail = safe_float(shadow.get("trail_price"))
+    prior_floor = safe_float(shadow.get("mfe_floor_price"))
+    hold = int(safe_float(shadow.get("hold_candles")) or 0) + 1
+    previous_high = float(safe_float(shadow.get("highest_high")) or entry)
+    previous_low = float(safe_float(shadow.get("lowest_low")) or entry)
+
+    # Existing protection is actionable during this candle.
+    prior_protection: Optional[float] = None
+    prior_reason = ""
+    if hold >= BCO_EXIT_SHADOW_MIN_HOLD_HOURS:
+        if challenger == "ATR2_CHANDELIER" and prior_trail is not None:
+            prior_protection = max(hard, float(prior_trail))
+            prior_reason = "ATR2_CHANDELIER_PRIOR_TRAIL"
+        elif challenger == "MFE_GIVEBACK_50" and prior_floor is not None:
+            prior_protection = max(hard, float(prior_floor))
+            prior_reason = "MFE50_PRIOR_FLOOR"
+
+    highest = max(previous_high, high)
+    lowest = min(previous_low, low)
+    atr14 = (
+        _bco_exit_shadow_wilder_atr14(conn, int(raw_signal_id))
+        if challenger == "ATR2_CHANDELIER" else None
+    )
+
+    if prior_protection is not None and low <= float(prior_protection):
+        _bco_exit_shadow_close(
+            conn, shadow, signal_time, float(prior_protection), prior_reason,
+            current, highest, lowest, hold, atr14, prior_trail, prior_floor,
+        )
+        return True
+
+    # The original hard stop exists from entry and remains active regardless of
+    # whether a post-48 challenger level has been armed.
+    if low <= hard:
+        _bco_exit_shadow_close(
+            conn, shadow, signal_time, hard, "HARD_STOP",
+            current, highest, lowest, hold, atr14, prior_trail, prior_floor,
+        )
+        return True
+
+    current_r = (((current-entry)/entry)*100.0)/BCO_SL_PCT
+    mfe_pct = max(0.0, ((highest-entry)/entry)*100.0)
+    mae_pct = min(0.0, ((lowest-entry)/entry)*100.0)
+
+    next_trail = prior_trail
+    next_floor = prior_floor
+    if hold >= BCO_EXIT_SHADOW_MIN_HOLD_HOURS:
+        if challenger == "ATR2_CHANDELIER" and atr14 is not None and atr14 > 0:
+            candidate = highest - (BCO_EXIT_SHADOW_ATR_MULTIPLIER * float(atr14))
+            next_trail = max(
+                hard,
+                float(prior_trail) if prior_trail is not None else hard,
+                candidate,
+            )
+            if current <= float(next_trail):
+                _bco_exit_shadow_close(
+                    conn, shadow, signal_time, current,
+                    "ATR2_CLOSE_BELOW_NEW_TRAIL",
+                    current, highest, lowest, hold, atr14, next_trail, prior_floor,
+                )
+                return True
+
+        elif challenger == "MFE_GIVEBACK_50" and highest > entry:
+            retained_fraction = 1.0 - BCO_EXIT_SHADOW_MFE_GIVEBACK_FRACTION
+            candidate = entry + ((highest-entry) * retained_fraction)
+            next_floor = max(
+                hard,
+                float(prior_floor) if prior_floor is not None else hard,
+                candidate,
+            )
+            if current <= float(next_floor):
+                _bco_exit_shadow_close(
+                    conn, shadow, signal_time, current,
+                    "MFE50_CLOSE_BELOW_NEW_FLOOR",
+                    current, highest, lowest, hold, None, prior_trail, next_floor,
+                )
+                return True
+
+    conn.execute("""
+        UPDATE bco_exit_challenger_shadow SET
+            last_raw_signal_id=?,last_signal_time=?,hold_candles=?,
+            current_price=?,current_R=?,highest_high=?,lowest_low=?,
+            mfe_pct=?,mae_pct=?,atr14=?,trail_price=?,mfe_floor_price=?,
+            updated_at_utc=?
+        WHERE id=?
+    """, (
+        int(raw_signal_id), signal_time, hold, current, current_r,
+        highest, lowest, mfe_pct, mae_pct, atr14, next_trail, next_floor,
+        now_utc_iso(), shadow.get("id"),
+    ))
+    return False
+
+
+def _bco_classic_shadow_state(shadow: Dict[str, Any]) -> Dict[str, str]:
+    raw = safe_str(shadow.get("note"))
+    try:
+        obj = json.loads(raw) if raw.startswith("{") else {}
+    except Exception:
+        obj = {}
+    return {
+        "decision_48": safe_str(obj.get("decision_48")),
+        "decision_72": safe_str(obj.get("decision_72")),
+        "managed_stop_stage": safe_str(obj.get("managed_stop_stage")),
+    }
+
+
+def _bco_update_classic_manager_shadow_row(
+    conn: DBConn,
+    shadow: Dict[str, Any],
+    raw_signal_id: int,
+    signal: Dict[str, Any],
+) -> bool:
+    """Advance a research-only Classic trade-manager control.
+
+    This reproduces the per-trade 48/72h extension + staged protection logic.
+    Basket-defence counterfactuals remain in the dedicated basket research layer.
+    Returns True when the shadow closes on this signal.
+    """
+    current = safe_float(signal.get("exec_close"))
+    if current is None:
+        return False
+    current = float(current)
+    high = float(safe_float(signal.get("exec_high")) or current)
+    low = float(safe_float(signal.get("exec_low")) or current)
+    signal_time = safe_str(signal.get("timestamp_readable"))
+
+    entry = float(safe_float(shadow.get("entry_price")) or 0.0)
+    if entry <= 0:
+        return False
+    hard = float(
+        safe_float(shadow.get("hard_stop_price"))
+        or entry * (1.0 - BCO_SL_PCT / 100.0)
+    )
+    prior_stop = safe_float(shadow.get("trail_price"))
+    hold = int(safe_float(shadow.get("hold_candles")) or 0) + 1
+
+    # Only the prior-candle stop may trigger inside this completed candle.
+    if prior_stop is not None and low <= float(prior_stop):
+        _bco_exit_shadow_close(
+            conn, shadow, signal_time, float(prior_stop), "CLASSIC_MANAGED_STOP",
+            current,
+            max(float(safe_float(shadow.get("highest_high")) or entry), high),
+            min(float(safe_float(shadow.get("lowest_low")) or entry), low),
+            hold, None, float(prior_stop), None,
+        )
+        return True
+    if low <= hard:
+        _bco_exit_shadow_close(
+            conn, shadow, signal_time, hard, "CLASSIC_HARD_STOP",
+            current,
+            max(float(safe_float(shadow.get("highest_high")) or entry), high),
+            min(float(safe_float(shadow.get("lowest_low")) or entry), low),
+            hold, None, prior_stop, None,
+        )
+        return True
+
+    highest = max(float(safe_float(shadow.get("highest_high")) or entry), high)
+    lowest = min(float(safe_float(shadow.get("lowest_low")) or entry), low)
+    ret = (current-entry)/entry*100.0
+    mfe = max(0.0, (highest-entry)/entry*100.0)
+    mae = min(0.0, (lowest-entry)/entry*100.0)
+    rr = ret/BCO_SL_PCT
+    state = _bco_classic_shadow_state(shadow)
+    d48 = state["decision_48"]
+    d72 = state["decision_72"]
+    managed_stage = state["managed_stop_stage"]
+    reg = regime(conn, max_raw_signal_id=raw_signal_id)
+    support = candidate_support(conn, max_raw_signal_id=raw_signal_id)
+
+    exit_reason = ""
+    if hold >= 48 and not d48:
+        passed, reasons = extension_decision(reg, ret, mfe)
+        if not passed:
+            override, override_reasons = candidate_supported_extension_override(
+                conn, support, reg, rr, reasons
+            )
+            if override:
+                passed = True
+                reasons = ["candidate_supported_48h_extension_override"] + override_reasons
+            else:
+                reasons = override_reasons
+        d48 = "extend" if passed else "exit:" + ",".join(reasons)
+        if not passed:
+            exit_reason = "CLASSIC_EXIT_48:" + ",".join(reasons)
+
+    if hold >= 72 and d48 == "extend" and not d72 and not exit_reason:
+        passed, reasons = extension_decision(reg, ret, mfe)
+        if not passed:
+            override, override_reasons = candidate_supported_extension_override(
+                conn, support, reg, rr, reasons
+            )
+            if override:
+                passed = True
+                reasons = ["candidate_supported_72h_extension_override"] + override_reasons
+            else:
+                reasons = override_reasons
+        d72 = "extend" if passed else "exit:" + ",".join(reasons)
+        if not passed:
+            exit_reason = "CLASSIC_EXIT_72:" + ",".join(reasons)
+
+    if exit_reason:
+        _bco_exit_shadow_close(
+            conn, shadow, signal_time, current, exit_reason,
+            current, highest, lowest, hold, None, prior_stop, None,
+        )
+        return True
+
+    new_stop = prior_stop
+    if hold >= BCO_MIN_HOLD_HOURS and rr > 0:
+        fraction, stage = protect_fraction(hold)
+        candidate_stop = entry + (current-entry)*fraction
+        candidate_stop = min(candidate_stop, current*0.9999)
+        min_step = entry * BCO_MIN_STOP_STEP_PCT / 100.0
+        if new_stop is None or candidate_stop > float(new_stop) + min_step:
+            new_stop = candidate_stop
+            managed_stage = stage
+
+    note = json.dumps({
+        "kind": "CLASSIC_MANAGER_SHADOW",
+        "decision_48": d48,
+        "decision_72": d72,
+        "managed_stop_stage": managed_stage,
+        "production_manager_at_entry": safe_str(
+            json.loads(safe_str(shadow.get("note"))).get("production_manager_at_entry")
+            if safe_str(shadow.get("note")).startswith("{") else ""
+        ),
+    }, separators=(",", ":"))
+
+    conn.execute("""
+        UPDATE bco_exit_challenger_shadow SET
+            last_raw_signal_id=?,last_signal_time=?,hold_candles=?,
+            current_price=?,current_R=?,highest_high=?,lowest_low=?,
+            mfe_pct=?,mae_pct=?,trail_price=?,note=?,updated_at_utc=?
+        WHERE id=?
+    """, (
+        int(raw_signal_id), signal_time, hold, current, rr, highest, lowest,
+        mfe, mae, new_stop, note, now_utc_iso(), shadow.get("id"),
+    ))
+    return False
+
+
 def start_bco_exit_challenger_shadows(
     conn: DBConn,
     trade_id: str,
     entry_raw_signal_id: int,
 ) -> Dict[str, Any]:
-    """Create MFE and ATR2 research rows for a NEW production trade only.
+    """Create forward exit-control rows for a NEW production trade only.
 
+    v0.8.12 adds CLASSIC_MANAGER as the control for future ATR2 production.
     There is intentionally no historical/backfill loop anywhere in the app.
     """
     if not BCO_EXIT_SHADOW_ENABLED:
@@ -3212,7 +4028,10 @@ def start_bco_exit_challenger_shadows(
     hard = safe_float(trade.get("hard_sl_price")) or float(entry) * (1.0 - BCO_SL_PCT / 100.0)
     created = 0
 
-    for challenger in ("MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
+    production_manager = bco_cycle_exit_manager(
+        conn, safe_str(trade.get("cycle_id")), assign=True
+    )
+    for challenger in ("CLASSIC_MANAGER", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
         existing = fetchone_dict(conn.execute("""
             SELECT id FROM bco_exit_challenger_shadow
             WHERE trade_id=? AND challenger=? LIMIT 1
@@ -3233,7 +4052,17 @@ def start_bco_exit_challenger_shadows(
             float(hard), int(entry_raw_signal_id), entry_time, 0,
             float(entry), 0.0, float(entry), float(entry), 0.0, 0.0,
             safe_str(trade.get("status")).upper(),
-            "Forward-only research shadow created from new production-accepted BCO trade. Zero execution authority.",
+            (
+                json.dumps({
+                    "kind": "CLASSIC_MANAGER_SHADOW",
+                    "decision_48": "",
+                    "decision_72": "",
+                    "managed_stop_stage": "",
+                    "production_manager_at_entry": production_manager,
+                }, separators=(",", ":"))
+                if challenger == "CLASSIC_MANAGER"
+                else f"Forward-only {challenger} research shadow. Production manager at entry={production_manager}. Zero execution authority."
+            ),
         ))
         created += 1
     return {"ok": True, "enabled": True, "created": created, "trade_id": trade_id}
@@ -3320,6 +4149,40 @@ def update_bco_exit_challenger_shadows(
         last_id = int(safe_float(shadow.get("last_raw_signal_id")) or 0)
         if int(raw_signal_id) <= last_id:
             continue  # recovery/idempotency guard
+
+        if safe_str(shadow.get("challenger")).upper() == "CLASSIC_MANAGER":
+            if _bco_update_classic_manager_shadow_row(
+                conn, shadow, int(raw_signal_id), signal
+            ):
+                refreshed = fetchone_dict(conn.execute(
+                    "SELECT * FROM bco_exit_challenger_shadow WHERE id=? LIMIT 1",
+                    (shadow.get("id"),),
+                )) or shadow
+                _bco_exit_shadow_sync_actual(conn, refreshed)
+                closed += 1
+            updated += 1
+            continue
+
+        # v0.8.12 rows use the same executable next-interval sequencing as the
+        # promoted production ATR2 manager. Legacy v1 rows deliberately continue
+        # through the original block below so historical research is not rewritten.
+        shadow_version = safe_str(shadow.get("shadow_version"))
+        challenger_name = safe_str(shadow.get("challenger")).upper()
+        if (
+            shadow_version == BCO_EXIT_SHADOW_VERSION
+            and challenger_name in {"ATR2_CHANDELIER", "MFE_GIVEBACK_50"}
+        ):
+            if _bco_update_executable_challenger_shadow_row(
+                conn, shadow, int(raw_signal_id), signal
+            ):
+                refreshed = fetchone_dict(conn.execute(
+                    "SELECT * FROM bco_exit_challenger_shadow WHERE id=? LIMIT 1",
+                    (shadow.get("id"),),
+                )) or shadow
+                _bco_exit_shadow_sync_actual(conn, refreshed)
+                closed += 1
+            updated += 1
+            continue
 
         entry = float(safe_float(shadow.get("entry_price")) or 0.0)
         if entry <= 0:
@@ -3448,12 +4311,14 @@ def bco_exit_challenger_shadow_summary() -> Dict[str, Any]:
         "research_only": True,
         "execution_authority": False,
         "forward_only_no_backfill": True,
+        "v2_execution_semantics": "completed-candle level arms next interval; close-through exits at completed-candle close",
+        "legacy_v1_rows_preserved": True,
         "schema_status": schema_status,
         "challengers": {},
         "trade_count": len({safe_str(r.get("trade_id")) for r in rows if safe_str(r.get("trade_id"))}),
         "row_count": len(rows),
     }
-    for challenger in ("MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
+    for challenger in ("CLASSIC_MANAGER", "MFE_GIVEBACK_50", "ATR2_CHANDELIER"):
         rr = [r for r in rows if safe_str(r.get("challenger")).upper() == challenger]
         pairs = [r for r in rr if parse_bool(r.get("paired_complete"), False)]
         deltas = [safe_float(r.get("challenger_minus_current_R")) for r in pairs]
@@ -3509,6 +4374,7 @@ def build_bco_exit_challenger_shadow_html() -> str:
 
     cards = ""
     for key, label in (
+        ("CLASSIC_MANAGER", "Classic Manager Control"),
         ("MFE_GIVEBACK_50", "MFE 50% Giveback"),
         ("ATR2_CHANDELIER", "ATR2 Chandelier"),
     ):
@@ -3527,7 +4393,7 @@ def build_bco_exit_challenger_shadow_html() -> str:
           </div>
         """
 
-    # Pivot latest rows by trade so Current/MFE/ATR2 are easy to compare.
+    # Pivot latest rows by trade so Production/Classic/MFE/ATR2 are easy to compare.
     by_trade: Dict[str, Dict[str, Dict[str, Any]]] = {}
     order: List[str] = []
     for r in rows:
@@ -3542,15 +4408,21 @@ def build_bco_exit_challenger_shadow_html() -> str:
     trs = ""
     for tid in order[:80]:
         d = by_trade.get(tid) or {}
+        classic = d.get("CLASSIC_MANAGER") or {}
         mfe = d.get("MFE_GIVEBACK_50") or {}
         atr = d.get("ATR2_CHANDELIER") or {}
-        basis = mfe or atr
+        basis = classic or mfe or atr
         actual_r = safe_float(basis.get("actual_R"))
         trs += f"""
         <tr>
           <td>{esc(tid)}</td>
           <td>{esc(basis.get('entry_time'))}</td>
           <td>{_fmt_r(actual_r)}</td>
+          <td>{esc(classic.get('status') or '—')}</td>
+          <td>{_fmt_r(classic.get('hypothetical_exit_R') if safe_str(classic.get('status')).upper()=='CLOSED' else classic.get('current_R'))}</td>
+          <td>{_fmt_r(classic.get('challenger_minus_current_R'))}</td>
+          <td>{esc(classic.get('hypothetical_exit_reason') or '—')}</td>
+          <td>{esc(f"{safe_float(classic.get('trail_price')):.3f}" if safe_float(classic.get('trail_price')) is not None else '—')}</td>
           <td>{esc(mfe.get('status') or '—')}</td>
           <td>{_fmt_r(mfe.get('hypothetical_exit_R') if safe_str(mfe.get('status')).upper()=='CLOSED' else mfe.get('current_R'))}</td>
           <td>{_fmt_r(mfe.get('challenger_minus_current_R'))}</td>
@@ -3565,15 +4437,16 @@ def build_bco_exit_challenger_shadow_html() -> str:
         </tr>
         """
     if not trs:
-        trs = '<tr><td colspan="14">No forward-shadow trades yet. This is intentional: existing/historical BCO trades are not backfilled. The first new production-accepted trade after deployment will create both challenger rows.</td></tr>'
+        trs = '<tr><td colspan="19">No forward-shadow trades yet. Existing/historical BCO trades are intentionally not backfilled. The first new production-accepted trade after deployment creates Classic, MFE50 and ATR2 controls.</td></tr>'
 
     return f"""
       <div class="section-note small">
-        <strong>Forward shadow only — ZERO broker authority.</strong>
-        New production-accepted BCO trades create two independent research copies:
-        <strong>MFE 50% giveback after 48h</strong> and <strong>2ATR Chandelier after 48h</strong>.
-        Both retain the normal {BCO_SL_PCT:.1f}% hard-stop basis. Either challenger may exit while
-        Current continues, or Current may exit while the challenger continues. No historical trade is backfilled.
+        <strong>Forward controls only — ZERO broker authority.</strong>
+        New production-accepted BCO trades create Classic, MFE50 and ATR2 research controls.
+        Once ATR2 becomes production, <strong>Classic Manager Control</strong> remains the primary benchmark.
+        New v2 ATR2/MFE controls use executable next-interval stop sequencing; historical v1 rows are preserved.
+        All retain the normal {BCO_SL_PCT:.1f}% hard-stop basis. A control may exit while
+        production continues, or production may exit while a control continues. No historical trade is backfilled.
       </div>
       <div class="metric-grid">
         <div class="mini-card"><div class="k">Forward Trades Shadowed</div><div class="v">{int(summary.get('trade_count') or 0)}</div><div class="small">{esc(BCO_EXIT_SHADOW_VERSION)}</div></div>
@@ -3582,7 +4455,8 @@ def build_bco_exit_challenger_shadow_html() -> str:
       </div>
       <div class="table-scroll"><table>
         <thead><tr>
-          <th>Production Trade</th><th>Entry</th><th>Current Exit R</th>
+          <th>Production Trade</th><th>Entry</th><th>Production Exit R</th>
+          <th>Classic State</th><th>Classic R</th><th>Classic Δ</th><th>Classic Exit</th><th>Classic Stop</th>
           <th>MFE State</th><th>MFE R</th><th>MFE Δ</th><th>MFE Exit</th><th>MFE Floor</th>
           <th>ATR2 State</th><th>ATR2 R</th><th>ATR2 Δ</th><th>ATR2 Exit</th><th>ATR2 Trail</th><th>ATR14</th>
         </tr></thead>
@@ -3839,6 +4713,19 @@ def _background_bootstrap() -> None:
                 pass
 
         init_db()
+
+        # v0.8.12: pin the basket that existed at deployment to CLASSIC before
+        # any stored-signal recovery can touch it. Future cycle IDs then default ATR2.
+        with _db_lock, get_conn() as _mgr_conn:
+            manager_promotion = initialize_bco_exit_manager_promotion_state(_mgr_conn)
+        try:
+            log_event(
+                "exit_manager_promotion_initialized",
+                "Cycle-bound exit-manager promotion state ready.",
+                manager_promotion,
+            )
+        except Exception:
+            pass
 
         # Verify again after the main migration. This also repairs the edge case
         # where the first attempt was blocked by a transient Postgres DDL lock.
@@ -5858,6 +6745,35 @@ def _bco_standard_top_uncached():
             _latest_processed=bool(_latest_done)
 
         _processor_ok=bool(_latest_processed and _pending_count==0)
+        _manager_status=bco_exit_manager_status(conn)
+        _queue_row=fetchone_dict(conn.execute(
+            "SELECT COUNT(*) AS c FROM broker_action_queue WHERE status IN ('PENDING','RETRY')"
+        )) or {}
+        _pending_broker_actions=int(safe_float(_queue_row.get("c")) or 0)
+
+    _broker_snapshot_ok=bool(broker.get("ok"))
+    _flat_for_cutover=bool(
+        _broker_snapshot_ok
+        and _processor_ok
+        and local_open==0
+        and broker_open==0
+        and _pending_broker_actions==0
+    )
+    if safe_str(OANDA_ENV).lower()=="live":
+        _cutover_status="LIVE"
+        _cutover_ready=False
+    elif not _broker_snapshot_ok:
+        _cutover_status="CUTOVER_BLOCKED_BROKER_UNAVAILABLE"
+        _cutover_ready=False
+    elif not _processor_ok:
+        _cutover_status="CUTOVER_BLOCKED_SIGNAL_PROCESSING"
+        _cutover_ready=False
+    elif _flat_for_cutover:
+        _cutover_status="READY_FOR_MANUAL_LIVE_CUTOVER"
+        _cutover_ready=True
+    else:
+        _cutover_status="WAITING_FOR_FLAT"
+        _cutover_ready=False
     return {
       "status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
       "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),
@@ -5885,7 +6801,13 @@ def _bco_standard_top_uncached():
                   "auto_entry":bool(safety.get("auto_entry")),"auto_management":bool(safety.get("auto_management")),
                   "banked_r_cycle":safe_float(basket.get("banked_R_cycle")) or 0.0,
                   "broker_margin_used":safe_float(broker.get("owned_margin_used")) or 0.0,
-                  "broker_account_open_count":int(broker.get("account_open_count") or 0)},
+                  "broker_account_open_count":int(broker.get("account_open_count") or 0),
+                  "exit_manager":safe_str(_manager_status.get("current_manager")),
+                  "next_cycle_exit_manager":safe_str(_manager_status.get("next_cycle_manager")),
+                  "exit_manager_cycle_id":safe_str(_manager_status.get("current_cycle_id")),
+                  "live_cutover_ready":_cutover_ready,
+                  "live_cutover_status":_cutover_status,
+                  "pending_broker_actions":_pending_broker_actions},
       "signals":{"candidate":parse_bool(latest.get("candidate_8h"),False),
                  "latest_time":safe_str(latest.get("timestamp_readable")),
                  "latest_time_display":bco_display_candle_time(latest.get("timestamp_readable")),
@@ -5903,7 +6825,9 @@ def _bco_standard_top_uncached():
                  "processing_health_source":"fresh unprocessed raw_signals missing basket_decisions",
                  "recovery_interval_seconds":BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS},
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
-                "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION}}
+                "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION,
+                "new_cycle_exit_manager":BCO_NEW_CYCLE_EXIT_MANAGER,
+                "risk_round_up_max_overage_pct":BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT}}
 
 def bco_standard_top_snapshot(force=False):
     now_ts = time.time()
@@ -5971,6 +6895,14 @@ def aggregate_portfolio_summary(
             "high_water_gbp_snapshot_at_utc": safe_str(strategy.get("high_water_gbp_snapshot_time_utc")) or None,
             "giveback_gbp": safe_float(strategy.get("giveback_gbp")),
             "giveback_r": safe_float(strategy.get("giveback_r")),
+        },
+        "exit_management": {
+            "current_manager": safe_str(strategy.get("exit_manager")) or "FLAT",
+            "next_cycle_manager": safe_str(strategy.get("next_cycle_exit_manager")) or BCO_NEW_CYCLE_EXIT_MANAGER,
+            "cycle_id": safe_str(strategy.get("exit_manager_cycle_id")) or None,
+            "live_cutover_ready": bool(strategy.get("live_cutover_ready")),
+            "live_cutover_status": safe_str(strategy.get("live_cutover_status")) or None,
+            "pending_broker_actions": int(safe_float(strategy.get("pending_broker_actions")) or 0),
         },
         "accounting": {
             "realised_today_gbp": None,
@@ -6473,6 +7405,13 @@ def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
         new_hwm_seen_at = observed_at if new_hwm > 0 else None
 
         old_cycle = safe_str(previous.get("cycle_id"))
+        # A manual ECONOMIC/HWM reset is not a trading-manager boundary.
+        # Preserve the manager of the still-open exposure so this control can
+        # never promote the current basket from Classic to ATR2 mid-flight.
+        preserved_exit_manager = (
+            bco_cycle_exit_manager(conn, old_cycle, assign=True)
+            if old_cycle else BCO_EXIT_MANAGER_CLASSIC
+        )
         if old_cycle:
             conn.execute("""
                 UPDATE protection_stages
@@ -6531,6 +7470,13 @@ def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
                 updated_at_utc=?
             WHERE status='OPEN'
         """, (new_cycle, observed_at))
+        runtime_set(
+            conn,
+            _bco_cycle_manager_runtime_key(new_cycle),
+            preserved_exit_manager,
+        )
+        runtime_set(conn, "bco_exit_manager_last_assigned_cycle", new_cycle)
+        runtime_set(conn, "bco_exit_manager_last_assigned_manager", preserved_exit_manager)
 
         # Permanent audit boundary in basket snapshots. Old snapshots remain
         # untouched and therefore retain the previous HWM for research.
@@ -6565,6 +7511,7 @@ def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
                 "MANUAL_ECONOMIC_CYCLE_RESET boundary. Previous cycle "
                 f"{old_cycle or 'none'} archived at HWM "
                 f"{float(previous.get('high_water_R') or 0.0):.2f}R. "
+                f"Exit manager preserved as {preserved_exit_manager}. "
                 "No OANDA trade/stop/age/exit-shadow state changed."
             ),
         ))
@@ -6587,6 +7534,7 @@ def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
             "broker_write_authority": False,
             "individual_trade_state_unchanged": True,
             "exit_shadow_state_unchanged": True,
+            "exit_manager_preserved": preserved_exit_manager,
         },
     )
 
@@ -6631,6 +7579,7 @@ def bco_manual_start_new_basket_cycle_impl() -> Dict[str, Any]:
         "broker_write_authority": False,
         "individual_trade_state_unchanged": True,
         "exit_shadow_state_unchanged": True,
+        "exit_manager_preserved": preserved_exit_manager,
         "time_utc": now_utc_iso(),
     }
 
@@ -6839,8 +7788,8 @@ def _bco_standard_broker_html():
         some trades remain open. It archives the old family HWM/harvest cycle,
         rebases HWM to the current basket and makes <strong>50R the next harvest again</strong>.
         <br><strong>No trades are closed or modified.</strong> Existing trade ages,
-        MFE/MAE, hard/managed stops, Current Manager state and MFE50/ATR2 shadows
-        remain unchanged.
+        MFE/MAE, hard/managed stops, the cycle's exit manager and Classic/MFE50/ATR2
+        shadows remain unchanged. A manual HWM reset never triggers ATR2 promotion.
       </div>
       <div style="padding:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
         <button type="button"
@@ -7079,12 +8028,12 @@ ${{card('Giveback',`${{money(s.giveback_gbp)}}${{gb===null?'':' · '+gb.toFixed(
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
 ${{card('This Month',money(ac.month_pnl),eh(ac.month_label||''),cls(ac.month_pnl))}}
-${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}}`)}}
+${{card('Open Trades',eh(s.open_trades||0),`OANDA BCO · local ${{eh(s.local_open_trades||0)}} · exit ${{eh(s.exit_manager||'FLAT')}}`)}}
 ${{card('48h+ Trades',eh(s.mature_48h_plus||0),`Oldest ${{eh(s.oldest_hold||0)}}h`)}}</div>
 <div class="cards three">
 ${{card('Signal Health',g.processor_ok&&Number(g.received_assets||0)===1?'OK':'RECOVERING',g.processor_ok?(g.latest_time_display?`Latest BCO candle · ${{eh(g.latest_time_display)}}${{Number(g.legacy_unprocessed_count||0)>0?' · legacy audit gaps '+eh(g.legacy_unprocessed_count)+' (non-executable)':''}}`:'Waiting for BCO signal'):`Fresh pending ${{eh(g.processing_lag||0)}} · candidate pending ${{eh(g.pending_candidate_count||0)}} · auto-retry every ${{eh(g.recovery_interval_seconds||10)}}s${{g.latest_time_display?' · latest '+eh(g.latest_time_display):''}}`,g.processor_ok&&Number(g.received_assets||0)===1?'pos':'warn')}}
 ${{card('Signals',`${{eh(g.received_assets||0)}}/${{eh(g.expected_assets||1)}}`,Number(g.received_assets||0)===1?(g.latest_time_display?`Latest candle · ${{eh(g.latest_time_display)}}`:'Signal received'):(g.latest_time_display?`Waiting · latest ${{eh(g.latest_time_display)}}`:'Waiting'))}}
-${{card('Candidate Support',g.candidate?'1/1':'0/1','BCO',g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
+${{card('Candidate Support',g.candidate?'1/1':'0/1',`BCO · next exit ${{eh(s.next_cycle_exit_manager||'ATR2_CHANDELIER')}} · ${{eh(s.live_cutover_status||'')}}`,g.candidate?'pos':'neg')}}</div>`;st.innerHTML=`<strong>Updated ${{localTime(d.time_utc)}} · loaded in ${{((performance.now()-t0)/1000).toFixed(2)}}s</strong>`}}catch(e){{st.innerHTML=`<span class="neg"><strong>Top tile load failed:</strong> ${{eh(e.message||e)}}</span>`}}}}
 async function loadSection(d){{if(d.dataset.loaded==='1'||d.dataset.loading==='1')return;d.dataset.loading='1';const b=d.querySelector('.lazy-body');b.innerHTML='<div class="lazy-loading">Loading this section…</div>';try{{const r=await fetch('/dashboard/section/'+encodeURIComponent(d.dataset.section),{{cache:'no-store'}});const h=await r.text();if(!r.ok)throw new Error(h);b.innerHTML=h;d.dataset.loaded='1'}}catch(e){{b.innerHTML=`<div class="lazy-error">${{eh(e.message||e)}}</div>`}}finally{{d.dataset.loading='0'}}}}
 
 async function startNewBCOBasketCycle(){{
@@ -7146,7 +8095,19 @@ def bco_standard_status():
             "manual_economic_basket_cycle_reset":True,
             "staged_defence":True,
             "exact_instrument_ownership":True,
+            "production_exit_manager":{
+                "cycle_bound":True,
+                "deployment_rule":"any basket already open at first v0.8.12 bootstrap is pinned CLASSIC",
+                "subsequent_new_cycles":BCO_NEW_CYCLE_EXIT_MANAGER,
+                "atr2_min_hold_hours":BCO_MIN_HOLD_HOURS,
+                "atr2_multiplier":BCO_EXIT_SHADOW_ATR_MULTIPLIER,
+                "basket_defence_closes_suppressed_on_atr2_cycles":True,
+                "entry_blocking_from_tide_retained":True,
+                "50R_harvesting_retained":True,
+                "automatic_practice_to_live_cutover":False,
+            },
             "exit_shadows":{
+                "CLASSIC_MANAGER":BCO_EXIT_SHADOW_ENABLED,
                 "MFE_GIVEBACK_50":BCO_EXIT_SHADOW_ENABLED,
                 "ATR2_CHANDELIER":BCO_EXIT_SHADOW_ENABLED,
                 "execution_authority":False,
