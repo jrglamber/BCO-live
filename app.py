@@ -36,11 +36,16 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.13 — Live HWM + Intrahour Harvest + ATR2 Next Cycle"
-APP_VERSION = "0.8.13"
-POLICY_VERSION = "bco_v0.8.13_live_hwm_intrahour_harvest_2026_09_10"
+APP_NAME = "Project Exit Plan — BCO v0.8.14 — Last-Trade Visibility + Live HWM + Intrahour Harvest"
+APP_VERSION = "0.8.14"
+POLICY_VERSION = "bco_v0.8.14_last_trade_visibility_live_hwm_intrahour_harvest_2026_09_10"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.14 — Portfolio Hub last-trade-opened visibility only.
+# - Exposes the latest successful broker-confirmed BCO opening audit time.
+# - Display/API metadata only; no entry, exit, risk, ATR2/Classic, SL, HWM,
+#   harvest threshold, bank percentage or broker-execution rule is changed.
+#
 # v0.8.13 — live broker monitoring / harvesting visibility and timing repair.
 # - Adds a lightweight OANDA BCO open-trade monitor (default every 15s).
 # - Persists a broker-equivalent live basket R + GBP high-water with the
@@ -7439,6 +7444,30 @@ def _aggregate_summary_authorized(x_aggregate_secret: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="aggregate source secret rejected")
 
 
+def _aggregate_last_trade_opened_at_utc() -> Optional[str]:
+    """Latest successful broker-confirmed BCO opening audit timestamp.
+
+    OPEN_BCO_DETAILS is written only after the OANDA open response has been
+    validated. Using its durable timestamp avoids confusing the hourly signal
+    candle time with the actual broker entry event.
+    """
+    try:
+        with get_conn() as conn:
+            row = fetchone_dict(conn.execute("""
+                SELECT created_at_utc
+                FROM execution_audit
+                WHERE action='OPEN_BCO_DETAILS'
+                  AND success
+                  AND COALESCE(broker_trade_id,'') <> ''
+                  AND COALESCE(created_at_utc,'') <> ''
+                ORDER BY created_at_utc DESC, id DESC
+                LIMIT 1
+            """)) or {}
+        return safe_str(row.get("created_at_utc")) or None
+    except Exception:
+        return None
+
+
 @app.get("/api/portfolio-summary")
 def aggregate_portfolio_summary(
     x_aggregate_secret: Optional[str] = Header(default=None),
@@ -7452,6 +7481,7 @@ def aggregate_portfolio_summary(
     signals = top.get("signals") or {}
     config = top.get("config") or {}
     mode = safe_str(top.get("mode") or OANDA_ENV).strip().lower()
+    last_trade_opened_at_utc = _aggregate_last_trade_opened_at_utc()
 
     return {
         "schema_version": 1,
@@ -7466,6 +7496,7 @@ def aggregate_portfolio_summary(
         "basket": {
             "direction": "LONG",
             "open_trades": int(safe_float(strategy.get("open_trades")) or 0),
+            "last_trade_opened_at_utc": last_trade_opened_at_utc,
             "pnl_gbp": safe_float(strategy.get("headline_pnl")),
             "pnl_r": safe_float(strategy.get("basket_r")),
             "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
