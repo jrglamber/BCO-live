@@ -36,11 +36,23 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.12 — ATR2 Next-Cycle Promotion + Classic Control"
-APP_VERSION = "0.8.12"
-POLICY_VERSION = "bco_v0.8.12_atr2_next_cycle_promotion_2026_09_10"
+APP_NAME = "Project Exit Plan — BCO v0.8.13 — Live HWM + Intrahour Harvest + ATR2 Next Cycle"
+APP_VERSION = "0.8.13"
+POLICY_VERSION = "bco_v0.8.13_live_hwm_intrahour_harvest_2026_09_10"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.13 — live broker monitoring / harvesting visibility and timing repair.
+# - Adds a lightweight OANDA BCO open-trade monitor (default every 15s).
+# - Persists a broker-equivalent live basket R + GBP high-water with the
+#   actual monitor timestamp instead of only advancing HWM on hourly candles.
+# - Harvest checkpoints are evaluated on that live broker-normalised R and
+#   execute immediately on the monitor cycle when crossed; the hourly path
+#   remains as a resilient fallback.
+# - Harvest dashboard cash uses authoritative broker/net realised GBP from
+#   harvest_execution_outcomes, never executed_R × nominal £5.
+# - Deterministic hourly basket_state HWM/research is retained unchanged for
+#   comparability. No entry signal, ATR2/Classic rule, SL or bank percentage changed.
+#
 # v0.8.12 — cycle-bound exit-manager promotion.
 # - The basket active at first v0.8.12 bootstrap is permanently pinned to
 #   CLASSIC, so deployment cannot change the manager mid-cycle.
@@ -318,6 +330,9 @@ BCO_PRACTICE_SMOKE_TEST_ENABLED = env_bool("BCO_PRACTICE_SMOKE_TEST_ENABLED", Fa
 BROKER_MAX_SPREAD_PCT = max(0.0, float(os.getenv("BROKER_MAX_SPREAD_PCT", "0.20")))
 BROKER_MAX_RISK_OVERAGE_PCT = max(0.0, float(os.getenv("BROKER_MAX_RISK_OVERAGE_PCT", "25")))
 BROKER_RECONCILE_INTERVAL_SECONDS = max(15, min(int(float(os.getenv("BROKER_RECONCILE_INTERVAL_SECONDS", "60"))), 300))
+BCO_LIVE_MONITOR_INTERVAL_SECONDS = max(
+    5.0, min(float(os.getenv("BCO_LIVE_MONITOR_INTERVAL_SECONDS", "15")), 60.0)
+)
 BCO_ACTION_RETRY_MAX_ATTEMPTS = max(3, int(float(os.getenv("BCO_ACTION_RETRY_MAX_ATTEMPTS", "1000"))))
 BCO_TRANSACTION_SYNC_ENABLED = env_bool("BCO_TRANSACTION_SYNC_ENABLED", True)
 BCO_TRANSACTION_SYNC_PAGE_LIMIT = max(100, min(int(float(os.getenv("BCO_TRANSACTION_SYNC_PAGE_LIMIT", "1000"))), 5000))
@@ -402,6 +417,9 @@ _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
 _signal_recovery_started = False
 _signal_recovery_thread: Optional[threading.Thread] = None
+_live_monitor_started = False
+_live_monitor_thread: Optional[threading.Thread] = None
+_live_monitor_lock = threading.Lock()
 
 
 # -----------------------------------------------------------------------------
@@ -2521,6 +2539,7 @@ def reset_flat_bco_basket_state(
         f"Flat basket state reset: {safe_str(reason)}",
         observed_at or now_utc_iso(),
     ))
+    _bco_reset_live_hwm_state(conn)
 
     return {
         "reset": True,
@@ -4495,6 +4514,482 @@ def bco_broker_live_snapshot() -> Dict[str, Any]:
         "account_open_count":len(all_trades),"time_utc":now_utc_iso()
     }
 
+
+BCO_LIVE_HWM_CYCLE_KEY = "bco_live_hwm_cycle_id"
+BCO_LIVE_HWM_R_KEY = "bco_live_hwm_r"
+BCO_LIVE_HWM_GBP_KEY = "bco_live_hwm_gbp"
+BCO_LIVE_HWM_AT_KEY = "bco_live_hwm_at_utc"
+BCO_LIVE_CURRENT_R_KEY = "bco_live_current_r"
+BCO_LIVE_CURRENT_GBP_KEY = "bco_live_current_gbp"
+BCO_LIVE_CURRENT_AT_KEY = "bco_live_current_at_utc"
+BCO_LIVE_MONITOR_LAST_STATUS_KEY = "bco_live_monitor_last_status"
+BCO_LIVE_HWM_SOURCE_KEY = "bco_live_hwm_source"
+
+
+def bco_owned_open_trades_snapshot() -> Dict[str, Any]:
+    """Lightweight OANDA BCO open-trade read for live HWM/harvest monitoring."""
+    if not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
+        return {
+            "ok": False, "owned_open_trades": [], "owned_open_count": 0,
+            "owned_unrealized_pl": 0.0, "error": "OANDA not configured",
+            "time_utc": now_utc_iso(),
+        }
+    resp = oanda_request(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades")
+    if not resp.get("ok"):
+        return {
+            "ok": False, "owned_open_trades": [], "owned_open_count": 0,
+            "owned_unrealized_pl": 0.0, "error": resp.get("error"),
+            "time_utc": now_utc_iso(),
+        }
+    all_trades = (resp.get("data") or {}).get("trades", []) or []
+    owned = [
+        t for t in all_trades
+        if safe_str(t.get("instrument")).upper() == safe_str(BCO_OANDA_INSTRUMENT).upper()
+    ]
+    return {
+        "ok": True,
+        "owned_open_trades": owned,
+        "owned_open_count": len(owned),
+        "owned_unrealized_pl": sum(
+            float(safe_float(t.get("unrealizedPL")) or 0.0) for t in owned
+        ),
+        "account_open_count": len(all_trades),
+        "time_utc": now_utc_iso(),
+    }
+
+
+def bco_live_broker_r_metrics(conn: DBConn, live: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert actual OANDA BCO open P&L into per-trade and basket R."""
+    owned = live.get("owned_open_trades") or []
+    by_id = {safe_str(t.get("id")): t for t in owned if safe_str(t.get("id"))}
+    local = fetchall_dict(conn.execute("""
+        SELECT * FROM trades
+        WHERE status='OPEN' AND broker_trade_id IS NOT NULL AND broker_trade_id<>''
+        ORDER BY entry_time ASC,id ASC
+    """))
+
+    rows = []
+    missing_broker_ids = []
+    total_r = 0.0
+    total_gbp = 0.0
+
+    for trade in local:
+        bid = safe_str(trade.get("broker_trade_id"))
+        broker_trade = by_id.get(bid)
+        if broker_trade is None:
+            missing_broker_ids.append(bid)
+            continue
+
+        upl = float(safe_float(broker_trade.get("unrealizedPL")) or 0.0)
+        risk = float(
+            safe_float(trade.get("effective_risk_gbp"))
+            or safe_float(trade.get("requested_risk_gbp"))
+            or 0.0
+        )
+        if risk <= 0:
+            missing_broker_ids.append(bid)
+            continue
+
+        rr = upl / risk
+        row = dict(trade)
+        row["current_R"] = rr
+        row["broker_unrealized_gbp"] = upl
+        row["return_pct"] = rr * float(safe_float(trade.get("sl_pct")) or BCO_SL_PCT)
+        rows.append(row)
+        total_r += rr
+        total_gbp += upl
+
+    local_ids = {safe_str(t.get("broker_trade_id")) for t in local}
+    unlinked_broker_ids = [bid for bid in by_id if bid not in local_ids]
+    complete = bool(
+        live.get("ok")
+        and not missing_broker_ids
+        and not unlinked_broker_ids
+        and len(rows) == len(local)
+        and len(rows) == len(owned)
+    )
+
+    return {
+        "ok": bool(live.get("ok")),
+        "complete": complete,
+        "rows": rows,
+        "open_count": len(rows),
+        "basket_R": total_r,
+        "basket_pnl_gbp": total_gbp,
+        "positive_pool_R": sum(
+            max(0.0, float(safe_float(r.get("current_R")) or 0.0)) for r in rows
+        ),
+        "missing_broker_ids": missing_broker_ids,
+        "unlinked_broker_ids": unlinked_broker_ids,
+        "broker_open_count": len(owned),
+        "local_linked_open_count": len(local),
+        "time_utc": safe_str(live.get("time_utc")) or now_utc_iso(),
+    }
+
+
+def _bco_live_hwm_state(conn: DBConn, cycle_id: str) -> Dict[str, Any]:
+    cycle = safe_str(cycle_id)
+    stored_cycle = runtime_get(conn, BCO_LIVE_HWM_CYCLE_KEY, "")
+    if not cycle or stored_cycle != cycle:
+        return {
+            "cycle_id": stored_cycle, "high_water_r": None, "high_water_gbp": None,
+            "high_water_at_utc": "", "current_r": None, "current_gbp": None,
+            "current_at_utc": "", "same_cycle": False,
+        }
+    return {
+        "cycle_id": stored_cycle,
+        "high_water_r": safe_float(runtime_get(conn, BCO_LIVE_HWM_R_KEY, "")),
+        "high_water_gbp": safe_float(runtime_get(conn, BCO_LIVE_HWM_GBP_KEY, "")),
+        "high_water_at_utc": runtime_get(conn, BCO_LIVE_HWM_AT_KEY, ""),
+        "high_water_source": runtime_get(conn, BCO_LIVE_HWM_SOURCE_KEY, ""),
+        "current_r": safe_float(runtime_get(conn, BCO_LIVE_CURRENT_R_KEY, "")),
+        "current_gbp": safe_float(runtime_get(conn, BCO_LIVE_CURRENT_GBP_KEY, "")),
+        "current_at_utc": runtime_get(conn, BCO_LIVE_CURRENT_AT_KEY, ""),
+        "same_cycle": True,
+    }
+
+
+def _bco_reset_live_hwm_state(conn: DBConn) -> None:
+    for key, value in (
+        (BCO_LIVE_HWM_CYCLE_KEY, ""),
+        (BCO_LIVE_HWM_R_KEY, "0"),
+        (BCO_LIVE_HWM_GBP_KEY, "0"),
+        (BCO_LIVE_HWM_AT_KEY, ""),
+        (BCO_LIVE_HWM_SOURCE_KEY, "FLAT"),
+        (BCO_LIVE_CURRENT_R_KEY, "0"),
+        (BCO_LIVE_CURRENT_GBP_KEY, "0"),
+        (BCO_LIVE_CURRENT_AT_KEY, now_utc_iso()),
+        (BCO_LIVE_MONITOR_LAST_STATUS_KEY, "FLAT"),
+    ):
+        runtime_set(conn, key, value)
+
+
+def _bco_seed_live_hwm_for_cycle(
+    conn: DBConn,
+    cycle_id: str,
+    state: Dict[str, Any],
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Seed live HWM without losing an already-observed hourly HWM on upgrade."""
+    cycle = safe_str(cycle_id)
+    now_at = safe_str(metrics.get("time_utc")) or now_utc_iso()
+    current_r = float(safe_float(metrics.get("basket_R")) or 0.0)
+    current_gbp = float(safe_float(metrics.get("basket_pnl_gbp")) or 0.0)
+    strategy_hwm = float(safe_float(state.get("high_water_R")) or 0.0)
+    strategy_hwm_at = safe_str(state.get("high_water_seen_at"))
+
+    seed_r = max(0.0, current_r)
+    seed_gbp = current_gbp
+    seed_at = now_at
+    source = "LIVE_BROKER_MONITOR_INIT"
+
+    if strategy_hwm > seed_r + 1e-9:
+        cash = _bco_cash_hwm_at_r_hwm(conn, cycle, strategy_hwm, strategy_hwm_at)
+        historical_gbp = safe_float(cash.get("high_water_gbp"))
+        if historical_gbp is not None:
+            seed_r = strategy_hwm
+            seed_gbp = float(historical_gbp)
+            seed_at = strategy_hwm_at or safe_str(cash.get("hwm_signal_time")) or now_at
+            source = "SEEDED_FROM_EXISTING_HOURLY_HWM"
+
+    runtime_set(conn, BCO_LIVE_HWM_CYCLE_KEY, cycle)
+    runtime_set(conn, BCO_LIVE_HWM_R_KEY, seed_r)
+    runtime_set(conn, BCO_LIVE_HWM_GBP_KEY, seed_gbp)
+    runtime_set(conn, BCO_LIVE_HWM_AT_KEY, seed_at)
+    runtime_set(conn, BCO_LIVE_HWM_SOURCE_KEY, source)
+    runtime_set(conn, BCO_LIVE_CURRENT_R_KEY, current_r)
+    runtime_set(conn, BCO_LIVE_CURRENT_GBP_KEY, current_gbp)
+    runtime_set(conn, BCO_LIVE_CURRENT_AT_KEY, now_at)
+    runtime_set(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, source)
+    return {
+        "cycle_id": cycle, "high_water_r": seed_r, "high_water_gbp": seed_gbp,
+        "high_water_at_utc": seed_at, "source": source,
+    }
+
+
+def _bco_execute_live_harvest_levels(
+    conn: DBConn,
+    cycle_id: str,
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Execute crossed bank levels from a live broker snapshot, intrahour."""
+    if not metrics.get("complete"):
+        return {
+            "ok": False, "skipped": True, "reason": "broker_local_mapping_incomplete",
+            "banked_R": 0.0, "banked_trade_ids": [],
+        }
+
+    current_r = float(safe_float(metrics.get("basket_R")) or 0.0)
+    signal_time = safe_str(metrics.get("time_utc")) or now_utc_iso()
+    if current_r < BCO_BANK_FIRST_LEVEL_R:
+        return {
+            "ok": True, "skipped": True, "reason": "below_first_checkpoint",
+            "banked_R": 0.0, "banked_trade_ids": [],
+        }
+
+    banked = 0.0
+    bank_ids = []
+    stages_completed = 0
+
+    # CURRENT live R prevents retroactive execution of an old, missed checkpoint.
+    for threshold, fraction in bco_bank_levels_up_to(current_r):
+        stage = fetchone_dict(conn.execute("""
+            SELECT * FROM protection_stages
+            WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=? LIMIT 1
+        """, (cycle_id, threshold)))
+
+        if stage:
+            status = safe_str(stage.get("status")).upper()
+            if status in {"EXECUTED", "NO_ELIGIBLE", "EXPIRED_FLAT"}:
+                continue
+            if status in {"EXECUTING", "EXECUTING_RETRY"}:
+                result = finalize_harvest_stage(conn, int(stage.get("id") or 0), signal_time)
+                if safe_str(result.get("status")).upper() == "EXECUTED":
+                    stages_completed += 1
+                continue
+
+        live_rows = list(metrics.get("rows") or [])
+        positive_pool_r = sum(
+            max(0.0, float(safe_float(r.get("current_R")) or 0.0))
+            for r in live_rows
+        )
+
+        if not stage:
+            target = max(0.0, positive_pool_r * float(fraction))
+            status = "ARMED" if target > 0 else "ARMED_WAITING_PROFITABLE_POOL"
+            conn.execute("""
+                INSERT INTO protection_stages(
+                    created_at_utc,updated_at_utc,cycle_id,stage_type,threshold_R,
+                    fraction,status,target_bank_R,armed_at_signal_time,reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (
+                now_utc_iso(), now_utc_iso(), cycle_id, "BANK", threshold,
+                fraction, status, target, signal_time,
+                f"v0.8.13 LIVE trigger: {threshold:.0f}R crossed intrahour; "
+                f"target={fraction*100:.0f}% of live profitable pool {positive_pool_r:.2f}R.",
+            ))
+            stage = fetchone_dict(conn.execute("""
+                SELECT * FROM protection_stages
+                WHERE cycle_id=? AND stage_type='BANK' AND threshold_R=? LIMIT 1
+            """, (cycle_id, threshold))) or {}
+
+        target = float(safe_float(stage.get("target_bank_R")) or 0.0)
+        if target <= 0:
+            if positive_pool_r <= 0:
+                conn.execute(
+                    "UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',"
+                    "updated_at_utc=?,reason=? WHERE id=?",
+                    (now_utc_iso(), f"{threshold:.0f}R live checkpoint crossed; waiting for positive pool.", stage.get("id")),
+                )
+                continue
+            target = positive_pool_r * float(fraction)
+            conn.execute(
+                "UPDATE protection_stages SET target_bank_R=?,status='ARMED',updated_at_utc=?,reason=? WHERE id=?",
+                (target, now_utc_iso(),
+                 f"v0.8.13 LIVE target frozen at {fraction*100:.0f}% of {positive_pool_r:.2f}R positive pool.",
+                 stage.get("id")),
+            )
+
+        eligible = [
+            r for r in live_rows
+            if float(safe_float(r.get("current_R")) or 0.0) > 0
+        ]
+        ranked = sorted(eligible, key=bank_sort_key)
+        selected = []
+        running = 0.0
+        remaining = list(ranked)
+
+        while remaining and running + 0.0001 < target:
+            need = target - running
+            finish = [
+                r for r in remaining
+                if float(safe_float(r.get("current_R")) or 0.0) + 0.0001 >= need
+            ]
+            if finish:
+                bucket = min(bank_sort_key(r)[:2] for r in finish)
+                opts = [r for r in finish if bank_sort_key(r)[:2] == bucket]
+                pick = min(
+                    opts,
+                    key=lambda r: (
+                        float(safe_float(r.get("current_R")) or 0.0) - need,
+                        bank_sort_key(r),
+                    ),
+                )
+            else:
+                pick = remaining[0]
+            selected.append(pick)
+            running += float(safe_float(pick.get("current_R")) or 0.0)
+            remaining = [r for r in remaining if r.get("trade_id") != pick.get("trade_id")]
+
+        if not selected:
+            conn.execute(
+                "UPDATE protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',"
+                "updated_at_utc=?,reason=? WHERE id=?",
+                (now_utc_iso(), f"Fixed live target {target:.2f}R remains armed; no profitable whole trade available.", stage.get("id")),
+            )
+            continue
+
+        selected_ids = [safe_str(t.get("trade_id")) for t in selected]
+        conn.execute(
+            "UPDATE protection_stages SET status='EXECUTING',selected_trade_ids=?,updated_at_utc=?,reason=? WHERE id=?",
+            (",".join(selected_ids), now_utc_iso(),
+             f"v0.8.13 intrahour LIVE {threshold:.0f}R bank; fixed target {target:.2f}R; durable retry active.",
+             stage.get("id")),
+        )
+
+        ids = []
+        actual = 0.0
+        for trade in selected:
+            rr = float(safe_float(trade.get("current_R")) or 0.0)
+            px = float(safe_float(trade.get("current_price")) or safe_float(trade.get("entry_price")) or 0.0)
+            ok, val = execute_or_sim_close(
+                conn, trade, signal_time, px,
+                f"live_immediate_bank_{int(threshold)}R", rr
+            )
+            if ok:
+                actual += val
+                ids.append(safe_str(trade.get("trade_id")))
+
+        result = finalize_harvest_stage(conn, int(stage.get("id") or 0), signal_time)
+        if safe_str(result.get("status")).upper() == "EXECUTED":
+            stages_completed += 1
+        if ids:
+            banked += actual
+            bank_ids.extend(ids)
+
+    if banked:
+        conn.execute(
+            "UPDATE basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,updated_at_utc=? "
+            "WHERE singleton_key='BCO_LONG'",
+            (banked, now_utc_iso()),
+        )
+        refresh_current_cycle_realized_r(conn)
+
+    return {
+        "ok": True,
+        "banked_R": banked,
+        "banked_trade_ids": bank_ids,
+        "bank_stages_completed": stages_completed,
+        "trigger_basis": "LIVE_BROKER_NORMALISED_R",
+        "trigger_time_utc": signal_time,
+    }
+
+
+def bco_live_hwm_and_harvest(live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One live-monitor iteration: update HWM and fire crossed bank levels."""
+    if not _live_monitor_lock.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "live_monitor_already_running"}
+    try:
+        live = live or bco_owned_open_trades_snapshot()
+        if not live.get("ok"):
+            return {"ok": False, "error": live.get("error")}
+
+        with _db_lock, get_conn() as conn:
+            state = fetchone_dict(conn.execute(
+                "SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+            )) or {}
+            cycle = safe_str(state.get("cycle_id"))
+            metrics = bco_live_broker_r_metrics(conn, live)
+
+            local_open_row = fetchone_dict(conn.execute(
+                "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+            )) or {}
+            local_open = int(safe_float(local_open_row.get("c")) or 0)
+
+            if local_open == 0 and int(live.get("owned_open_count") or 0) == 0:
+                _bco_reset_live_hwm_state(conn)
+                return {
+                    "ok": True, "flat": True, "cycle_id": cycle,
+                    "current_r": 0.0, "current_gbp": 0.0,
+                    "high_water_r": 0.0, "high_water_gbp": 0.0,
+                    "time_utc": safe_str(live.get("time_utc")) or now_utc_iso(),
+                }
+
+            if not cycle:
+                runtime_set(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, "WAITING_FOR_CYCLE_ID")
+                return {
+                    "ok": True, "skipped": True, "reason": "active_open_trades_without_cycle_id",
+                    "metrics": metrics,
+                }
+
+            # Never seed/update R-HWM or execute a bank from a partial broker/local
+            # mapping. The next successful fast poll will resume automatically.
+            if not metrics.get("complete"):
+                runtime_set(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, "MAPPING_INCOMPLETE")
+                return {
+                    "ok": True, "skipped": True, "reason": "broker_local_mapping_incomplete",
+                    "cycle_id": cycle, "metrics": metrics,
+                }
+
+            hwm_state = _bco_live_hwm_state(conn, cycle)
+            if not hwm_state.get("same_cycle"):
+                hwm_state = _bco_seed_live_hwm_for_cycle(conn, cycle, state, metrics)
+
+            current_r = float(safe_float(metrics.get("basket_R")) or 0.0)
+            current_gbp = float(safe_float(metrics.get("basket_pnl_gbp")) or 0.0)
+            observed_at = safe_str(metrics.get("time_utc")) or now_utc_iso()
+
+            runtime_set(conn, BCO_LIVE_CURRENT_R_KEY, current_r)
+            runtime_set(conn, BCO_LIVE_CURRENT_GBP_KEY, current_gbp)
+            runtime_set(conn, BCO_LIVE_CURRENT_AT_KEY, observed_at)
+
+            stored_hwm_r = float(safe_float(hwm_state.get("high_water_r")) or 0.0)
+            if current_r > stored_hwm_r + 1e-9:
+                runtime_set(conn, BCO_LIVE_HWM_R_KEY, current_r)
+                runtime_set(conn, BCO_LIVE_HWM_GBP_KEY, current_gbp)
+                runtime_set(conn, BCO_LIVE_HWM_AT_KEY, observed_at)
+                runtime_set(conn, BCO_LIVE_HWM_SOURCE_KEY, "LIVE_BROKER_MONITOR")
+
+            status = "OK" if metrics.get("complete") else "MAPPING_INCOMPLETE"
+            runtime_set(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, status)
+
+            harvest = _bco_execute_live_harvest_levels(conn, cycle, metrics)
+
+            return {
+                "ok": True,
+                "cycle_id": cycle,
+                "mapping_complete": bool(metrics.get("complete")),
+                "current_r": current_r,
+                "current_gbp": current_gbp,
+                "current_at_utc": observed_at,
+                "high_water_r": safe_float(runtime_get(conn, BCO_LIVE_HWM_R_KEY, "")),
+                "high_water_gbp": safe_float(runtime_get(conn, BCO_LIVE_HWM_GBP_KEY, "")),
+                "high_water_at_utc": runtime_get(conn, BCO_LIVE_HWM_AT_KEY, ""),
+                "monitor_interval_seconds": BCO_LIVE_MONITOR_INTERVAL_SECONDS,
+                "harvest": harvest,
+                "missing_broker_ids": metrics.get("missing_broker_ids"),
+                "unlinked_broker_ids": metrics.get("unlinked_broker_ids"),
+            }
+    finally:
+        _live_monitor_lock.release()
+
+
+def bco_live_monitor_status() -> Dict[str, Any]:
+    """Read-only persisted live-monitor status; never triggers an order."""
+    with get_conn() as conn:
+        state = fetchone_dict(conn.execute(
+            "SELECT cycle_id FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+        )) or {}
+        cycle = safe_str(state.get("cycle_id"))
+        h = _bco_live_hwm_state(conn, cycle)
+        return {
+            "ok": True,
+            "cycle_id": cycle,
+            "current_r": h.get("current_r"),
+            "current_gbp": h.get("current_gbp"),
+            "current_at_utc": h.get("current_at_utc"),
+            "high_water_r": h.get("high_water_r"),
+            "high_water_gbp": h.get("high_water_gbp"),
+            "high_water_at_utc": h.get("high_water_at_utc"),
+            "high_water_source": h.get("high_water_source"),
+            "same_cycle": h.get("same_cycle"),
+            "last_status": runtime_get(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, ""),
+            "monitor_interval_seconds": BCO_LIVE_MONITOR_INTERVAL_SECONDS,
+            "harvest_trigger_basis": "LIVE_BROKER_NORMALISED_R",
+            "read_only_status_endpoint": True,
+        }
+
+
 def reconcile_broker() -> Dict[str,Any]:
     if not OANDA_ENABLED or not OANDA_ACCOUNT_ID:
         return {"ok":False,"skipped":True,"reason":"OANDA not configured"}
@@ -4663,6 +5158,40 @@ def start_signal_recovery_worker() -> None:
     _signal_recovery_thread.start()
 
 
+
+def _live_monitor_worker() -> None:
+    """Fast broker-only HWM/harvest loop; independent of hourly TradingView."""
+    while not _worker_stop.is_set():
+        try:
+            if OANDA_ENABLED and OANDA_ACCOUNT_ID:
+                result = bco_live_hwm_and_harvest()
+                harvest = result.get("harvest") if isinstance(result, dict) else {}
+                if isinstance(harvest, dict) and (harvest.get("banked_trade_ids") or []):
+                    log_event(
+                        "live_intrahour_harvest",
+                        f"BCO intrahour harvest executed: {harvest.get('banked_R')}R",
+                        result,
+                    )
+        except Exception as exc:
+            log_event("live_monitor_error", str(exc))
+        if _worker_stop.wait(BCO_LIVE_MONITOR_INTERVAL_SECONDS):
+            break
+
+
+def start_live_monitor_worker() -> None:
+    global _live_monitor_started, _live_monitor_thread
+    if _live_monitor_thread is not None and _live_monitor_thread.is_alive():
+        _live_monitor_started = True
+        return
+    _live_monitor_started = True
+    _live_monitor_thread = threading.Thread(
+        target=_live_monitor_worker,
+        name="bco-live-hwm-and-harvest-monitor",
+        daemon=True,
+    )
+    _live_monitor_thread.start()
+
+
 def _worker() -> None:
     while not _worker_stop.wait(BROKER_RECONCILE_INTERVAL_SECONDS):
         try:
@@ -4747,6 +5276,7 @@ def _background_bootstrap() -> None:
         _bootstrap_state["status"] = "STARTING_WORKER"
         start_signal_recovery_worker()
         start_worker()
+        start_live_monitor_worker()
         try:
             log_event("startup", APP_NAME, {"safety": safety_status()})
         except Exception:
@@ -5408,6 +5938,9 @@ def operational_health() -> Dict[str, Any]:
     tx_age = _iso_age_seconds(tx_sync_at)
 
     worker_alive = bool(_worker_thread is not None and _worker_thread.is_alive())
+    live_monitor_worker_alive = bool(
+        _live_monitor_thread is not None and _live_monitor_thread.is_alive()
+    )
     recovery_worker_alive = bool(
         _signal_recovery_thread is not None and _signal_recovery_thread.is_alive()
     )
@@ -5430,6 +5963,11 @@ def operational_health() -> Dict[str, Any]:
             "last_recovery_at": recovery_last_at,
             "last_recovered_count": recovery_last_count,
             "broker_worker_alive": worker_alive,
+        },
+        "live_hwm_harvest_monitor": {
+            "ok": live_monitor_worker_alive,
+            "thread_alive": live_monitor_worker_alive,
+            "interval_seconds": BCO_LIVE_MONITOR_INTERVAL_SECONDS,
         },
         "signal_freshness": {
             "ok": signal_age is None or signal_age <= BCO_HEALTH_SIGNAL_STALE_SECONDS,
@@ -5640,6 +6178,11 @@ def practice_smoke_close(broker_trade_id: str, x_admin_secret: Optional[str] = H
     if OANDA_ENV != "practice": raise HTTPException(status_code=400,detail="smoke-close is practice-only")
     if not BCO_PRACTICE_SMOKE_TEST_ENABLED: raise HTTPException(status_code=403,detail="BCO_PRACTICE_SMOKE_TEST_ENABLED=false")
     return close_broker_trade(broker_trade_id, f"SMOKE_{broker_trade_id}", "practice_smoke_test")
+
+
+@app.get("/broker/live-monitor/status")
+def live_monitor_status_endpoint():
+    return bco_live_monitor_status()
 
 
 @app.post("/admin/reconcile")
@@ -6628,11 +7171,14 @@ def _bco_standard_top_uncached():
     local_open=len(rows);broker_open=int(broker.get("owned_open_count") or 0)
     mature=sum(1 for r in rows if int(safe_float(r.get("hold_candles")) or 0)>=BCO_MIN_HOLD_HOURS)
     oldest=max([int(safe_float(r.get("hold_candles")) or 0) for r in rows] or [0])
-    basket_r=safe_float(lm.get("basket_R")) or 0.0
+    hourly_basket_r=safe_float(lm.get("basket_R")) or 0.0
+    basket_r=hourly_basket_r
     model_open=safe_float(lm.get("basket_pnl_gbp")) or 0.0
     broker_open_pnl=safe_float(broker.get("owned_unrealized_pl")) or 0.0
-    hwm=safe_float(basket.get("high_water_R")) or 0.0
-    hwm_time=safe_str(basket.get("high_water_seen_at"))
+    hourly_hwm=safe_float(basket.get("high_water_R")) or 0.0
+    hourly_hwm_time=safe_str(basket.get("high_water_seen_at"))
+    hwm=hourly_hwm
+    hwm_time=hourly_hwm_time
 
     # v0.7.7: current basket HWM/giveback belongs to the ACTIVE basket only.
     # Once both OANDA and local BCO exposure are flat, show zero immediately;
@@ -6642,29 +7188,55 @@ def _bco_standard_top_uncached():
         hwm = 0.0
         hwm_time = ""
 
-    # v0.8.10: £ high-water must use the SAME broker-P&L basis as the
-    # current Broker P&L tile. The R high-water remains the deterministic
-    # basket-manager measure; cash is the persisted OANDA BCO open P&L nearest
-    # that exact HWM candle (with an effective-risk reconstruction fallback).
-    # Never use hwm × nominal requested £5: BCO's real £/R varies with OANDA
-    # whole-unit sizing and quote/home conversion.
+    # v0.8.13: dashboard/harvest visibility prefers the fast broker monitor.
+    # Hourly basket_state HWM remains intact for deterministic research.
     current_cycle=safe_str(basket.get("cycle_id"))
-    hwm_cash = {
-        "high_water_gbp": 0.0 if authoritative_flat else None,
-        "source": "FLAT_OR_NO_HWM" if authoritative_flat else "UNRESOLVED",
-        "broker_snapshot_time_utc": "",
-        "broker_snapshot_distance_seconds": None,
-        "hwm_signal_time": hwm_time,
-        "hwm_signal_price": None,
-    }
-    if hwm > 0 and current_cycle:
-        with get_conn() as _hwm_conn:
-            hwm_cash = _bco_cash_hwm_at_r_hwm(
-                _hwm_conn, current_cycle, hwm, hwm_time
-            )
-        if not hwm_time:
-            hwm_time=safe_str(hwm_cash.get("hwm_signal_time"))
-    hwm_gbp=safe_float(hwm_cash.get("high_water_gbp"))
+    live_hwm_state = {}
+    live_metrics = {}
+    if current_cycle and not authoritative_flat:
+        with get_conn() as _live_conn:
+            live_hwm_state = _bco_live_hwm_state(_live_conn, current_cycle)
+            live_metrics = bco_live_broker_r_metrics(_live_conn, broker)
+
+    if live_metrics.get("complete"):
+        basket_r = float(safe_float(live_metrics.get("basket_R")) or 0.0)
+
+    use_live_hwm = bool(
+        current_cycle
+        and not authoritative_flat
+        and live_hwm_state.get("same_cycle")
+        and safe_float(live_hwm_state.get("high_water_r")) is not None
+    )
+
+    if use_live_hwm:
+        hwm = float(safe_float(live_hwm_state.get("high_water_r")) or 0.0)
+        hwm_gbp = safe_float(live_hwm_state.get("high_water_gbp"))
+        hwm_time = safe_str(live_hwm_state.get("high_water_at_utc"))
+        _stored_live_source = safe_str(live_hwm_state.get("high_water_source")) or "LIVE_BROKER_MONITOR"
+        hwm_cash = {
+            "high_water_gbp": hwm_gbp,
+            "source": _stored_live_source,
+            "broker_snapshot_time_utc": hwm_time,
+            "broker_snapshot_distance_seconds": 0.0,
+        }
+    else:
+        hwm_cash = {
+            "high_water_gbp": 0.0 if authoritative_flat else None,
+            "source": "FLAT_OR_NO_HWM" if authoritative_flat else "HOURLY_HWM_FALLBACK",
+            "broker_snapshot_time_utc": "",
+            "broker_snapshot_distance_seconds": None,
+            "hwm_signal_time": hwm_time,
+            "hwm_signal_price": None,
+        }
+        if hwm > 0 and current_cycle:
+            with get_conn() as _hwm_conn:
+                hwm_cash = _bco_cash_hwm_at_r_hwm(
+                    _hwm_conn, current_cycle, hwm, hwm_time
+                )
+            if not hwm_time:
+                hwm_time=safe_str(hwm_cash.get("hwm_signal_time"))
+        hwm_gbp=safe_float(hwm_cash.get("high_water_gbp"))
+
     give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     current_open_basket_gbp=safe_float(lm.get("basket_pnl_gbp")) or 0.0
     realized_pnl=safe_float(closed.get("p")) or 0.0
@@ -6789,6 +7361,12 @@ def _bco_standard_top_uncached():
                   "high_water_gbp_source":safe_str(hwm_cash.get("source")),
                   "high_water_gbp_snapshot_time_utc":safe_str(hwm_cash.get("broker_snapshot_time_utc")),
                   "high_water_gbp_snapshot_distance_seconds":safe_float(hwm_cash.get("broker_snapshot_distance_seconds")),
+                  "high_water_source":safe_str(hwm_cash.get("source")),
+                  "high_water_live":bool(use_live_hwm and safe_str(hwm_cash.get("source")) in {"LIVE_BROKER_MONITOR","LIVE_BROKER_MONITOR_INIT"}),
+                  "high_water_monitor_interval_seconds":BCO_LIVE_MONITOR_INTERVAL_SECONDS,
+                  "hourly_strategy_high_water_r":hourly_hwm,
+                  "hourly_strategy_high_water_time":hourly_hwm_time,
+                  "hourly_strategy_basket_r":hourly_basket_r,
                   "giveback_basis_r":current_giveback_basis_r,
                   "giveback_basis_gbp":current_giveback_basis_gbp,
                   "giveback_r":giveback_r,"giveback_gbp":giveback_gbp,
@@ -6827,7 +7405,9 @@ def _bco_standard_top_uncached():
       "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION,
                 "new_cycle_exit_manager":BCO_NEW_CYCLE_EXIT_MANAGER,
-                "risk_round_up_max_overage_pct":BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT}}
+                "risk_round_up_max_overage_pct":BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT,
+                "live_monitor_interval_seconds":BCO_LIVE_MONITOR_INTERVAL_SECONDS,
+                "harvest_trigger_basis":"LIVE_BROKER_NORMALISED_R_WITH_HOURLY_FALLBACK"}}
 
 def bco_standard_top_snapshot(force=False):
     now_ts = time.time()
@@ -6891,8 +7471,10 @@ def aggregate_portfolio_summary(
             "high_water_gbp": safe_float(strategy.get("high_water_gbp")),
             "high_water_r": safe_float(strategy.get("high_water_r")),
             "high_water_at_utc": safe_str(strategy.get("high_water_time")) or None,
-            "high_water_gbp_source": safe_str(strategy.get("high_water_gbp_source")) or None,
+            "high_water_gbp_source": safe_str(strategy.get("high_water_gbp_source") or strategy.get("high_water_source")) or None,
             "high_water_gbp_snapshot_at_utc": safe_str(strategy.get("high_water_gbp_snapshot_time_utc")) or None,
+            "high_water_live": bool(strategy.get("high_water_live")),
+            "high_water_monitor_interval_seconds": safe_float(strategy.get("high_water_monitor_interval_seconds")),
             "giveback_gbp": safe_float(strategy.get("giveback_gbp")),
             "giveback_r": safe_float(strategy.get("giveback_r")),
         },
@@ -7121,15 +7703,33 @@ def _bco_standard_profit_harvesting_html():
     s = snapshot()
     b = s.get("basket") or {}
     cycle = safe_str(b.get("cycle_id"))
-    hwm = float(safe_float(b.get("high_water_R")) or 0.0)
+    top = bco_standard_top_snapshot(force=True)
+    top_strategy = top.get("strategy") or {}
+    hwm = float(
+        safe_float(top_strategy.get("high_water_r"))
+        or safe_float(b.get("high_water_R"))
+        or 0.0
+    )
+    current_basket_r = float(
+        safe_float(top_strategy.get("basket_r"))
+        or safe_float(b.get("basket_R"))
+        or 0.0
+    )
 
     with get_conn() as conn:
         rows = fetchall_dict(conn.execute(
             "SELECT * FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' ORDER BY threshold_R",
             (cycle,),
         )) if cycle else []
+        outcomes = fetchall_dict(conn.execute(
+            "SELECT * FROM harvest_execution_outcomes WHERE cycle_id=? ORDER BY protection_stage_id ASC",
+            (cycle,),
+        )) if cycle else []
 
-    # Show at least through 300R and two checkpoints above the current HWM.
+    outcome_by_stage = {
+        int(safe_float(o.get("protection_stage_id")) or 0): o for o in outcomes
+    }
+
     display_top = max(300.0, hwm + (2.0 * BCO_BANK_STEP_R))
     levels = bco_bank_levels_up_to(display_top)
     banks = []
@@ -7141,11 +7741,21 @@ def _bco_standard_profit_harvesting_html():
         target = safe_float(m.get("target_bank_R"))
         executed = safe_float(m.get("executed_R"))
         status = safe_str(m.get("status") or "NOT_ARMED")
+        outcome = outcome_by_stage.get(int(safe_float(m.get("id")) or 0), {})
+        actual_gbp = safe_float(outcome.get("net_realized_gbp"))
+        broker_gbp = safe_float(outcome.get("broker_realized_pl_gbp"))
+        financing_gbp = safe_float(outcome.get("financing_gbp"))
+        cash_note = ""
+        if actual_gbp is not None:
+            cash_note = (
+                f"Broker P/L {_money(broker_gbp)}"
+                + (f" · financing {_money(financing_gbp)}" if financing_gbp is not None else "")
+            )
         banks.append(f'''
         <tr>
           <td>{threshold:.0f}R</td><td>{esc(status)}</td><td>{fraction*100:.0f}%</td>
           <td>{_fmt_metric(target,"R",2)}</td><td class="{_pnl_class(executed)}">{_fmt_metric(executed,"R",2)}</td>
-          <td>{_money((executed or 0.0)*BCO_RISK_PER_TRADE_GBP) if executed is not None else "—"}</td>
+          <td class="{_pnl_class(actual_gbp)}">{_money(actual_gbp)}{f'<div class="small">{esc(cash_note)}</div>' if cash_note else ''}</td>
           <td>{esc(m.get("executed_at_signal_time") or "—")}</td><td>{esc(m.get("selected_trade_ids") or "waiting")}</td>
         </tr>''')
 
@@ -7158,25 +7768,36 @@ def _bco_standard_profit_harvesting_html():
         next_level += float(BCO_BANK_STEP_R)
     next_fraction = bco_bank_fraction_for_level(next_level)
 
+    live_label = (
+        f"LIVE broker monitor · every ~{BCO_LIVE_MONITOR_INTERVAL_SECONDS:g}s"
+        if top_strategy.get("high_water_live")
+        else "Hourly fallback until live monitor has a complete broker/local mapping"
+    )
+
     return f'''
       <div class="section-note">
         <strong>Simplified BCO basket harvesting.</strong> First checkpoint is 50R, then every additional +50R.
         Bank 20% at 50R and 100R; bank 25% from 150R onward. The percentage is frozen against
         the <strong>remaining profitable open BCO pool</strong> at that checkpoint. Profitable whole trades
-        can be banked immediately and do not need to be 48h old. Surviving trades continue under the normal Current Manager.
+        can be banked immediately and do not need to be 48h old. Surviving trades continue under the active cycle manager.
       </div>
       <div class="section-note small">
-        The former exceptional pre-48 cohort ratchet has been retired as redundant. Historical COHORT rows
-        remain in database exports for audit only; production creates and consumes BANK stages only.
+        <strong>Intrahour execution:</strong> {esc(live_label)}. A live R checkpoint is acted on as soon as
+        the broker monitor observes it; the hourly TradingView processor remains a fallback only.
+        Historical hourly HWM/research remains unchanged for comparability.
       </div>
       <div class="metric-grid">
-        <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(b.get("basket_R"))}">{safe_float(b.get("basket_R")) or 0:.2f}R</div></div>
-        <div class="mini-card"><div class="k">High-Water</div><div class="v {_pnl_class(b.get("high_water_R"))}">{safe_float(b.get("high_water_R")) or 0:.2f}R</div></div>
-        <div class="mini-card"><div class="k">Giveback</div><div class="v">{safe_float(b.get("giveback_pct")) or 0:.1f}%</div></div>
+        <div class="mini-card"><div class="k">Current Basket</div><div class="v {_pnl_class(current_basket_r)}">{current_basket_r:.2f}R</div><div class="small">Live broker-normalised when mapping is complete</div></div>
+        <div class="mini-card"><div class="k">Live High-Water</div><div class="v {_pnl_class(hwm)}">{hwm:.2f}R</div><div class="small">{esc(top_strategy.get("high_water_time") or "—")}</div></div>
+        <div class="mini-card"><div class="k">Giveback</div><div class="v">{safe_float(top_strategy.get("giveback_r")) or 0:.2f}R</div><div class="small">{_money(top_strategy.get("giveback_gbp"))} broker-basis</div></div>
         <div class="mini-card"><div class="k">Next Harvest</div><div class="v pos">{next_level:.0f}R</div><div class="small">Bank {next_fraction*100:.0f}% of remaining profitable pool</div></div>
       </div>
       <h3>BCO Cash-Banking Ladder</h3>
-      <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Approx £ Banked</th><th>Executed At</th><th>Trade IDs</th></tr></thead><tbody>{"".join(banks)}</tbody></table></div>
+      <div class="table-scroll"><table><thead><tr><th>Level</th><th>Status</th><th>Bank %</th><th>Target at Trigger</th><th>Actually Banked</th><th>Actual £ Banked</th><th>Executed At</th><th>Trade IDs</th></tr></thead><tbody>{"".join(banks)}</tbody></table></div>
+      <div class="section-note small">
+        <strong>Actual £ Banked</strong> is authoritative broker/net realised cash from the selected harvest trades
+        (broker realised P/L plus financing where applicable). It is no longer approximated as R × nominal £5.
+      </div>
     '''
 
 
@@ -8023,7 +8644,7 @@ async function loadTop(force=false){{const st=document.getElementById('topStatus
 <div class="cards four">
 ${{card('NAV',money(a.nav),`Bal ${{money(a.balance)}} · Margin ${{money(a.margin_available)}}`)}}
 ${{card('Broker P&L',money(s.headline_pnl),`Open broker P&L · Realised ${{money(s.realized_pnl)}}`,cls(s.headline_pnl))}}
-${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}`,cls(s.high_water_gbp))}}
+${{card('High-Water',money(s.high_water_gbp),`${{Number(s.high_water_r||0).toFixed(2)}}R · ${{s.high_water_time?localTime(s.high_water_time):'time not recorded'}}${{s.high_water_live?' · LIVE':''}}`,cls(s.high_water_gbp))}}
 ${{card('Giveback',`${{money(s.giveback_gbp)}}${{gb===null?'':' · '+gb.toFixed(1)+'%'}}`,`${{Number(s.giveback_r||0).toFixed(2)}}R`,gb===null?'':gb>=50?'neg':gb>=25?'warn':'pos')}}</div>
 <div class="cards four">
 ${{card('This Week',money(ac.week_pnl),eh(ac.week_label||''),cls(ac.week_pnl))}}
