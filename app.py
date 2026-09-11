@@ -1,4 +1,4 @@
-# BCO Live v0.8.9 — read-only aggregate portfolio summary
+# BCO Live v0.8.15 — Directional Intelligence Research + Last-Trade Visibility + Intrahour Harvest
 # Project Exit Plan
 #
 # Design sources:
@@ -36,11 +36,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.14 — Last-Trade Visibility + Live HWM + Intrahour Harvest"
-APP_VERSION = "0.8.14"
-POLICY_VERSION = "bco_v0.8.14_last_trade_visibility_live_hwm_intrahour_harvest_2026_09_10"
+APP_NAME = "Project Exit Plan — BCO v0.8.15 — Directional Intelligence Research + Last-Trade Visibility + Live HWM + Intrahour Harvest"
+APP_VERSION = "0.8.15"
+POLICY_VERSION = "bco_v0.8.15_directional_intelligence_research_last_trade_live_hwm_intrahour_harvest_2026_09_11"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.15 — prospective Directional Intelligence research only.
+# - Freezes one comparable LONG and hypothetical SHORT research row per new BCO signal.
+# - SHORT uses a pre-declared bearish-context classifier (or an explicit short payload if supplied); no historical optimisation/backfill.
+# - Records independent candidate episodes, 6/12/24/48/72/96h direction-normalised R, MFE/MAE, post-peak deterioration and snapback.
+# - AI output is extended with directional bias/regime plus independent long/short views.
+# - Research has ZERO broker/execution authority and is never consumed by live entry, ATR2/Classic exits, sizing, stops or harvesting.
+#
 # v0.8.14 — Portfolio Hub last-trade-opened visibility only.
 # - Exposes the latest successful broker-confirmed BCO opening audit time.
 # - Display/API metadata only; no entry, exit, risk, ATR2/Classic, SL, HWM,
@@ -930,6 +937,7 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_status ON bco_exit_challenger_shadow(status,paired_complete)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_trade ON bco_exit_challenger_shadow(trade_id,challenger)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_signal ON bco_exit_challenger_shadow(last_raw_signal_id)")
+        _ensure_bco_directional_intelligence_on_conn(conn)
 
 
 def _ensure_bco_exit_challenger_shadow_schema_on_conn(conn: DBConn) -> None:
@@ -5327,8 +5335,8 @@ AI_SHADOW_ENABLED = os.getenv("AI_SHADOW_ENABLED", "false").strip().lower() == "
 AI_SHADOW_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 AI_SHADOW_OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip().rstrip("/")
 AI_SHADOW_MODEL = os.getenv("AI_SHADOW_MODEL", "gpt-5.6-terra").strip() or "gpt-5.6-terra"
-AI_SHADOW_PROMPT_VERSION = "ai_regime_observer_family_v1_2026_08_21"
-AI_SHADOW_OBSERVER_VERSION = "ai_regime_observer_v1_event_driven_2026_08_21"
+AI_SHADOW_PROMPT_VERSION = "ai_regime_observer_bco_directional_v2_2026_09_11"
+AI_SHADOW_OBSERVER_VERSION = "ai_regime_observer_bco_directional_v2_event_driven_2026_09_11"
 AI_SHADOW_EVENT_DRIVEN_ONLY = os.getenv("AI_SHADOW_EVENT_DRIVEN_ONLY", "true").strip().lower() == "true"
 AI_SHADOW_TIMEOUT_SECONDS = max(10.0, min(float(os.getenv("AI_SHADOW_TIMEOUT_SECONDS", "45")), 120.0))
 AI_SHADOW_MAX_OUTPUT_TOKENS = max(250, min(int(float(os.getenv("AI_SHADOW_MAX_OUTPUT_TOKENS", "700"))), 2000))
@@ -5338,7 +5346,7 @@ AI_SHADOW_GIVEBACK_BANDS_PCT = (25.0, 50.0, 75.0)
 # still being learned prospectively. These are CALL TRIGGERS ONLY.
 AI_SHADOW_HIGH_WATER_LEVELS_R = (25.0, 50.0, 75.0, 100.0, 200.0, 300.0)
 
-AI_REGIME_SYSTEM_PROMPT = 'You are the Project Exit Plan AI Regime Observer.\nYou are research-only and have ZERO authority over live or demo trading.\n\nYou receive one immutable point-in-time snapshot captured before the deterministic\ntrading worker acts on that signal. Use ONLY that snapshot. Do not use web\nknowledge, remembered market history, later candles, hidden information, or\nassumptions about what happened next.\n\nThis project trades BCO/Brent long-only using deterministic rules. BCO is a\nsingle-market strategy with stacked entries. Existing positions use a 48h minimum\nnormal hold with hourly mature-runner review thereafter. Your role is to classify\nthe current Brent regime and independently describe whether a fresh deterministic\nlong slice looks supported and whether existing exposure appears HOLD / PROTECT /\nREDUCE. You do not make or alter trading decisions.\n\nregime TREND / CHOP / TRANSITION / EXHAUSTION describes the current state only.\nBe conservative about certainty. Candidate state is evidence, not an instruction.'
+AI_REGIME_SYSTEM_PROMPT = 'You are the Project Exit Plan AI Regime Observer.\nYou are research-only and have ZERO authority over live or demo trading.\n\nYou receive one immutable point-in-time snapshot captured before the deterministic\ntrading worker acts on that signal. Use ONLY that snapshot. Do not use web\nknowledge, remembered market history, later candles, hidden information, or\nassumptions about what happened next.\n\nProduction currently trades BCO/Brent LONG only using deterministic rules and stacked entries.\nExisting positions use the production cycle-bound exit manager and harvesting rules.\nFor research, independently assess BOTH directions so we can learn whether a future\ndirectional router could add value without changing the current strategy.\n\nentry_view preserves the existing production-long interpretation for compatibility.\nlong_view independently rates a fresh LONG as ENTER / HOLD / AVOID.\nshort_view independently rates a hypothetical SHORT as ENTER / HOLD / AVOID.\ndirectional_regime must distinguish TREND_UP / TREND_DOWN / TRANSITION / CHOP /\nEXHAUSTION_UP / EXHAUSTION_DOWN. directional_bias is UP / DOWN / NEUTRAL / MIXED.\nmanagement_view still refers to the CURRENT production exposure only.\n\nBe conservative about certainty. Candidate states are evidence, not instructions.\nYou do not make or alter trading decisions.'
 
 AI_REGIME_OUTPUT_SCHEMA = {
     "type": "object",
@@ -5346,6 +5354,10 @@ AI_REGIME_OUTPUT_SCHEMA = {
         "entry_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
         "management_view": {"type": "string", "enum": ["HOLD", "PROTECT", "REDUCE"]},
         "regime": {"type": "string", "enum": ["TREND", "CHOP", "TRANSITION", "EXHAUSTION"]},
+        "directional_bias": {"type": "string", "enum": ["UP", "DOWN", "NEUTRAL", "MIXED"]},
+        "directional_regime": {"type": "string", "enum": ["TREND_UP", "TREND_DOWN", "TRANSITION", "CHOP", "EXHAUSTION_UP", "EXHAUSTION_DOWN"]},
+        "long_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
+        "short_view": {"type": "string", "enum": ["ENTER", "HOLD", "AVOID"]},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
         "live_rule_assessment": {
             "type": "string",
@@ -5361,7 +5373,8 @@ AI_REGIME_OUTPUT_SCHEMA = {
         "short_reason": {"type": "string"},
     },
     "required": [
-        "entry_view","management_view","regime","confidence",
+        "entry_view","management_view","regime","directional_bias",
+        "directional_regime","long_view","short_view","confidence",
         "live_rule_assessment","reason_codes","short_reason"
     ],
     "additionalProperties": False,
@@ -5398,6 +5411,10 @@ def ensure_ai_regime_observer_table() -> None:
                 entry_view TEXT,
                 management_view TEXT,
                 regime TEXT,
+                directional_bias TEXT,
+                directional_regime TEXT,
+                long_view TEXT,
+                short_view TEXT,
                 confidence INTEGER,
                 live_rule_assessment TEXT,
                 reason_codes TEXT,
@@ -5410,6 +5427,18 @@ def ensure_ai_regime_observer_table() -> None:
                 error TEXT
             )
         """)
+        # Existing Railway DBs may already have the v1 table. Add directional
+        # columns only when absent; this changes research schema only.
+        if getattr(conn, "postgres", False):
+            _cols = {safe_str(r.get("column_name")) for r in fetchall_dict(conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?",
+                ("ai_regime_observer",)
+            ))}
+        else:
+            _cols = {safe_str(r.get("name")) for r in fetchall_dict(conn.execute("PRAGMA table_info(ai_regime_observer)"))}
+        for _name in ("directional_bias","directional_regime","long_view","short_view"):
+            if _name not in _cols:
+                conn.execute(f"ALTER TABLE ai_regime_observer ADD COLUMN {_name} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_status ON ai_regime_observer(status, created_at_utc)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_asset ON ai_regime_observer(asset, raw_signal_id)")
         conn.commit()
@@ -5508,7 +5537,7 @@ def _aiobs_openai_call(model_input, raw_signal_id):
                 data = json.loads(resp.read().decode("utf-8"))
             txt = _aiobs_extract_text(data)
             decision = json.loads(txt) if txt else {}
-            required = {"entry_view","management_view","regime","confidence","live_rule_assessment","reason_codes","short_reason"}
+            required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
             if not isinstance(decision, dict) or not required.issubset(decision):
                 raise ValueError("structured regime decision missing required fields")
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -5560,12 +5589,15 @@ def process_ai_regime_observer(raw_signal_id):
         d = api["decision"]
         conn.execute("""UPDATE ai_regime_observer SET
                         status='COMPLETE',updated_at_utc=?,completed_at_utc=?,
-                        entry_view=?,management_view=?,regime=?,confidence=?,
+                        entry_view=?,management_view=?,regime=?,directional_bias=?,
+                        directional_regime=?,long_view=?,short_view=?,confidence=?,
                         live_rule_assessment=?,reason_codes=?,short_reason=?,
                         response_id=?,input_tokens=?,output_tokens=?,model=?,error=''
                         WHERE raw_signal_id=?""",
                      (now,now,safe_str(d.get("entry_view")),safe_str(d.get("management_view")),
-                      safe_str(d.get("regime")),int(safe_float(d.get("confidence")) or 0),
+                      safe_str(d.get("regime")),safe_str(d.get("directional_bias")),
+                      safe_str(d.get("directional_regime")),safe_str(d.get("long_view")),
+                      safe_str(d.get("short_view")),int(safe_float(d.get("confidence")) or 0),
                       safe_str(d.get("live_rule_assessment")),json.dumps(d.get("reason_codes") or []),
                       safe_str(d.get("short_reason"))[:1500],safe_str(api.get("response_id")),
                       int(api.get("input_tokens") or 0),int(api.get("output_tokens") or 0),
@@ -5700,13 +5732,16 @@ def build_ai_regime_observer_html():
           <td>{'TRUE' if int(safe_float(r.get('live_candidate')) or 0) else 'FALSE'}</td>
           <td>{esc(r.get('candidate_side') or '—')}</td>
           <td><strong>{esc(r.get('regime') or '—')}</strong></td>
+          <td>{esc(r.get('directional_regime') or '—')}</td>
+          <td>{esc(r.get('long_view') or '—')}</td>
+          <td>{esc(r.get('short_view') or '—')}</td>
           <td>{esc(r.get('confidence') if r.get('confidence') is not None else '—')}</td>
           <td>{esc(', '.join(str(x) for x in codes) or '—')}</td>
           <td>{esc(r.get('short_reason') or r.get('error') or '—')}</td>
           <td>{esc(r.get('status'))}</td>
         </tr>"""
     if not trs:
-        trs='<tr><td colspan="10">No AI regime-observer events yet. First post-deploy production signal will create a point-in-time observation.</td></tr>'
+        trs='<tr><td colspan="13">No AI regime-observer events yet. First post-deploy production signal will create a point-in-time observation.</td></tr>'
     return f"""
       <div class="section-note small">
         <strong>Research only — zero broker authority.</strong>
@@ -5721,7 +5756,7 @@ def build_ai_regime_observer_html():
         <div class="card"><div class="label">API Spend Control</div><div class="value pos">EVENT DRIVEN</div><div class="small">Captured {len(rows)} recent · paid-eligible {sum(1 for r in rows if int(safe_float(r.get('api_eligible')) or 0))}</div></div>
       </div>
       <div class="table-scroll"><table>
-        <thead><tr><th>Candle</th><th>Asset</th><th>Why AI Was Called</th><th>Candidate</th><th>Side</th><th>Regime</th><th>Confidence</th><th>Reason Codes</th><th>Observer Reason / Error</th><th>Status</th></tr></thead>
+        <thead><tr><th>Candle</th><th>Asset</th><th>Why AI Was Called</th><th>Candidate</th><th>Side</th><th>Regime</th><th>Directional Regime</th><th>Long View</th><th>Short View</th><th>Confidence</th><th>Reason Codes</th><th>Observer Reason / Error</th><th>Status</th></tr></thead>
         <tbody>{trs}</tbody>
       </table></div>
       <div class="section-note small">
@@ -5731,7 +5766,435 @@ def build_ai_regime_observer_html():
     """
 
 
-def _bco_aiobs_state(conn, raw_signal_id, payload):
+
+# ============================================================
+# v0.8.15 — PROSPECTIVE DIRECTIONAL INTELLIGENCE RESEARCH
+# ============================================================
+# Zero execution authority. No historical backfill. LONG uses the unchanged
+# production candidate. SHORT uses an explicit short payload when one exists;
+# otherwise it uses this frozen pre-declared bearish-context classifier. Do not
+# retune these thresholds from weekly results; a later v2 must be a separately
+# declared prospective hypothesis.
+BCO_DIRECTIONAL_INTELLIGENCE_VERSION = "bco_directional_intelligence_v1_2026_09_11"
+BCO_DIRECTIONAL_INTELLIGENCE_HORIZONS = [6, 12, 24, 48, 72, 96]
+BCO_DIRECTIONAL_INTELLIGENCE_PROSPECTIVE_ONLY = True
+BCO_SHORT_RESEARCH_CLASSIFIER_VERSION = "bco_short_context_v1_2026_09_11"
+
+
+def _bco_payload_value(payload: Dict[str, Any], *keys: str) -> Any:
+    ctx = context_8h(payload if isinstance(payload, dict) else {})
+    for source in (ctx, payload if isinstance(payload, dict) else {}):
+        lower = {safe_str(k).lower(): k for k in source.keys()}
+        for key in keys:
+            actual = lower.get(key.lower())
+            if actual is not None:
+                return source.get(actual)
+    return None
+
+
+def _bco_optional_bool(payload: Dict[str, Any], *keys: str) -> Optional[bool]:
+    v = _bco_payload_value(payload, *keys)
+    if v is None or safe_str(v) == "":
+        return None
+    return parse_bool(v, False)
+
+
+def _bco_prior_closes(conn: DBConn, raw_signal_id: int, count: int) -> List[float]:
+    rows = fetchall_dict(conn.execute(
+        "SELECT exec_close FROM raw_signals WHERE id<=? AND exec_close IS NOT NULL ORDER BY id DESC LIMIT ?",
+        (int(raw_signal_id), max(2, int(count))),
+    ))
+    vals = [safe_float(r.get("exec_close")) for r in reversed(rows)]
+    return [float(v) for v in vals if v is not None and v > 0]
+
+
+def _bco_return_lookback(conn: DBConn, raw_signal_id: int, candles: int) -> Optional[float]:
+    vals = _bco_prior_closes(conn, raw_signal_id, int(candles) + 1)
+    if len(vals) < int(candles) + 1 or vals[-(candles + 1)] <= 0:
+        return None
+    return (vals[-1] / vals[-(candles + 1)] - 1.0) * 100.0
+
+
+def _bco_efficiency_8h(conn: DBConn, raw_signal_id: int) -> Dict[str, Any]:
+    vals = _bco_prior_closes(conn, raw_signal_id, 9)
+    if len(vals) < 9:
+        return {"efficiency": None, "state": "INSUFFICIENT_DATA"}
+    net = abs(vals[-1] - vals[0])
+    path = sum(abs(b - a) for a, b in zip(vals[:-1], vals[1:]))
+    eff = (net / path) if path > 0 else None
+    if eff is None:
+        state = "INSUFFICIENT_DATA"
+    elif eff >= 0.55:
+        state = "CLEAN_TREND"
+    elif eff >= 0.35:
+        state = "TRENDING"
+    else:
+        state = "CHOPPY"
+    return {"efficiency": eff, "state": state}
+
+
+def _bco_alignment_state(conn: DBConn, raw_signal_id: int) -> str:
+    vals = [_bco_return_lookback(conn, raw_signal_id, n) for n in (4, 8, 24)]
+    known = [v for v in vals if v is not None]
+    if len(known) < 2:
+        return "INSUFFICIENT_DATA"
+    if all(v > 0 for v in known):
+        return "ALIGNED_UP"
+    if all(v < 0 for v in known):
+        return "ALIGNED_DOWN"
+    return "DIVERGENT_TIMEFRAMES"
+
+
+def _bco_short_research_context(conn: DBConn, raw_signal_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    side = directional_side(payload.get("signal_side") or payload.get("side") or payload.get("direction"))
+    raw_candidate = parse_bool(_bco_payload_value(payload, "forward_test_candidate"), False)
+    explicit_short = bool(raw_candidate and side == "short")
+    production_long = bool(bco_long_candidate(payload))
+
+    trend = safe_str(_bco_payload_value(payload, "ctx_trend_state", "context_trend_state", "context_trend", "trend")).lower()
+    close_gt_ema20 = _bco_optional_bool(payload, "ctx_close_gt_ema20", "close_gt_ema20")
+    close_gt_ema50 = _bco_optional_bool(payload, "ctx_close_gt_ema50", "close_gt_ema50")
+    hist_up = _bco_optional_bool(payload, "ctx_hist_up", "hist_up", "macd_hist_up")
+    rsi_up = _bco_optional_bool(payload, "ctx_rsi_up", "rsi_up")
+    bull_stack = _bco_optional_bool(payload, "ctx_bull_stack", "bull_stack")
+    ctx_rsi = safe_float(_bco_payload_value(payload, "ctx_rsi", "context_rsi", "rsi"))
+    daily_rsi = safe_float(_bco_payload_value(payload, "d_rsi", "daily_rsi"))
+    dist_ema20 = safe_float(_bco_payload_value(payload, "ctx_dist_ema20_pct", "dist_ema20_pct"))
+    r4 = _bco_return_lookback(conn, raw_signal_id, 4)
+    r8 = _bco_return_lookback(conn, raw_signal_id, 8)
+    r24 = _bco_return_lookback(conn, raw_signal_id, 24)
+    eff = _bco_efficiency_8h(conn, raw_signal_id)
+
+    score = 0
+    reasons: List[str] = []
+    if close_gt_ema20 is False:
+        score += 2; reasons.append("below 8H EMA20")
+    if close_gt_ema50 is False:
+        score += 2; reasons.append("below 8H EMA50")
+    if trend in {"bear", "bearish", "down", "downtrend", "weak", "risk_off"}:
+        score += 2; reasons.append(f"8H trend {trend}")
+    if hist_up is False:
+        score += 1; reasons.append("8H MACD hist not improving")
+    if rsi_up is False:
+        score += 1; reasons.append("8H RSI not improving")
+    if bull_stack is False:
+        score += 1; reasons.append("bull stack false")
+    if not production_long:
+        score += 1; reasons.append("production long candidate off")
+    if r8 is not None and r8 < 0:
+        score += 1; reasons.append("8h return negative")
+    if r24 is not None and r24 < 0:
+        score += 1; reasons.append("24h return negative")
+    if r8 is not None and r8 < 0 and safe_str(eff.get("state")) in {"TRENDING", "CLEAN_TREND"}:
+        score += 1; reasons.append("downside movement efficient")
+
+    oversold = False
+    if ctx_rsi is not None and ctx_rsi < 28:
+        oversold = True; reasons.append("8H RSI deeply oversold")
+    if daily_rsi is not None and daily_rsi < 25:
+        oversold = True; reasons.append("Daily RSI deeply oversold")
+    if dist_ema20 is not None and dist_ema20 < -3.0:
+        oversold = True; reasons.append("price stretched below 8H EMA20")
+
+    if explicit_short:
+        candidate = True; state = "EXPLICIT_SHORT_PAYLOAD_CANDIDATE"; source = "payload_short_forward_test_candidate"
+    elif score >= 7 and not oversold:
+        candidate = True; state = "SHORT_CANDIDATE_STRONG"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+    elif score >= 6 and not oversold:
+        candidate = True; state = "TACTICAL_SHORT_CANDIDATE"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+    elif score >= 6 and oversold:
+        candidate = False; state = "BEARISH_BUT_OVERSOLD"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+    elif score >= 4:
+        candidate = False; state = "EARLY_BEARISH_STRUCTURE"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+    elif production_long:
+        candidate = False; state = "LONG_BIAS_ACTIVE"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+    else:
+        candidate = False; state = "NO_SHORT_CONTEXT"; source = BCO_SHORT_RESEARCH_CLASSIFIER_VERSION
+
+    return {
+        "short_candidate": bool(candidate), "short_state": state, "candidate_source": source,
+        "bearish_score": int(score), "oversold_warning": bool(oversold),
+        "context_trend": trend, "ctx_rsi": ctx_rsi, "daily_rsi": daily_rsi,
+        "return_4h_pct": r4, "return_8h_pct": r8, "return_24h_pct": r24,
+        "efficiency_8h": safe_float(eff.get("efficiency")), "efficiency_state_8h": safe_str(eff.get("state")),
+        "alignment_state": _bco_alignment_state(conn, raw_signal_id),
+        "research_reason": "; ".join(reasons[:12])[:2000],
+        "classifier_version": BCO_SHORT_RESEARCH_CLASSIFIER_VERSION,
+    }
+
+
+def _ensure_bco_directional_intelligence_on_conn(conn: DBConn) -> None:
+    id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_directional_intelligence_research (
+        id {id_type}, created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL,
+        raw_signal_id BIGINT NOT NULL, asset TEXT NOT NULL, signal_time TEXT, direction TEXT NOT NULL,
+        candidate INTEGER DEFAULT 0, candidate_source TEXT, candidate_state TEXT,
+        candidate_episode_id TEXT, episode_start_raw_signal_id BIGINT,
+        entry_close DOUBLE PRECISION, sl_pct DOUBLE PRECISION, context_trend TEXT,
+        efficiency_8h DOUBLE PRECISION, efficiency_state_8h TEXT, alignment_state TEXT,
+        peer_support_state TEXT, basket_cycle_id TEXT, basket_open_count BIGINT,
+        basket_r DOUBLE PRECISION, basket_high_water_r DOUBLE PRECISION, basket_giveback_pct DOUBLE PRECISION,
+        active_exit_manager TEXT,
+        ai_decision_id BIGINT, ai_status TEXT, ai_regime TEXT, ai_directional_bias TEXT,
+        ai_directional_regime TEXT, ai_long_view TEXT, ai_short_view TEXT,
+        point_in_time_json TEXT,
+        outcome_6_signal_time TEXT, outcome_6_close DOUBLE PRECISION, outcome_6_r DOUBLE PRECISION,
+        outcome_6_mfe_r DOUBLE PRECISION, outcome_6_mae_r DOUBLE PRECISION, outcome_6_post_peak_worst_r DOUBLE PRECISION,
+        outcome_6_snapback_r DOUBLE PRECISION, outcome_6_hard_stop_hit INTEGER, completed_6 INTEGER DEFAULT 0,
+        outcome_12_signal_time TEXT, outcome_12_close DOUBLE PRECISION, outcome_12_r DOUBLE PRECISION,
+        outcome_12_mfe_r DOUBLE PRECISION, outcome_12_mae_r DOUBLE PRECISION, outcome_12_post_peak_worst_r DOUBLE PRECISION,
+        outcome_12_snapback_r DOUBLE PRECISION, outcome_12_hard_stop_hit INTEGER, completed_12 INTEGER DEFAULT 0,
+        outcome_24_signal_time TEXT, outcome_24_close DOUBLE PRECISION, outcome_24_r DOUBLE PRECISION,
+        outcome_24_mfe_r DOUBLE PRECISION, outcome_24_mae_r DOUBLE PRECISION, outcome_24_post_peak_worst_r DOUBLE PRECISION,
+        outcome_24_snapback_r DOUBLE PRECISION, outcome_24_hard_stop_hit INTEGER, completed_24 INTEGER DEFAULT 0,
+        outcome_48_signal_time TEXT, outcome_48_close DOUBLE PRECISION, outcome_48_r DOUBLE PRECISION,
+        outcome_48_mfe_r DOUBLE PRECISION, outcome_48_mae_r DOUBLE PRECISION, outcome_48_post_peak_worst_r DOUBLE PRECISION,
+        outcome_48_snapback_r DOUBLE PRECISION, outcome_48_hard_stop_hit INTEGER, completed_48 INTEGER DEFAULT 0,
+        outcome_72_signal_time TEXT, outcome_72_close DOUBLE PRECISION, outcome_72_r DOUBLE PRECISION,
+        outcome_72_mfe_r DOUBLE PRECISION, outcome_72_mae_r DOUBLE PRECISION, outcome_72_post_peak_worst_r DOUBLE PRECISION,
+        outcome_72_snapback_r DOUBLE PRECISION, outcome_72_hard_stop_hit INTEGER, completed_72 INTEGER DEFAULT 0,
+        outcome_96_signal_time TEXT, outcome_96_close DOUBLE PRECISION, outcome_96_r DOUBLE PRECISION,
+        outcome_96_mfe_r DOUBLE PRECISION, outcome_96_mae_r DOUBLE PRECISION, outcome_96_post_peak_worst_r DOUBLE PRECISION,
+        outcome_96_snapback_r DOUBLE PRECISION, outcome_96_hard_stop_hit INTEGER, completed_96 INTEGER DEFAULT 0,
+        research_version TEXT NOT NULL, UNIQUE(raw_signal_id, direction)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_directional_candidate ON bco_directional_intelligence_research(direction,candidate,signal_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_directional_episode ON bco_directional_intelligence_research(candidate_episode_id,direction)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_directional_pending ON bco_directional_intelligence_research(completed_96,direction,raw_signal_id)")
+
+
+def ensure_bco_directional_intelligence_table() -> None:
+    with get_conn() as conn:
+        _ensure_bco_directional_intelligence_on_conn(conn)
+        conn.commit()
+
+
+def _bco_directional_ai_fields(conn: DBConn, raw_signal_id: int) -> Dict[str, Any]:
+    try:
+        row = fetchone_dict(conn.execute("""SELECT id,status,regime,directional_bias,directional_regime,long_view,short_view
+                                           FROM ai_regime_observer WHERE raw_signal_id=? LIMIT 1""", (int(raw_signal_id),)))
+        if not row:
+            return {}
+        return {"ai_decision_id": row.get("id"), "ai_status": row.get("status"), "ai_regime": row.get("regime"),
+                "ai_directional_bias": row.get("directional_bias"), "ai_directional_regime": row.get("directional_regime"),
+                "ai_long_view": row.get("long_view"), "ai_short_view": row.get("short_view")}
+    except Exception:
+        return {}
+
+
+def _bco_directional_episode(conn: DBConn, direction: str, raw_signal_id: int, candidate: bool) -> Tuple[str, Optional[int]]:
+    if not candidate:
+        return "", None
+    prev = fetchone_dict(conn.execute("""SELECT candidate,candidate_episode_id,episode_start_raw_signal_id
+                                        FROM bco_directional_intelligence_research
+                                        WHERE direction=? AND raw_signal_id<? ORDER BY raw_signal_id DESC LIMIT 1""",
+                                     (direction, int(raw_signal_id))))
+    if prev and int(safe_float(prev.get("candidate")) or 0) == 1 and safe_str(prev.get("candidate_episode_id")):
+        return safe_str(prev.get("candidate_episode_id")), int(safe_float(prev.get("episode_start_raw_signal_id")) or raw_signal_id)
+    return f"BCO_{direction}_{int(raw_signal_id)}", int(raw_signal_id)
+
+
+def _bco_directional_future_rows(conn: DBConn, raw_signal_id: int, limit: int) -> List[Dict[str, Any]]:
+    return fetchall_dict(conn.execute("""SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals
+                                        WHERE id>? AND exec_close IS NOT NULL ORDER BY id ASC LIMIT ?""",
+                                      (int(raw_signal_id), int(limit))))
+
+
+def _bco_directional_path_metrics(entry: float, sl_pct: float, direction: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    risk_px = float(entry) * float(sl_pct) / 100.0
+    if risk_px <= 0 or not rows:
+        return {}
+    fav: List[float] = []; adverse: List[float] = []
+    side = safe_str(direction).upper()
+    for row in rows:
+        close = safe_float(row.get("exec_close")); high = safe_float(row.get("exec_high")); low = safe_float(row.get("exec_low"))
+        if high is None: high = close
+        if low is None: low = close
+        if high is None or low is None:
+            fav.append(0.0); adverse.append(0.0); continue
+        if side == "LONG":
+            fav.append((float(high)-entry)/risk_px); adverse.append((float(low)-entry)/risk_px)
+        else:
+            fav.append((entry-float(low))/risk_px); adverse.append((entry-float(high))/risk_px)
+    mfe = max([0.0] + fav); mae = min([0.0] + adverse)
+    peak_i = fav.index(max(fav)) if fav and max(fav) > 0 else 0
+    post_peak_worst = min([0.0] + adverse[peak_i:])
+    return {"mfe_r": mfe, "mae_r": mae, "post_peak_worst_r": post_peak_worst,
+            "snapback_r": max(0.0, mfe - post_peak_worst), "hard_stop_hit": 1 if mae <= -1.0 else 0}
+
+
+def update_bco_directional_intelligence_outcomes(conn: DBConn, limit: int = 500) -> Dict[str, Any]:
+    _ensure_bco_directional_intelligence_on_conn(conn)
+    rows = fetchall_dict(conn.execute("""SELECT * FROM bco_directional_intelligence_research
+                                        WHERE COALESCE(completed_96,0)=0 ORDER BY id ASC LIMIT ?""",
+                                      (max(1, min(int(limit), 2000)),)))
+    updated = 0
+    for row in rows:
+        rid = int(safe_float(row.get("raw_signal_id")) or 0); entry = safe_float(row.get("entry_close")); sl = safe_float(row.get("sl_pct"))
+        direction = safe_str(row.get("direction")).upper()
+        if rid <= 0 or entry is None or entry <= 0 or sl is None or sl <= 0 or direction not in {"LONG","SHORT"}:
+            continue
+        sets: List[str] = []; vals: List[Any] = []
+        ai = _bco_directional_ai_fields(conn, rid)
+        for col in ("ai_decision_id","ai_status","ai_regime","ai_directional_bias","ai_directional_regime","ai_long_view","ai_short_view"):
+            if ai.get(col) is not None and ai.get(col) != row.get(col):
+                sets.append(f"{col}=?"); vals.append(ai.get(col))
+        future = _bco_directional_future_rows(conn, rid, max(BCO_DIRECTIONAL_INTELLIGENCE_HORIZONS) + 2)
+        for h in BCO_DIRECTIONAL_INTELLIGENCE_HORIZONS:
+            if int(safe_float(row.get(f"completed_{h}")) or 0) == 1 or len(future) < h:
+                continue
+            path = future[:h]; end = path[h-1]; close = safe_float(end.get("exec_close"))
+            if close is None: continue
+            risk_px = float(entry) * float(sl) / 100.0
+            out_r = ((float(close)-float(entry))/risk_px) if direction == "LONG" else ((float(entry)-float(close))/risk_px)
+            m = _bco_directional_path_metrics(float(entry), float(sl), direction, path)
+            sets.extend([f"outcome_{h}_signal_time=?",f"outcome_{h}_close=?",f"outcome_{h}_r=?",f"outcome_{h}_mfe_r=?",
+                         f"outcome_{h}_mae_r=?",f"outcome_{h}_post_peak_worst_r=?",f"outcome_{h}_snapback_r=?",
+                         f"outcome_{h}_hard_stop_hit=?",f"completed_{h}=?"])
+            vals.extend([safe_str(end.get("timestamp_readable")),float(close),out_r,m.get("mfe_r"),m.get("mae_r"),
+                         m.get("post_peak_worst_r"),m.get("snapback_r"),m.get("hard_stop_hit"),1])
+        if sets:
+            sets.append("updated_at_utc=?"); vals.extend([now_utc_iso(), int(row["id"])])
+            conn.execute(f"UPDATE bco_directional_intelligence_research SET {', '.join(sets)} WHERE id=?", tuple(vals)); updated += 1
+    return {"ok": True, "checked": len(rows), "updated": updated, "research_only": True, "execution_authority": False}
+
+
+def record_bco_directional_intelligence(raw_signal_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    rid = int(raw_signal_id or 0)
+    if rid <= 0:
+        return {"ok": False, "reason": "invalid_raw_signal_id", "research_only": True}
+    with get_conn() as conn:
+        _ensure_bco_directional_intelligence_on_conn(conn)
+        update_bco_directional_intelligence_outcomes(conn, 500)
+        sig = fetchone_dict(conn.execute("SELECT * FROM raw_signals WHERE id=? LIMIT 1", (rid,)))
+        if not sig:
+            return {"ok": False, "reason": "raw_signal_not_found", "research_only": True}
+        entry = safe_float(sig.get("exec_close"))
+        if entry is None or entry <= 0:
+            return {"ok": True, "skipped": True, "reason": "missing_entry_close", "research_only": True}
+        short_ctx = _bco_short_research_context(conn, rid, payload)
+        eff = _bco_efficiency_8h(conn, rid); alignment = _bco_alignment_state(conn, rid)
+        pre = _bco_aiobs_state(conn, rid, payload, include_short_context=False)
+        ai = _bco_directional_ai_fields(conn, rid)
+        manager_state = ""
+        try:
+            _ems = bco_exit_manager_state_snapshot()
+            manager_state = safe_str((_ems or {}).get("current_manager") or (_ems or {}).get("active_manager"))
+        except Exception:
+            manager_state = ""
+        directions = [
+            ("LONG", bool(bco_long_candidate(payload)), "production_bco_long_candidate",
+             "RAW_LONG_CANDIDATE" if bco_long_candidate(payload) else "NO_RAW_LONG_CANDIDATE"),
+            ("SHORT", bool(short_ctx.get("short_candidate")), safe_str(short_ctx.get("candidate_source")), safe_str(short_ctx.get("short_state"))),
+        ]
+        inserted = 0
+        for direction, candidate, source, state in directions:
+            exists = fetchone_dict(conn.execute("SELECT id FROM bco_directional_intelligence_research WHERE raw_signal_id=? AND direction=? LIMIT 1", (rid, direction)))
+            if exists: continue
+            episode, episode_start = _bco_directional_episode(conn, direction, rid, candidate)
+            point = {"prospective_only": True, "future_data_included": False, "candidate_source": source,
+                     "raw_features": _aiobs_scalar_features(payload), "short_context": short_ctx,
+                     "pre_action_basket": pre, "active_exit_manager": manager_state}
+            vals = [now_utc_iso(),now_utc_iso(),rid,"BCO",safe_str(sig.get("timestamp_readable")),direction,1 if candidate else 0,
+                    source,state,episode,episode_start,float(entry),float(BCO_SL_PCT),safe_str(short_ctx.get("context_trend")),
+                    safe_float(eff.get("efficiency")),safe_str(eff.get("state")),alignment,"SINGLE_ASSET_NO_PEER",
+                    safe_str(pre.get("cycle_id")),int(safe_float(pre.get("open_count")) or 0),safe_float(pre.get("basket_r")),
+                    safe_float(pre.get("high_water_r")),safe_float(pre.get("giveback_pct")),manager_state,
+                    ai.get("ai_decision_id"),ai.get("ai_status"),ai.get("ai_regime"),ai.get("ai_directional_bias"),
+                    ai.get("ai_directional_regime"),ai.get("ai_long_view"),ai.get("ai_short_view"),json.dumps(point,default=str),
+                    BCO_DIRECTIONAL_INTELLIGENCE_VERSION]
+            conn.execute("""INSERT INTO bco_directional_intelligence_research (
+                created_at_utc,updated_at_utc,raw_signal_id,asset,signal_time,direction,candidate,candidate_source,candidate_state,
+                candidate_episode_id,episode_start_raw_signal_id,entry_close,sl_pct,context_trend,efficiency_8h,efficiency_state_8h,
+                alignment_state,peer_support_state,basket_cycle_id,basket_open_count,basket_r,basket_high_water_r,basket_giveback_pct,
+                active_exit_manager,ai_decision_id,ai_status,ai_regime,ai_directional_bias,ai_directional_regime,ai_long_view,ai_short_view,
+                point_in_time_json,research_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", tuple(vals))
+            inserted += 1
+        conn.commit()
+    return {"ok": True, "raw_signal_id": rid, "rows_inserted": inserted, "research_only": True, "execution_authority": False,
+            "prospective_only": True, "version": BCO_DIRECTIONAL_INTELLIGENCE_VERSION}
+
+
+def bco_directional_intelligence_rows(limit: int = 25000) -> List[Dict[str, Any]]:
+    ensure_bco_directional_intelligence_table(); lim = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        update_bco_directional_intelligence_outcomes(conn, min(lim, 2000)); conn.commit()
+        return fetchall_dict(conn.execute("SELECT * FROM bco_directional_intelligence_research ORDER BY id DESC LIMIT ?", (lim,)))
+
+
+def bco_directional_intelligence_summary(limit: int = 5000) -> Dict[str, Any]:
+    rows = bco_directional_intelligence_rows(limit); candidates = [r for r in rows if int(safe_float(r.get("candidate")) or 0) == 1]
+    groups = []
+    for direction in ("LONG","SHORT"):
+        subset = [r for r in candidates if safe_str(r.get("direction")).upper() == direction]
+        complete = [r for r in subset if int(safe_float(r.get("completed_48")) or 0) == 1 and safe_float(r.get("outcome_48_r")) is not None]
+        episodes = len({safe_str(r.get("candidate_episode_id")) for r in subset if safe_str(r.get("candidate_episode_id"))})
+        def avg(key: str) -> Optional[float]:
+            vals = [safe_float(r.get(key)) for r in complete]; vals = [float(v) for v in vals if v is not None]
+            return (sum(vals)/len(vals)) if vals else None
+        groups.append({"direction": direction, "candidate_rows": len(subset), "independent_candidate_episodes": episodes,
+                       "completed_48": len(complete), "avg_48_r": avg("outcome_48_r"), "avg_48_mfe_r": avg("outcome_48_mfe_r"),
+                       "avg_48_mae_r": avg("outcome_48_mae_r"), "avg_48_snapback_r": avg("outcome_48_snapback_r")})
+    return {"ok": True, "research_only": True, "execution_authority": False, "prospective_only": True,
+            "version": BCO_DIRECTIONAL_INTELLIGENCE_VERSION, "groups": groups, "recent_candidates": candidates[:60], "time_utc": now_utc_iso()}
+
+
+def build_bco_directional_intelligence_html() -> str:
+    try:
+        summary = bco_directional_intelligence_summary()
+    except Exception as exc:
+        return f'<div class="lazy-error">Directional intelligence unavailable: {esc(exc)}</div>'
+
+    card_parts = []
+    for g in summary.get("groups") or []:
+        avg48 = safe_float(g.get("avg_48_r"))
+        avg48_txt = "n/a" if avg48 is None else f"{avg48:+.2f}R"
+        card_parts.append(
+            "<div class='card'>"
+            f"<div class='label'>{esc(g.get('direction'))} candidate episodes</div>"
+            f"<div class='value'>{esc(g.get('independent_candidate_episodes'))}</div>"
+            f"<div class='small'>Rows {esc(g.get('candidate_rows'))} · "
+            f"48h complete {esc(g.get('completed_48'))} · avg 48h {esc(avg48_txt)}</div>"
+            "</div>"
+        )
+    cards = "".join(card_parts)
+
+    row_parts = []
+    for r in (summary.get("recent_candidates") or [])[:40]:
+        r48 = safe_float(r.get("outcome_48_r"))
+        snap48 = safe_float(r.get("outcome_48_snapback_r"))
+        r48_txt = "" if r48 is None else f"{r48:+.2f}R"
+        snap48_txt = "" if snap48 is None else f"{snap48:.2f}R"
+        row_parts.append(
+            "<tr>"
+            f"<td>{esc(r.get('signal_time'))}</td>"
+            f"<td>{esc(r.get('direction'))}</td>"
+            f"<td>{esc(r.get('candidate_state'))}</td>"
+            f"<td>{esc(r.get('candidate_episode_id'))}</td>"
+            f"<td>{esc(r.get('ai_directional_regime') or r.get('ai_regime'))}</td>"
+            f"<td>{esc(r.get('efficiency_state_8h'))}</td>"
+            f"<td>{esc(r.get('alignment_state'))}</td>"
+            f"<td>{esc(r48_txt)}</td>"
+            f"<td>{esc(snap48_txt)}</td>"
+            "</tr>"
+        )
+    rows = "".join(row_parts) or '<tr><td colspan="9">Prospective collection starts after v0.8.15 deployment.</td></tr>'
+
+    return f"""<details class='research-inner'><summary>Directional Intelligence — Long / Short Prospective Research</summary><div class='research-inner-body'><div class='section-note small'><strong>RESEARCH ONLY.</strong> LONG uses the unchanged production candidate. SHORT is frozen prospectively from v0.8.15 and is never allowed to place, block, resize or close a trade. Candidate episodes prevent repeated hourly observations from being treated as independent evidence. Snapback is R surrendered from peak favourable excursion to the worst later excursion in the horizon.</div><div class='cards three'>{cards}<div class='card'><div class='label'>Execution authority</div><div class='value'>NONE</div><div class='small'>Prospective only · no historical backfill.</div></div></div><div class='table-scroll'><table><thead><tr><th>Signal</th><th>Side</th><th>State</th><th>Episode</th><th>AI Regime</th><th>Efficiency</th><th>Alignment</th><th>48h R</th><th>48h Snapback</th></tr></thead><tbody>{rows}</tbody></table></div><div class='section-note small'><a href='/bco-directional-intelligence'>Directional JSON</a> · <a href='/export/bco-directional-intelligence.csv'>Directional CSV</a></div></div></details>"""
+
+
+@app.get("/bco-directional-intelligence")
+def bco_directional_intelligence_api(limit: int = 5000):
+    return bco_directional_intelligence_summary(limit)
+
+
+@app.get("/export/bco-directional-intelligence.csv")
+def export_bco_directional_intelligence_csv(limit: int = 25000):
+    return csv_response(bco_directional_intelligence_rows(limit), "bco-directional-intelligence.csv")
+
+
+def _bco_aiobs_state(conn, raw_signal_id, payload, include_short_context: bool = True):
     """Freeze current-candle BCO observer state before deterministic processing.
 
     basket_state/current_R are prior-candle values at this point in the webhook
@@ -5774,7 +6237,8 @@ def _bco_aiobs_state(conn, raw_signal_id, payload):
     if cycle:
         row=conn.execute("""SELECT COUNT(*) AS c FROM protection_stages WHERE cycle_id=? AND stage_type='BANK' AND UPPER(COALESCE(status,'')) IN ('EXECUTED','CONSUMED','DONE','BANKED')""",(cycle,)).fetchone()
         consumed=int(row["c"] or 0) if row else 0
-    return {"asset":"BCO","candidate":candidate,"side":"long" if candidate else "","open_count":len(open_rows),"mature_48h_plus":mature,"basket_state_source":basket_source,"incoming_price":incoming_price,"basket_r":basket_r,"high_water_r":hwm,"prior_high_water_r":prior_hwm,"giveback_pct":give,"giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),"high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),"consumed_bank_stages":consumed,"cycle_id":cycle,"tide_status":safe_str(state.get("tide_status") or state.get("status") or state.get("phase")),"manager_action":safe_str(state.get("manager_action") or state.get("recommended_action") or state.get("action"))}
+    _short_ctx = _bco_short_research_context(conn, int(raw_signal_id), payload) if include_short_context else {}
+    return {"asset":"BCO","candidate":candidate,"side":"long" if candidate else "","short_candidate":bool(_short_ctx.get("short_candidate")),"short_state":safe_str(_short_ctx.get("short_state")),"open_count":len(open_rows),"mature_48h_plus":mature,"basket_state_source":basket_source,"incoming_price":incoming_price,"basket_r":basket_r,"high_water_r":hwm,"prior_high_water_r":prior_hwm,"giveback_pct":give,"giveback_band":_aiobs_band(give,AI_SHADOW_GIVEBACK_BANDS_PCT),"high_water_band":_aiobs_band(hwm,AI_SHADOW_HIGH_WATER_LEVELS_R),"consumed_bank_stages":consumed,"cycle_id":cycle,"tide_status":safe_str(state.get("tide_status") or state.get("status") or state.get("phase")),"manager_action":safe_str(state.get("manager_action") or state.get("recommended_action") or state.get("action"))}
 
 
 def capture_ai_regime_snapshot(raw_signal_id, payload):
@@ -5799,6 +6263,10 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
         else:
             if bool(current["candidate"]) != bool(previous.get("candidate")):
                 reasons.append("CANDIDATE_FLIP_TO_TRUE" if current["candidate"] else "CANDIDATE_FLIP_TO_FALSE")
+            if bool(current.get("short_candidate")) != bool(previous.get("short_candidate")):
+                reasons.append("SHORT_RESEARCH_CANDIDATE_ON" if current.get("short_candidate") else "SHORT_RESEARCH_CANDIDATE_OFF")
+            elif safe_str(current.get("short_state")) != safe_str(previous.get("short_state")):
+                reasons.append("SHORT_RESEARCH_STATE_CHANGE")
             if int(previous.get("mature_48h_plus") or 0)<=0<int(current["mature_48h_plus"]):
                 reasons.append("MATURE_EXPOSURE_ON")
             elif int(previous.get("mature_48h_plus") or 0)>0>=int(current["mature_48h_plus"]):
@@ -5816,8 +6284,9 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
             "current_asset":"BCO",
             "current_signal":_aiobs_scalar_features(payload),
             "event_state":current,
+            "short_research_context":_bco_short_research_context(conn,int(raw_signal_id),payload),
             "recent_history":[],
-            "research_note":"Single-asset Brent long-only strategy. Snapshot captured before deterministic processing. v0.8.6 revalues open trades at the incoming candle for point-in-time basket R; prior HWM/cycle context comes from basket_state:BCO_LONG.",
+            "research_note":"Production remains deterministic Brent long-only. Snapshot captured before deterministic processing; LONG and hypothetical SHORT are assessed independently for research. v0.8.6 revalues open trades at the incoming candle for point-in-time basket R; prior HWM/cycle context comes from basket_state:BCO_LONG.",
         }
         recent=conn.execute("""SELECT timestamp_readable,candidate_8h,exec_close,signal_side
                                FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT 6""",(int(raw_signal_id),)).fetchall()
@@ -6144,10 +6613,14 @@ async def tradingview_webhook(request: Request, secret: str = Query(default=""))
     except Exception as _ai_exc:
         ai_regime_observer={"captured":False,"research_only":True,"error":f"{type(_ai_exc).__name__}: {_ai_exc}"}
     try:
+        directional_research=record_bco_directional_intelligence(raw_id,payload)
+    except Exception as _dir_exc:
+        directional_research={"ok":False,"research_only":True,"execution_authority":False,"error":f"{type(_dir_exc).__name__}: {_dir_exc}"}
+    try:
         result=process_signal(raw_id,payload); focused_research=record_bco_focused_research(raw_id)
     except Exception as e:
         log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id}); raise
-    return {"status":"ok","raw_signal_id":raw_id,"ingress_receipt_id":receipt_id,"result":result,"focused_research":focused_research,"ai_regime_observer":ai_regime_observer}
+    return {"status":"ok","raw_signal_id":raw_id,"ingress_receipt_id":receipt_id,"result":result,"focused_research":focused_research,"directional_research":directional_research,"ai_regime_observer":ai_regime_observer}
 
 
 @app.get("/snapshot")
@@ -6237,10 +6710,13 @@ def export_table(table: str):
         "harvest-execution-outcomes":"harvest_execution_outcomes",
         "accounting-snapshots":"accounting_snapshots",
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
+        "directional-intelligence":"bco_directional_intelligence_research",
     }
     if table not in allowed: raise HTTPException(status_code=404,detail="unknown export")
     if allowed[table] == "bco_exit_challenger_shadow":
         ensure_bco_exit_challenger_shadow_schema()
+    if allowed[table] == "bco_directional_intelligence_research":
+        ensure_bco_directional_intelligence_table()
     with get_conn() as conn: rows=fetchall_dict(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id ASC"))
     return csv_response(rows,f"bco-{table}.csv")
 
@@ -6263,8 +6739,10 @@ def export_all_zip():
         "harvest-execution-outcomes":"harvest_execution_outcomes",
         "accounting-snapshots":"accounting_snapshots",
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
+        "directional-intelligence":"bco_directional_intelligence_research",
     }
     ensure_bco_exit_challenger_shadow_schema()
+    ensure_bco_directional_intelligence_table()
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         with get_conn() as conn:
@@ -6593,8 +7071,9 @@ def _bf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_bco_focused_research_html():
-    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers and the event-driven AI Regime Observer. All research layers have zero execution authority. <strong>v0.8.5:</strong> recovery/HWM triggers are frozen pre-defence and future horizons use durable cycle economic R; pre-v0.8.5 zero-reset artifacts are retained only for audit and should not be treated as evidence.</div>' + \
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers, directional LONG/SHORT evidence and the event-driven AI Regime Observer. All research layers have zero execution authority. <strong>v0.8.15:</strong> Directional Intelligence is prospective only with independent candidate episodes and no historical backfill. <strong>v0.8.5:</strong> recovery/HWM triggers are frozen pre-defence and future horizons use durable cycle economic R.</div>' + \
       '<details class="research-inner"><summary>MFE + ATR2 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_bco_exit_challenger_shadow_html() + '</div></details>' + \
+      build_bco_directional_intelligence_html() + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _bf_table("BCO Multi-Horizon Alignment / Divergence",_bf_rows("bco_focused_alignment",100),["signal_time","state","return_4h","return_8h","return_24h","candidate"]) + \
@@ -6605,7 +7084,8 @@ def build_bco_focused_research_html():
 @app.get("/export/bco-focused-research.zip")
 def export_bco_focused_research_zip(limit:int=25000):
     ensure_bco_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"highwater-banking-research.csv":"bco_focused_highwater","alignment-research.csv":"bco_focused_alignment","trend-efficiency-research.csv":"bco_focused_efficiency","basket-recovery-research.csv":"bco_focused_recovery"}
+    tables={"highwater-banking-research.csv":"bco_focused_highwater","alignment-research.csv":"bco_focused_alignment","trend-efficiency-research.csv":"bco_focused_efficiency","basket-recovery-research.csv":"bco_focused_recovery","directional-intelligence.csv":"bco_directional_intelligence_research"}
+    ensure_bco_directional_intelligence_table()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_bf_rows(tbl,limit);out=io.StringIO()
@@ -8653,7 +9133,7 @@ def bco_standard_dashboard():
         _bco_std_placeholder("open-trades", "Open Trades / Positions", "Actual OANDA BCO positions with local R, MFE/MAE, age, stops and effective risk."),
         _bco_std_placeholder("broker", "Broker / OANDA / Accounting", "BCO OANDA lane, accounting, execution/reconciliation and operational health."),
         _bco_std_placeholder("manager-protection", "Basket Manager / Profit Protection", "48h+ manager state plus persisted harvesting/protection stages."),
-        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "MFE/ATR2 exit challengers, AI/regime evidence, high-water outcomes, alignment, trend efficiency and basket recovery."),
+        _bco_std_placeholder("research", "BCO Research / Evidence Lab", "MFE/ATR2 exit challengers, prospective LONG/SHORT directional intelligence, AI/regime evidence, high-water outcomes, alignment, trend efficiency and basket recovery."),
     ])
     env_label = "LIVE" if OANDA_ENV == "live" else "DEMO / PRACTICE"
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Exit Plan — BCO</title>
