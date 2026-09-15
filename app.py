@@ -36,11 +36,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.16 — Live Accounting Epoch + Demo Archive + Directional Intelligence"
-APP_VERSION = "0.8.16"
-POLICY_VERSION = "bco_v0.8.16_live_accounting_epoch_demo_archive_2026_09_15"
+APP_NAME = "Project Exit Plan — BCO v0.8.17 — Live Accounting Epoch Broker-Panel Fix"
+APP_VERSION = "0.8.17"
+POLICY_VERSION = "bco_v0.8.17_live_accounting_epoch_broker_panel_fix_2026_09_15"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.17 — broker/accounting panel rendering bugfix only.
+# - Defines the pre-live archive object inside the Broker/OANDA/Accounting
+#   renderer before the HTML references it.
+# - Fixes NameError: pre_live_archive is not defined.
+# - No accounting-boundary semantics, strategy, execution, ATR2, harvesting,
+#   AI, directional research, sizing or broker-safety logic changed.
+#
 # v0.8.16 — live accounting epoch / demo archive boundary only.
 # - When first deployed in LIVE while both local and OANDA BCO exposure are flat,
 #   freezes an immutable live-accounting epoch in runtime_state.
@@ -8003,7 +8010,6 @@ def _bco_standard_top_uncached():
     perf_week = (perf.get("by_key") or {}).get("THIS_WEEK") or {}
     perf_month = (perf.get("by_key") or {}).get("THIS_MONTH") or {}
     perf_lifetime = perf.get("lifetime") or {}
-    pre_live_archive = perf.get("pre_live_demo_archive") or {}
     realized_pnl=float(safe_float(perf_lifetime.get("realized_pnl_gbp")) or 0.0)
     realized_r=float(safe_float(perf_lifetime.get("realized_R")) or 0.0)
 
@@ -9064,6 +9070,7 @@ def _bco_standard_broker_html():
     perf = bco_accounting_performance_summary(
         current_open_pnl=safe_float(broker.get("owned_unrealized_pl"))
     )
+    pre_live_archive = perf.get("pre_live_demo_archive") or {}
 
     with get_conn() as conn:
         txs = fetchall_dict(conn.execute("""
