@@ -36,11 +36,26 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.15 — Directional Intelligence Research + Last-Trade Visibility + Live HWM + Intrahour Harvest"
-APP_VERSION = "0.8.15"
-POLICY_VERSION = "bco_v0.8.15_directional_intelligence_research_last_trade_live_hwm_intrahour_harvest_2026_09_11"
+APP_NAME = "Project Exit Plan — BCO v0.8.16 — Live Accounting Epoch + Demo Archive + Directional Intelligence"
+APP_VERSION = "0.8.16"
+POLICY_VERSION = "bco_v0.8.16_live_accounting_epoch_demo_archive_2026_09_15"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.16 — live accounting epoch / demo archive boundary only.
+# - When first deployed in LIVE while both local and OANDA BCO exposure are flat,
+#   freezes an immutable live-accounting epoch in runtime_state.
+# - All production-facing realised week/month/lifetime figures are calculated
+#   only from that epoch onward. Pre-live demo trades/research are preserved.
+# - Portfolio Hub inherits the same clean live week/month/all-time figures from
+#   /api/portfolio-summary; exact producer build pinning is not required.
+# - Last-trade-opened and Recently Closed views are live-era only in LIVE mode.
+# - Stores a compact pre-live demo archive summary for audit/display; no tables
+#   are deleted and the Analysis/Research ZIPs continue to retain historical data.
+# - Fail-safe: if LIVE is detected before an epoch exists and the service is not
+#   provably flat, realised live reporting stays at zero rather than mixing demo.
+# - No entry signal, £5 risk target, 3.5% SL, ATR2/Classic rule, harvesting,
+#   AI observer, directional-short research, broker safety or execution logic changed.
+#
 # v0.8.15 — prospective Directional Intelligence research only.
 # - Freezes one comparable LONG and hypothetical SHORT research row per new BCO signal.
 # - SHORT uses a pre-declared bearish-context classifier (or an explicit short payload if supplied); no historical optimisation/backfill.
@@ -350,6 +365,12 @@ BCO_TRANSACTION_SYNC_ENABLED = env_bool("BCO_TRANSACTION_SYNC_ENABLED", True)
 BCO_TRANSACTION_SYNC_PAGE_LIMIT = max(100, min(int(float(os.getenv("BCO_TRANSACTION_SYNC_PAGE_LIMIT", "1000"))), 5000))
 BCO_HEALTH_SIGNAL_STALE_SECONDS = max(3600, int(float(os.getenv("BCO_HEALTH_SIGNAL_STALE_SECONDS", "10800"))))
 BCO_HEALTH_RECONCILE_STALE_SECONDS = max(60, int(float(os.getenv("BCO_HEALTH_RECONCILE_STALE_SECONDS", "180"))))
+
+# v0.8.16 — immutable reporting boundary between the completed PRACTICE era and
+# the new LIVE era. The database/research history is retained; only production
+# performance reporting is scoped to rows at/after this epoch.
+BCO_LIVE_ACCOUNTING_EPOCH_KEY = "bco_live_accounting_epoch_utc"
+BCO_PRELIVE_ARCHIVE_KEY = "bco_pre_live_demo_archive_v1"
 
 # v0.7.2 — self-healing signal/manager recovery.
 # A TradingView signal is durable as soon as it is inserted into raw_signals.
@@ -1657,6 +1678,172 @@ def runtime_set(conn: DBConn, key: str, value: Any) -> None:
             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_utc=excluded.updated_at_utc
         """, (key, val, now_utc_iso()))
 
+
+
+def _bco_parse_aware_utc(value: Any) -> Optional[datetime]:
+    s = safe_str(value)
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def bco_live_accounting_epoch(conn: Optional[DBConn] = None) -> str:
+    """Return the immutable LIVE accounting epoch, if established."""
+    if safe_str(OANDA_ENV).lower() != "live":
+        return ""
+    if conn is not None:
+        return runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "")
+    try:
+        with get_conn() as _conn:
+            return runtime_get(_conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "")
+    except Exception:
+        return ""
+
+
+def bco_pre_live_demo_archive(conn: Optional[DBConn] = None) -> Dict[str, Any]:
+    """Read the compact archived PRACTICE-era summary; raw history remains in DB."""
+    raw = ""
+    try:
+        if conn is not None:
+            raw = runtime_get(conn, BCO_PRELIVE_ARCHIVE_KEY, "")
+        else:
+            with get_conn() as _conn:
+                raw = runtime_get(_conn, BCO_PRELIVE_ARCHIVE_KEY, "")
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _bco_effective_live_start(conn: DBConn, requested_start: Optional[str]) -> Optional[str]:
+    """Clamp a reporting start to the LIVE epoch when running live."""
+    start = safe_str(requested_start)
+    if safe_str(OANDA_ENV).lower() != "live":
+        return start or None
+    epoch = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "")
+    if not epoch:
+        # Fail-safe: a LIVE service without an established boundary must never
+        # expose PRACTICE economics as live performance.
+        return None
+    start_dt = _bco_parse_aware_utc(start)
+    epoch_dt = _bco_parse_aware_utc(epoch)
+    if epoch_dt is None:
+        return None
+    if start_dt is None or start_dt < epoch_dt:
+        return epoch
+    return start
+
+
+def ensure_bco_live_accounting_epoch() -> Dict[str, Any]:
+    """Create the PRACTICE->LIVE reporting boundary exactly once.
+
+    Auto-initialisation is deliberately allowed only when the LIVE broker and
+    local ledger are both flat and the durable broker queue is clear. This
+    deployment is therefore a safe accounting reset, never a trading action.
+    """
+    if safe_str(OANDA_ENV).lower() != "live":
+        return {"ok": True, "initialized": False, "reason": "not_live_environment"}
+
+    with _db_lock, get_conn() as conn:
+        existing = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "")
+        if existing:
+            return {
+                "ok": True,
+                "initialized": True,
+                "created_now": False,
+                "epoch_utc": existing,
+                "archive": bco_pre_live_demo_archive(conn),
+            }
+        local_row = fetchone_dict(conn.execute(
+            "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+        )) or {}
+        local_open = int(safe_float(local_row.get("c")) or 0)
+        queue_row = fetchone_dict(conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM broker_action_queue
+            WHERE UPPER(COALESCE(status,'')) IN
+                  ('PENDING','RETRY','WAITING_MARKET_REOPEN','WAITING_RECONCILIATION')
+        """)) or {}
+        pending_actions = int(safe_float(queue_row.get("c")) or 0)
+
+    live = bco_broker_live_snapshot()
+    if not live.get("ok"):
+        return {
+            "ok": False, "initialized": False,
+            "reason": "live_broker_snapshot_unavailable",
+            "error": safe_str(live.get("error")),
+        }
+    broker_open = int(safe_float(live.get("owned_open_count")) or 0)
+    if local_open != 0 or broker_open != 0 or pending_actions != 0:
+        return {
+            "ok": False, "initialized": False,
+            "reason": "not_provably_flat",
+            "local_open": local_open,
+            "broker_open": broker_open,
+            "pending_broker_actions": pending_actions,
+        }
+
+    epoch = now_utc_iso()
+    with _db_lock, get_conn() as conn:
+        # Re-check inside the committing transaction in case another worker won.
+        existing = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "")
+        if existing:
+            return {
+                "ok": True, "initialized": True, "created_now": False,
+                "epoch_utc": existing,
+                "archive": bco_pre_live_demo_archive(conn),
+            }
+
+        demo = _bco_realised_period(conn)
+        last_closed = fetchone_dict(conn.execute("""
+            SELECT exit_time,trade_id,realized_pnl_gbp,realized_R
+            FROM trades
+            WHERE UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED')
+            ORDER BY COALESCE(exit_time,updated_at_utc,created_at_utc) DESC,id DESC
+            LIMIT 1
+        """)) or {}
+        last_open = fetchone_dict(conn.execute("""
+            SELECT created_at_utc,trade_id,broker_trade_id
+            FROM execution_audit
+            WHERE action='OPEN_BCO_DETAILS' AND success
+              AND COALESCE(broker_trade_id,'')<>''
+            ORDER BY created_at_utc DESC,id DESC LIMIT 1
+        """)) or {}
+        archive = {
+            "archive_type": "PRE_LIVE_DEMO",
+            "archived_at_utc": epoch,
+            "live_epoch_utc": epoch,
+            "demo_trade_count": int(demo.get("trade_count") or 0),
+            "demo_realized_pnl_gbp": float(demo.get("realized_pnl_gbp") or 0.0),
+            "demo_realized_R": float(demo.get("realized_R") or 0.0),
+            "demo_broker_pl_gbp": float(demo.get("broker_pl_gbp") or 0.0),
+            "demo_financing_gbp": float(demo.get("financing_gbp") or 0.0),
+            "last_demo_close_at_utc": safe_str(last_closed.get("exit_time")) or None,
+            "last_demo_trade_id": safe_str(last_closed.get("trade_id")) or None,
+            "last_demo_open_audit_at_utc": safe_str(last_open.get("created_at_utc")) or None,
+            "last_demo_broker_trade_id": safe_str(last_open.get("broker_trade_id")) or None,
+            "note": "Historical PRACTICE rows retained for audit/research; excluded from LIVE performance reporting.",
+        }
+        runtime_set(conn, BCO_PRELIVE_ARCHIVE_KEY, json.dumps(archive, separators=(",", ":")))
+        runtime_set(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, epoch)
+
+    try:
+        log_event(
+            "live_accounting_epoch_initialized",
+            "BCO live accounting epoch established while broker/local exposure was flat.",
+            archive,
+        )
+    except Exception:
+        pass
+    return {
+        "ok": True, "initialized": True, "created_now": True,
+        "epoch_utc": epoch, "archive": archive,
+    }
 
 
 def _bco_cycle_manager_runtime_key(cycle_id: str) -> str:
@@ -5256,6 +5443,20 @@ def _background_bootstrap() -> None:
 
         init_db()
 
+        # v0.8.16: establish the immutable live-reporting epoch only when the
+        # newly promoted LIVE service is broker/local flat. This archives rather
+        # than deletes the completed PRACTICE era.
+        live_epoch_init = ensure_bco_live_accounting_epoch()
+        if safe_str(OANDA_ENV).lower() == "live":
+            try:
+                log_event(
+                    "live_accounting_epoch_bootstrap",
+                    "BCO live accounting epoch bootstrap checked.",
+                    live_epoch_init,
+                )
+            except Exception:
+                pass
+
         # v0.8.12: pin the basket that existed at deployment to CLASSIC before
         # any stored-signal recovery can touch it. Future cycle IDs then default ATR2.
         with _db_lock, get_conn() as _mgr_conn:
@@ -6765,6 +6966,8 @@ def export_all_zip():
             "direction":"long",
             "requested_risk_gbp":BCO_RISK_PER_TRADE_GBP,
             "sl_pct":BCO_SL_PCT,
+            "live_accounting_epoch_utc":bco_live_accounting_epoch() or None,
+            "pre_live_demo_archive":bco_pre_live_demo_archive(),
             "signal_recovery_enabled":BCO_SIGNAL_RECOVERY_ENABLED,
             "exit_challenger_shadow":{
                 "enabled":BCO_EXIT_SHADOW_ENABLED,
@@ -7294,14 +7497,9 @@ def bco_accounting_performance_summary(
 ) -> Dict[str, Any]:
     """BCO-only weekly/monthly realised and economic P&L.
 
-    Economic P&L for a calendar period is:
-      realised net P&L in the period + ending BCO broker open P&L
-      - BCO broker open P&L at the period start.
-
-    This correctly attributes movement in baskets spanning week/month boundaries
-    instead of treating all still-open profit as zero. It intentionally uses BCO
-    trade/accounting rows only; shared-account NAV or foreign-strategy P&L is not
-    imported.
+    In LIVE mode all production-facing performance is clamped to the immutable
+    PRACTICE->LIVE accounting epoch. Historical demo rows remain available for
+    research/export, but cannot contaminate live week/month/lifetime figures.
     """
     display_tz = _bco_zone(BCO_DISPLAY_TIMEZONE)
     now_utc = datetime.now(timezone.utc)
@@ -7325,6 +7523,10 @@ def bco_accounting_performance_summary(
     }
 
     with get_conn() as conn:
+        live_mode = safe_str(OANDA_ENV).lower() == "live"
+        live_epoch = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "") if live_mode else ""
+        archive = bco_pre_live_demo_archive(conn) if live_mode else {}
+
         current_open = safe_float(current_open_pnl)
         current_open_source = "BROKER_LIVE" if current_open is not None else "ACCOUNTING_SNAPSHOT"
         current_open_time = now_utc_iso()
@@ -7339,6 +7541,32 @@ def bco_accounting_performance_summary(
             current_open = 0.0
             current_open_source = "ZERO_FALLBACK"
 
+        # A LIVE service must never fall back to historic PRACTICE economics if
+        # the epoch was not safely established. Open broker P/L remains current,
+        # while realised live performance stays at zero until the boundary exists.
+        epoch_pending = bool(live_mode and not live_epoch)
+
+        def _zero_period(
+            key: str, label: str, start_iso: str, end_iso: Optional[str],
+            reason: str,
+        ) -> Dict[str, Any]:
+            return {
+                "key": key, "label": label,
+                "start_utc": live_epoch or start_iso,
+                "end_utc": end_iso or boundaries["now"],
+                "realized_pnl_gbp": 0.0, "realized_R": 0.0, "trade_count": 0,
+                "broker_pl_gbp": 0.0, "financing_gbp": 0.0,
+                "start_open_pnl_gbp": 0.0,
+                "end_open_pnl_gbp": float(current_open) if end_iso is None else 0.0,
+                "economic_pnl_gbp": float(current_open) if end_iso is None else 0.0,
+                "start_snapshot_time_utc": live_epoch or "",
+                "end_snapshot_time_utc": current_open_time if end_iso is None else "",
+                "start_basis_relation": reason,
+                "end_basis_relation": current_open_source if end_iso is None else reason,
+                "end_basis_label": "current broker open P/L" if end_iso is None else "period end",
+                "live_epoch_applied": bool(live_mode),
+            }
+
         def period(
             key: str,
             label: str,
@@ -7347,8 +7575,33 @@ def bco_accounting_performance_summary(
             end_open_override: Optional[float] = None,
             end_label: str = "period end",
         ) -> Dict[str, Any]:
-            realised = _bco_realised_period(conn, start_iso, end_iso)
-            start_basis = _bco_accounting_boundary_open_pl(conn, start_iso)
+            if epoch_pending:
+                return _zero_period(key, label, start_iso, end_iso, "LIVE_EPOCH_PENDING")
+
+            effective_start = start_iso
+            clamped_to_epoch = False
+            if live_mode and live_epoch:
+                epoch_dt = _bco_parse_aware_utc(live_epoch)
+                start_dt = _bco_parse_aware_utc(start_iso)
+                end_dt = _bco_parse_aware_utc(end_iso) if end_iso else None
+                if epoch_dt is not None and end_dt is not None and end_dt <= epoch_dt:
+                    return _zero_period(key, label, start_iso, end_iso, "PRE_LIVE_ARCHIVED")
+                if epoch_dt is not None and (start_dt is None or start_dt < epoch_dt):
+                    effective_start = live_epoch
+                    clamped_to_epoch = True
+
+            realised = _bco_realised_period(conn, effective_start, end_iso)
+
+            if clamped_to_epoch:
+                # Epoch creation is permitted only while BCO is broker/local FLAT.
+                start_basis = {
+                    "open_pnl": 0.0,
+                    "snapshot_time_utc": live_epoch,
+                    "relation": "LIVE_EPOCH_FLAT_BASELINE",
+                }
+            else:
+                start_basis = _bco_accounting_boundary_open_pl(conn, effective_start)
+
             if end_open_override is not None:
                 end_basis = {
                     "open_pnl": float(end_open_override),
@@ -7368,7 +7621,7 @@ def bco_accounting_performance_summary(
             return {
                 "key": key,
                 "label": label,
-                "start_utc": start_iso,
+                "start_utc": effective_start,
                 "end_utc": end_iso or boundaries["now"],
                 "realized_pnl_gbp": realised["realized_pnl_gbp"],
                 "realized_R": realised["realized_R"],
@@ -7383,6 +7636,7 @@ def bco_accounting_performance_summary(
                 "start_basis_relation": start_basis.get("relation"),
                 "end_basis_relation": end_basis.get("relation"),
                 "end_basis_label": end_label,
+                "live_epoch_applied": bool(clamped_to_epoch),
             }
 
         periods = [
@@ -7402,7 +7656,13 @@ def bco_accounting_performance_summary(
             ),
         ]
 
-        lifetime = _bco_realised_period(conn)
+        if epoch_pending:
+            lifetime = {
+                "trade_count": 0, "realized_pnl_gbp": 0.0, "realized_R": 0.0,
+                "broker_pl_gbp": 0.0, "financing_gbp": 0.0,
+            }
+        else:
+            lifetime = _bco_realised_period(conn, live_epoch if live_mode and live_epoch else None)
         lifetime_economic = float(lifetime["realized_pnl_gbp"]) + float(current_open)
 
     by_key = {p["key"]: p for p in periods}
@@ -7410,12 +7670,19 @@ def bco_accounting_performance_summary(
         "ok": True,
         "timezone": BCO_DISPLAY_TIMEZONE,
         "calendar_basis": "Monday-start week; calendar month in configured display timezone",
+        "live_accounting_epoch_utc": live_epoch or None,
+        "live_epoch_status": (
+            "ACTIVE" if live_mode and live_epoch else
+            "PENDING_SAFE_FLAT_INITIALISATION" if live_mode else
+            "NOT_APPLICABLE_PRACTICE"
+        ),
+        "pre_live_demo_archive": archive,
         "current_open_pnl_gbp": float(current_open),
         "current_open_pnl_source": current_open_source,
         "periods": periods,
         "by_key": by_key,
         "lifetime": {
-            "label": "Lifetime",
+            "label": "Live lifetime" if live_mode else "Lifetime",
             "realized_pnl_gbp": lifetime["realized_pnl_gbp"],
             "realized_R": lifetime["realized_R"],
             "trade_count": lifetime["trade_count"],
@@ -7424,7 +7691,12 @@ def bco_accounting_performance_summary(
             "broker_pl_gbp": lifetime["broker_pl_gbp"],
             "financing_gbp": lifetime["financing_gbp"],
         },
-        "note": "Economic P&L = realised net + change in BCO broker open P&L. Open-position financing is reflected when broker close accounting settles it.",
+        "note": (
+            "LIVE reporting begins at the immutable live accounting epoch; PRACTICE/demo history is retained but excluded. "
+            "Economic P&L = realised net + change in BCO broker open P&L."
+            if live_mode else
+            "Economic P&L = realised net + change in BCO broker open P&L. Open-position financing is reflected when broker close accounting settles it."
+        ),
         "time_utc": now_utc_iso(),
     }
 
@@ -7724,8 +7996,16 @@ def _bco_standard_top_uncached():
 
     give=((hwm-basket_r)/hwm*100.0) if hwm>0 and basket_r<hwm else 0.0
     current_open_basket_gbp=safe_float(lm.get("basket_pnl_gbp")) or 0.0
-    realized_pnl=safe_float(closed.get("p")) or 0.0
-    realized_r=safe_float(closed.get("r")) or 0.0
+
+    # v0.8.16: production-facing realised performance is LIVE-epoch scoped.
+    # snapshot().closed_summary deliberately remains all-history for research.
+    perf = bco_accounting_performance_summary(current_open_pnl=broker_open_pnl)
+    perf_week = (perf.get("by_key") or {}).get("THIS_WEEK") or {}
+    perf_month = (perf.get("by_key") or {}).get("THIS_MONTH") or {}
+    perf_lifetime = perf.get("lifetime") or {}
+    pre_live_archive = perf.get("pre_live_demo_archive") or {}
+    realized_pnl=float(safe_float(perf_lifetime.get("realized_pnl_gbp")) or 0.0)
+    realized_r=float(safe_float(perf_lifetime.get("realized_R")) or 0.0)
 
     # Match Live Indices:
     # cash giveback = cash high-water minus CURRENT UNREALISED BROKER P&L.
@@ -7746,10 +8026,8 @@ def _bco_standard_top_uncached():
         if giveback_gbp is not None and hwm_gbp is not None and float(hwm_gbp)>0
         else None
     )
-    now=datetime.now(timezone.utc);ws=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0);ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    now=datetime.now(timezone.utc)
     with get_conn() as conn:
-        wk=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ws.isoformat(),)).fetchone()
-        mo=conn.execute("SELECT COALESCE(SUM(realized_pnl_gbp),0) AS p FROM trades WHERE exit_time>=?",(ms.isoformat(),)).fetchone()
         _raw_latest=fetchone_dict(conn.execute(
             "SELECT id FROM raw_signals ORDER BY id DESC LIMIT 1"
         )) or {}
@@ -7835,8 +8113,12 @@ def _bco_standard_top_uncached():
       "status":"ok","project":"BCO","mode":safe_str(OANDA_ENV).upper(),"time_utc":now_utc_iso(),
       "account":{"nav":safe_float(acct.get("NAV")),"balance":safe_float(acct.get("balance")),
                  "margin_available":safe_float(acct.get("marginAvailable")),"currency":safe_str(acct.get("currency"))},
-      "accounting":{"week_pnl":safe_float(wk["p"] if wk else 0) or 0.0,"week_label":"Realised this week",
-                    "month_pnl":safe_float(mo["p"] if mo else 0) or 0.0,"month_label":"Realised this month"},
+      "accounting":{"week_pnl":safe_float(perf_week.get("realized_pnl_gbp")) or 0.0,
+                    "week_label":"Realised live this week" if safe_str(OANDA_ENV).lower()=="live" else "Realised this week",
+                    "month_pnl":safe_float(perf_month.get("realized_pnl_gbp")) or 0.0,
+                    "month_label":"Realised live this month" if safe_str(OANDA_ENV).lower()=="live" else "Realised this month",
+                    "live_accounting_epoch_utc":perf.get("live_accounting_epoch_utc"),
+                    "live_epoch_status":perf.get("live_epoch_status")},
       "strategy":{"open_pnl":broker_open_pnl,"headline_pnl":broker_open_pnl,
                   "model_open_pnl":model_open,"realized_pnl":realized_pnl,
                   "realized_r":realized_r,"total_pnl":broker_open_pnl+realized_pnl,
@@ -7933,16 +8215,26 @@ def _aggregate_last_trade_opened_at_utc() -> Optional[str]:
     """
     try:
         with get_conn() as conn:
-            row = fetchone_dict(conn.execute("""
+            epoch = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "") if safe_str(OANDA_ENV).lower()=="live" else ""
+            if safe_str(OANDA_ENV).lower()=="live" and not epoch:
+                return None
+            clauses = [
+                "action='OPEN_BCO_DETAILS'",
+                "success",
+                "COALESCE(broker_trade_id,'') <> ''",
+                "COALESCE(created_at_utc,'') <> ''",
+            ]
+            params: List[Any] = []
+            if epoch:
+                clauses.append("created_at_utc>=?")
+                params.append(epoch)
+            row = fetchone_dict(conn.execute(f"""
                 SELECT created_at_utc
                 FROM execution_audit
-                WHERE action='OPEN_BCO_DETAILS'
-                  AND success
-                  AND COALESCE(broker_trade_id,'') <> ''
-                  AND COALESCE(created_at_utc,'') <> ''
+                WHERE {' AND '.join(clauses)}
                 ORDER BY created_at_utc DESC, id DESC
                 LIMIT 1
-            """)) or {}
+            """, tuple(params))) or {}
         return safe_str(row.get("created_at_utc")) or None
     except Exception:
         return None
@@ -8002,6 +8294,8 @@ def aggregate_portfolio_summary(
             "realised_week_gbp": safe_float(accounting.get("week_pnl")),
             "realised_month_gbp": safe_float(accounting.get("month_pnl")),
             "realised_all_time_gbp": safe_float(strategy.get("realized_pnl")),
+            "live_accounting_epoch_utc": accounting.get("live_accounting_epoch_utc"),
+            "live_epoch_status": accounting.get("live_epoch_status"),
         },
         "health": {
             "broker_ok": account.get("nav") is not None,
@@ -8202,13 +8496,22 @@ def _bco_latest_30_signals_html(limit: int = 30):
 def _bco_recently_closed_trades_html(limit: int = 30):
     limit=max(1,min(int(limit or 30),100))
     with get_conn() as conn:
-        rows=fetchall_dict(conn.execute("SELECT * FROM trades WHERE UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED') ORDER BY COALESCE(exit_time,updated_at_utc,created_at_utc) DESC,id DESC LIMIT ?",(limit,)))
+        epoch = runtime_get(conn, BCO_LIVE_ACCOUNTING_EPOCH_KEY, "") if safe_str(OANDA_ENV).lower()=="live" else ""
+        if safe_str(OANDA_ENV).lower()=="live" and not epoch:
+            rows=[]
+        elif epoch:
+            rows=fetchall_dict(conn.execute(
+                "SELECT * FROM trades WHERE UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED') AND exit_time>=? ORDER BY COALESCE(exit_time,updated_at_utc,created_at_utc) DESC,id DESC LIMIT ?",
+                (epoch,limit),
+            ))
+        else:
+            rows=fetchall_dict(conn.execute("SELECT * FROM trades WHERE UPPER(COALESCE(status,'')) IN ('CLOSED','BROKER_CLOSED') ORDER BY COALESCE(exit_time,updated_at_utc,created_at_utc) DESC,id DESC LIMIT ?",(limit,)))
     body=[]
     for r in rows:
         rr=safe_float(r.get('realized_R')); pnl=safe_float(r.get('realized_pnl_gbp'))
         body.append(f'''<tr><td>{esc(r.get('exit_time'))}</td><td>{esc(r.get('trade_id'))}</td><td>{esc(r.get('broker_trade_id') or '-')}</td><td>{esc(safe_str(r.get('direction')).upper())}</td><td>{esc(r.get('entry_time'))}</td><td>{int(safe_float(r.get('hold_candles')) or 0)}h</td><td>{esc(r.get('exit_reason') or '-')}</td><td class="{_pnl_class(rr)}">{_fmt_metric(rr,'R',2)}</td><td class="{_pnl_class(pnl)}">{_money(pnl)}</td><td>{_money(r.get('broker_realized_pl_home'))}</td><td>{_money(r.get('financing_home'))}</td><td>{_money(r.get('effective_risk_gbp'))}</td><td>{_fmt_metric(r.get('mfe_pct'),'%',2)}</td><td>{_fmt_metric(r.get('mae_pct'),'%',2)}</td><td>{esc(r.get('managed_stop_stage') or '-')}</td></tr>''')
-    if not body: return '<div class="section-note">No closed BCO trades yet.</div>'
-    return f'''<div class="section-note small"><strong>Recently Closed BCO Trades.</strong> Latest 30 closures with persisted close reason and broker/accounting result.</div><div class="table-scroll"><table><thead><tr><th>Exit</th><th>Trade</th><th>Broker ID</th><th>Side</th><th>Entry</th><th>Age</th><th>Why Closed</th><th>Realised R</th><th>Net P&amp;L</th><th>Broker P/L</th><th>Financing</th><th>Risk</th><th>MFE</th><th>MAE</th><th>Protection</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
+    if not body: return '<div class="section-note">No LIVE BCO trades have closed yet.</div>' if safe_str(OANDA_ENV).lower()=="live" else '<div class="section-note">No closed BCO trades yet.</div>'
+    return f'''<div class="section-note small"><strong>Recently Closed BCO Trades.</strong> {'LIVE-era only · ' if safe_str(OANDA_ENV).lower()=='live' else ''}Latest 30 closures with persisted close reason and broker/accounting result.</div><div class="table-scroll"><table><thead><tr><th>Exit</th><th>Trade</th><th>Broker ID</th><th>Side</th><th>Entry</th><th>Age</th><th>Why Closed</th><th>Realised R</th><th>Net P&amp;L</th><th>Broker P/L</th><th>Financing</th><th>Risk</th><th>MFE</th><th>MAE</th><th>Protection</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>'''
 
 def _bco_standard_profit_harvesting_html():
     s = snapshot()
@@ -8881,11 +9184,16 @@ def _bco_standard_broker_html():
 
       <h3>BCO Profit Performance</h3>
       <div class="section-note small">
+        <strong>{'LIVE accounting epoch: '+esc(perf.get('live_accounting_epoch_utc')) if safe_str(OANDA_ENV).lower()=='live' and perf.get('live_accounting_epoch_utc') else ('LIVE accounting epoch pending safe flat initialisation' if safe_str(OANDA_ENV).lower()=='live' else 'Practice accounting')}</strong>.
+        {'Pre-live PRACTICE/demo economics are archived and excluded from every live performance total.' if safe_str(OANDA_ENV).lower()=='live' else ''}
+      </div>
+      <div class="section-note small">
         <strong>BCO-only accounting.</strong> Week boundaries start Monday and month boundaries use
         {esc(BCO_DISPLAY_TIMEZONE)}. <strong>Economic P&amp;L</strong> is realised net profit plus the change
         in BCO broker open P&amp;L across the period, so a basket spanning a week/month boundary is not
         misrepresented just because trades remain open. Shared-account/foreign-strategy P&amp;L is excluded.
       </div>
+      {f"""<div class="section-note small"><strong>Pre-Live Demo Archive.</strong> Archived {esc(pre_live_archive.get('archived_at_utc'))} · realised {_money(pre_live_archive.get('demo_realized_pnl_gbp'))} · {_fmt_metric(pre_live_archive.get('demo_realized_R'),'R')} · {int(pre_live_archive.get('demo_trade_count') or 0)} closed trades. Historical rows remain in research/exports.</div>""" if pre_live_archive else ""}
       <div class="metric-grid">
         <div class="mini-card"><div class="k">This Week — Economic</div><div class="v {_pnl_class(perf_week.get('economic_pnl_gbp'))}">{_perf_economic_text(perf_week)}</div><div class="small">Realised {_money(perf_week.get('realized_pnl_gbp'))} · {_fmt_metric(perf_week.get('realized_R'),'R')} · {int(perf_week.get('trade_count') or 0)} closes</div></div>
         <div class="mini-card"><div class="k">This Month — Economic</div><div class="v {_pnl_class(perf_month.get('economic_pnl_gbp'))}">{_perf_economic_text(perf_month)}</div><div class="small">Realised {_money(perf_month.get('realized_pnl_gbp'))} · {_fmt_metric(perf_month.get('realized_R'),'R')} · {int(perf_month.get('trade_count') or 0)} closes</div></div>
