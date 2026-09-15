@@ -36,11 +36,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.17 — Live Accounting Epoch Broker-Panel Fix"
-APP_VERSION = "0.8.17"
-POLICY_VERSION = "bco_v0.8.17_live_accounting_epoch_broker_panel_fix_2026_09_15"
+APP_NAME = "Project Exit Plan — BCO v0.8.18 — Live Near-Target Risk Rounding"
+APP_VERSION = "0.8.18"
+POLICY_VERSION = "bco_v0.8.18_live_near_target_risk_rounding_2026_09_15"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.18 — BCO discrete-unit sizing refinement for the live account.
+# - Keeps the requested risk target at £5/trade.
+# - Raises the dedicated "round to the next broker-valid unit" tolerance from
+#   10% to 15% above target so a 2-unit order at ~£5.66 effective risk is chosen
+#   instead of materially under-risking at ~£2.83 with 1 unit.
+# - The separate BROKER_MAX_RISK_OVERAGE_PCT hard guardrail remains unchanged
+#   at its existing configured/default value (25% by default).
+# - Applies identically in PRACTICE and LIVE; no separate live-only sizing path.
+# - No signal, ATR2/Classic exit, 3.5% SL, harvesting, AI, directional research,
+#   accounting epoch or broker-safety logic changed.
+#
 # v0.8.17 — broker/accounting panel rendering bugfix only.
 # - Defines the pre-live archive object inside the Broker/OANDA/Accounting
 #   renderer before the HTML references it.
@@ -110,7 +121,7 @@ AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 # The £5 target risk is unchanged. When broker unit precision forces a discrete
 # size, the app now prefers the next allowed unit step ABOVE the target only
 # when effective risk remains within BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT
-# (default 10%, i.e. max £5.50 for a £5 target). Otherwise it falls back to
+# (default 15%, i.e. max £5.75 for a £5 target). Otherwise it falls back to
 # the lower allowed unit size. Existing broker spread/risk guardrails remain
 # in force. No entry signal, exit, basket defence, harvesting, AI or research
 # rule changed.
@@ -296,7 +307,7 @@ BCO_ENTRY_PREVIEW_RETRY_DELAY_SECONDS = max(0.1, min(float(os.getenv("BCO_ENTRY_
 # v0.8.11: prefer the next broker-valid unit step when it lands just above
 # target risk, but never more than this dedicated sizing tolerance.
 BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT = max(
-    0.0, min(float(os.getenv("BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT", "10")), 100.0)
+    0.0, min(float(os.getenv("BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT", "15")), 100.0)
 )
 
 # Managed runner protection, mirroring the current live philosophy.
@@ -1537,7 +1548,7 @@ def bco_choose_discrete_units(
       - always respect the broker minimum trade size.
 
     For BCO_USD with tradeUnitsPrecision=0 this means, for example, raw 1.98
-    units can become 2 units when 2 units risk <= £5.50 for a £5 target, while
+    units can become 2 units when 2 units risk <= £5.75 for a £5 target, while
     a materially oversized 2-unit risk falls back to 1 unit.
     """
     raw = max(0.0, float(raw_units or 0.0))
