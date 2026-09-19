@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import csv
+import email.utils
 import io
 import json
 import math
@@ -36,11 +37,30 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.18 — Live Near-Target Risk Rounding"
-APP_VERSION = "0.8.18"
-POLICY_VERSION = "bco_v0.8.18_live_near_target_risk_rounding_2026_09_15"
+APP_NAME = "Project Exit Plan — BCO v0.8.19 — Stacking-Brake Shadow + Durable AI Retry"
+APP_VERSION = "0.8.19"
+POLICY_VERSION = "bco_v0.8.19_stacking_brake_shadow_durable_ai_retry_2026_09_18"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
+# v0.8.19 — research stacking-brake challenger + resilient AI collector.
+# - Adds a PROSPECTIVE, RESEARCH-ONLY stacking-brake shadow. It records whether
+#   a fresh production-eligible LONG would have been blocked under a frozen v1
+#   deterioration rule, while production continues unchanged.
+# - Primary v1 brake: block fresh stacking under RED/CRITICAL once exposure
+#   exists; under AMBER require >=3 existing trades plus deterioration
+#   confluence (hypothetical SHORT candidate, negative basket, >=25% giveback,
+#   or >=60% losing trades). Also records RED-only and AMBER-or-worse variants.
+# - Tracks 6/12/24/48/72/96h hypothetical LONG outcomes and the actual linked
+#   trade result so avoided-loss vs missed-upside evidence can accumulate.
+# - Adds durable AI retry state for HTTP 429 / retryable 5xx / transient network
+#   failures with exponential backoff, Retry-After support and restart recovery.
+# - Existing historical 429 ERROR snapshots are eligible for recovery because
+#   their point-in-time snapshot_json was already frozen at the original signal.
+# - Coalesces redundant SHORT_RESEARCH_STATE_CHANGE calls inside a configurable
+#   cooldown while candidate ON/OFF flips and other meaningful triggers still call.
+# - Both additions have ZERO execution authority. No production entry, ATR2,
+#   hard stop, sizing, harvesting, accounting, or broker-safety rule changed.
+#
 # v0.8.18 — BCO discrete-unit sizing refinement for the live account.
 # - Keeps the requested risk target at £5/trade.
 # - Raises the dedicated "round to the next broker-valid unit" tolerance from
@@ -977,6 +997,7 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_trade ON bco_exit_challenger_shadow(trade_id,challenger)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_exit_shadow_signal ON bco_exit_challenger_shadow(last_raw_signal_id)")
         _ensure_bco_directional_intelligence_on_conn(conn)
+        _ensure_bco_stacking_brake_on_conn(conn)
 
 
 def _ensure_bco_exit_challenger_shadow_schema_on_conn(conn: DBConn) -> None:
@@ -3610,6 +3631,35 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
                 start_bco_exit_challenger_shadows(
                     conn, new_trade_id, raw_signal_id
                 )
+        stacking_brake_research = {"ok": True, "research_only": True, "execution_authority": False, "skipped": True}
+        try:
+            stacking_brake_research = record_bco_stacking_brake_research(
+                conn=conn,
+                raw_signal_id=raw_signal_id,
+                payload=payload,
+                signal_time=signal_time,
+                production_candidate=bool(candidate),
+                production_entry_allowed=bool(entry_allowed),
+                production_entry_created=bool(entry_created),
+                local_trade_id=new_trade_id,
+                cycle_id=safe_str(state.get("cycle_id")),
+                open_count_before_entry=int(after_prot["open_count"]),
+                basket_r_before_entry=float(after_prot["basket_R"]),
+                basket_high_water_r=float(hwm),
+                basket_giveback_pct=float(giveback),
+                losing_pct=float(after_prot["losing_pct"]),
+                tide_score=int(score),
+                tide_status=status,
+                manager_action=action,
+            )
+        except Exception as stack_exc:
+            stacking_brake_research = {
+                "ok": False,
+                "research_only": True,
+                "execution_authority": False,
+                "error": f"{type(stack_exc).__name__}: {stack_exc}",
+            }
+
         final=basket_metrics(conn)
         # If basket is now flat, close the cycle cleanly and expire waiting stages.
         if final["open_count"]<=0:
@@ -3650,6 +3700,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         "basket":snapshot(),
         "exit_challenger_shadow":exit_shadow,
         "focused_research_point_capture":focused_point_capture,
+        "stacking_brake_research":stacking_brake_research,
         "exit_manager": final_cycle_manager,
         "next_cycle_exit_manager": BCO_NEW_CYCLE_EXIT_MANAGER,
     }
@@ -5509,6 +5560,7 @@ def _background_bootstrap() -> None:
         start_signal_recovery_worker()
         start_worker()
         start_live_monitor_worker()
+        _aiobs_ensure_worker()
         try:
             log_event("startup", APP_NAME, {"safety": safety_status()})
         except Exception:
@@ -5560,6 +5612,12 @@ AI_SHADOW_EVENT_DRIVEN_ONLY = os.getenv("AI_SHADOW_EVENT_DRIVEN_ONLY", "true").s
 AI_SHADOW_TIMEOUT_SECONDS = max(10.0, min(float(os.getenv("AI_SHADOW_TIMEOUT_SECONDS", "45")), 120.0))
 AI_SHADOW_MAX_OUTPUT_TOKENS = max(250, min(int(float(os.getenv("AI_SHADOW_MAX_OUTPUT_TOKENS", "700"))), 2000))
 AI_SHADOW_QUEUE_MAXSIZE = max(50, min(int(float(os.getenv("AI_SHADOW_QUEUE_MAXSIZE", "1000"))), 10000))
+AI_SHADOW_RETRY_MAX_ATTEMPTS = max(2, min(int(float(os.getenv("AI_SHADOW_RETRY_MAX_ATTEMPTS", "8"))), 20))
+AI_SHADOW_RETRY_BASE_SECONDS = max(2.0, min(float(os.getenv("AI_SHADOW_RETRY_BASE_SECONDS", "15")), 300.0))
+AI_SHADOW_RETRY_MAX_SECONDS = max(AI_SHADOW_RETRY_BASE_SECONDS, min(float(os.getenv("AI_SHADOW_RETRY_MAX_SECONDS", "900")), 3600.0))
+AI_SHADOW_RETRY_SCAN_SECONDS = max(2.0, min(float(os.getenv("AI_SHADOW_RETRY_SCAN_SECONDS", "10")), 120.0))
+AI_SHADOW_RETRY_BATCH = max(1, min(int(float(os.getenv("AI_SHADOW_RETRY_BATCH", "2"))), 20))
+AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS = max(0.0, min(float(os.getenv("AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS", "3")), 48.0))
 AI_SHADOW_GIVEBACK_BANDS_PCT = (25.0, 50.0, 75.0)
 # Includes earlier levels than Indices because BCO/Metals basket throughput is
 # still being learned prospectively. These are CALL TRIGGERS ONLY.
@@ -5605,6 +5663,9 @@ _ai_regime_worker_started = False
 _ai_regime_worker_thread = None
 _ai_regime_last_heartbeat_utc = ""
 _ai_regime_last_raw_signal_id = None
+_ai_regime_queue_lock = threading.Lock()
+_ai_regime_enqueued_ids = set()
+_ai_regime_last_retry_scan_monotonic = 0.0
 
 
 def ensure_ai_regime_observer_table() -> None:
@@ -5643,7 +5704,12 @@ def ensure_ai_regime_observer_table() -> None:
                 output_tokens INTEGER DEFAULT 0,
                 request_started_at_utc TEXT,
                 completed_at_utc TEXT,
-                error TEXT
+                error TEXT,
+                attempt_count BIGINT DEFAULT 0,
+                next_retry_at_utc TEXT,
+                last_http_status BIGINT,
+                retryable_error INTEGER DEFAULT 0,
+                coalesced_trigger_reason TEXT
             )
         """)
         # Existing Railway DBs may already have the v1 table. Add directional
@@ -5655,11 +5721,23 @@ def ensure_ai_regime_observer_table() -> None:
             ))}
         else:
             _cols = {safe_str(r.get("name")) for r in fetchall_dict(conn.execute("PRAGMA table_info(ai_regime_observer)"))}
-        for _name in ("directional_bias","directional_regime","long_view","short_view"):
+        _aiobs_column_specs = {
+            "directional_bias": "TEXT",
+            "directional_regime": "TEXT",
+            "long_view": "TEXT",
+            "short_view": "TEXT",
+            "attempt_count": "BIGINT DEFAULT 0",
+            "next_retry_at_utc": "TEXT",
+            "last_http_status": "BIGINT",
+            "retryable_error": "INTEGER DEFAULT 0",
+            "coalesced_trigger_reason": "TEXT",
+        }
+        for _name, _ddl in _aiobs_column_specs.items():
             if _name not in _cols:
-                conn.execute(f"ALTER TABLE ai_regime_observer ADD COLUMN {_name} TEXT")
+                conn.execute(f"ALTER TABLE ai_regime_observer ADD COLUMN {_name} {_ddl}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_status ON ai_regime_observer(status, created_at_utc)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_asset ON ai_regime_observer(asset, raw_signal_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_regime_retry ON ai_regime_observer(status,next_retry_at_utc,raw_signal_id)")
         conn.commit()
 
 
@@ -5724,6 +5802,26 @@ def _aiobs_extract_text(data):
     return "\n".join(bits).strip()
 
 
+def _aiobs_retry_after_seconds(headers: Any) -> Optional[float]:
+    try:
+        raw = safe_str(headers.get("Retry-After")) if headers is not None else ""
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
 def _aiobs_openai_call(model_input, raw_signal_id):
     body = {
         "model": AI_SHADOW_MODEL,
@@ -5749,29 +5847,153 @@ def _aiobs_openai_call(model_input, raw_signal_id):
         },
         method="POST",
     )
-    last_error = ""
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=AI_SHADOW_TIMEOUT_SECONDS) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            txt = _aiobs_extract_text(data)
-            decision = json.loads(txt) if txt else {}
-            required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
-            if not isinstance(decision, dict) or not required.issubset(decision):
-                raise ValueError("structured regime decision missing required fields")
-            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    try:
+        with urllib.request.urlopen(req, timeout=AI_SHADOW_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        txt = _aiobs_extract_text(data)
+        decision = json.loads(txt) if txt else {}
+        required = {"entry_view","management_view","regime","directional_bias","directional_regime","long_view","short_view","confidence","live_rule_assessment","reason_codes","short_reason"}
+        if not isinstance(decision, dict) or not required.issubset(decision):
             return {
-                "ok": True,
-                "decision": decision,
-                "response_id": safe_str(data.get("id")),
-                "input_tokens": int(safe_float(usage.get("input_tokens")) or 0),
-                "output_tokens": int(safe_float(usage.get("output_tokens")) or 0),
+                "ok": False,
+                "error": "ValueError: structured regime decision missing required fields",
+                "retryable": False,
+                "http_status": 200,
             }
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-    return {"ok": False, "error": last_error or "OpenAI request failed"}
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        return {
+            "ok": True,
+            "decision": decision,
+            "response_id": safe_str(data.get("id")),
+            "input_tokens": int(safe_float(usage.get("input_tokens")) or 0),
+            "output_tokens": int(safe_float(usage.get("output_tokens")) or 0),
+            "http_status": 200,
+        }
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        status = int(getattr(exc, "code", 0) or 0)
+        retryable = status == 429 or status in {500, 502, 503, 504}
+        retry_after = _aiobs_retry_after_seconds(getattr(exc, "headers", None))
+        return {
+            "ok": False,
+            "error": f"HTTPError: HTTP {status}: {raw or safe_str(exc)}"[:4000],
+            "retryable": retryable,
+            "http_status": status,
+            "retry_after_seconds": retry_after,
+        }
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}"[:4000],
+            "retryable": True,
+            "http_status": None,
+            "retry_after_seconds": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}"[:4000],
+            "retryable": False,
+            "http_status": None,
+            "retry_after_seconds": None,
+        }
+
+
+def _aiobs_retry_delay_seconds(attempt_count: int, retry_after_seconds: Optional[float] = None) -> float:
+    attempt = max(1, int(attempt_count or 1))
+    exponential = AI_SHADOW_RETRY_BASE_SECONDS * (2.0 ** max(0, attempt - 1))
+    delay = min(float(AI_SHADOW_RETRY_MAX_SECONDS), float(exponential))
+    if retry_after_seconds is not None:
+        delay = max(delay, min(float(AI_SHADOW_RETRY_MAX_SECONDS), max(0.0, float(retry_after_seconds))))
+    return max(1.0, delay)
+
+
+def _aiobs_recover_retryable_rows() -> Dict[str, Any]:
+    """Recover durable retry state across deploys/restarts.
+
+    Historical 429 rows are safe to retry because snapshot_json is the immutable
+    point-in-time input captured at the original signal.
+    """
+    ensure_ai_regime_observer_table()
+    now = now_utc_iso()
+    recovered_429 = 0
+    recovered_stale_running = 0
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    with get_conn() as conn:
+        # v0.8.18 and earlier stored 429s as terminal ERROR. Reclassify those
+        # snapshots once so they can complete rather than being permanently lost.
+        rows = conn.execute("""
+            SELECT raw_signal_id FROM ai_regime_observer
+            WHERE api_eligible=1
+              AND UPPER(COALESCE(status,''))='ERROR'
+              AND (error LIKE '%429%' OR UPPER(COALESCE(error,'')) LIKE '%TOO MANY REQUESTS%')
+              AND COALESCE(attempt_count,0) < ?
+            ORDER BY raw_signal_id ASC
+        """, (AI_SHADOW_RETRY_MAX_ATTEMPTS,)).fetchall()
+        for row in rows:
+            conn.execute("""
+                UPDATE ai_regime_observer
+                SET status='RETRY_WAIT',updated_at_utc=?,next_retry_at_utc=?,
+                    retryable_error=1,last_http_status=429,completed_at_utc=NULL
+                WHERE raw_signal_id=?
+            """, (now, now, int(row["raw_signal_id"])))
+            recovered_429 += 1
+
+        # A process restart during an HTTP request can strand RUNNING. Re-arm only
+        # genuinely stale rows; recent RUNNING rows are left alone.
+        rows = conn.execute("""
+            SELECT raw_signal_id FROM ai_regime_observer
+            WHERE api_eligible=1
+              AND UPPER(COALESCE(status,''))='RUNNING'
+              AND COALESCE(request_started_at_utc,'')<>''
+              AND request_started_at_utc<?
+              AND COALESCE(attempt_count,0) < ?
+            ORDER BY raw_signal_id ASC
+        """, (stale_cutoff, AI_SHADOW_RETRY_MAX_ATTEMPTS)).fetchall()
+        for row in rows:
+            conn.execute("""
+                UPDATE ai_regime_observer
+                SET status='RETRY_WAIT',updated_at_utc=?,next_retry_at_utc=?,
+                    retryable_error=1,error=CASE WHEN COALESCE(error,'')='' THEN 'stale RUNNING recovered after restart' ELSE error END
+                WHERE raw_signal_id=?
+            """, (now, now, int(row["raw_signal_id"])))
+            recovered_stale_running += 1
+        conn.commit()
+    return {
+        "ok": True,
+        "recovered_legacy_429": recovered_429,
+        "recovered_stale_running": recovered_stale_running,
+    }
+
+
+def _aiobs_enqueue_due_retries(force: bool = False) -> Dict[str, Any]:
+    global _ai_regime_last_retry_scan_monotonic
+    now_mono = time.monotonic()
+    if not force and now_mono - float(_ai_regime_last_retry_scan_monotonic or 0.0) < AI_SHADOW_RETRY_SCAN_SECONDS:
+        return {"ok": True, "skipped": True}
+    _ai_regime_last_retry_scan_monotonic = now_mono
+    ensure_ai_regime_observer_table()
+    now = now_utc_iso()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT raw_signal_id
+            FROM ai_regime_observer
+            WHERE api_eligible=1
+              AND UPPER(COALESCE(status,'')) IN ('CAPTURED','RETRY_WAIT')
+              AND COALESCE(attempt_count,0) < ?
+              AND (next_retry_at_utc IS NULL OR next_retry_at_utc='' OR next_retry_at_utc<=?)
+            ORDER BY raw_signal_id ASC
+            LIMIT ?
+        """, (AI_SHADOW_RETRY_MAX_ATTEMPTS, now, AI_SHADOW_RETRY_BATCH)).fetchall()
+    queued = 0
+    for row in rows:
+        result = enqueue_ai_regime_observer(int(row["raw_signal_id"]))
+        if result.get("queued"):
+            queued += 1
+    return {"ok": True, "due": len(rows), "queued": queued}
 
 
 def process_ai_regime_observer(raw_signal_id):
@@ -5783,26 +6005,67 @@ def process_ai_regime_observer(raw_signal_id):
         if not row:
             return {"ok":False,"reason":"snapshot_missing"}
         row = dict(row)
-        if safe_str(row.get("status")).upper() == "COMPLETE":
+        status = safe_str(row.get("status")).upper()
+        if status == "COMPLETE":
             return {"ok":True,"skipped":True,"reason":"already_complete"}
         if not int(safe_float(row.get("api_eligible")) or 0):
             return {"ok":True,"skipped":True,"reason":"capture_only"}
+        if status == "RETRY_WAIT":
+            next_retry = _bco_parse_aware_utc(row.get("next_retry_at_utc"))
+            if next_retry is not None and next_retry > datetime.now(timezone.utc):
+                return {"ok":True,"skipped":True,"reason":"retry_not_due","next_retry_at_utc":row.get("next_retry_at_utc")}
+        attempt_count = int(safe_float(row.get("attempt_count")) or 0) + 1
+        if attempt_count > AI_SHADOW_RETRY_MAX_ATTEMPTS:
+            conn.execute("""UPDATE ai_regime_observer
+                            SET status='ERROR',updated_at_utc=?,completed_at_utc=?,
+                                error=CASE WHEN COALESCE(error,'')='' THEN 'AI retry attempts exhausted' ELSE error END
+                            WHERE raw_signal_id=?""",
+                         (now_utc_iso(),now_utc_iso(),int(raw_signal_id)))
+            conn.commit()
+            return {"ok":False,"error":"AI retry attempts exhausted","attempt_count":attempt_count-1}
         snap = json.loads(safe_str(row.get("snapshot_json")) or "{}")
         model_input = snap.get("model_input") or {}
         started = now_utc_iso()
         conn.execute("""UPDATE ai_regime_observer
-                       SET status='RUNNING',updated_at_utc=?,request_started_at_utc=?,model=?,error=''
+                       SET status='RUNNING',updated_at_utc=?,request_started_at_utc=?,model=?,error='',
+                           attempt_count=?,next_retry_at_utc=NULL,retryable_error=0
                        WHERE raw_signal_id=?""",
-                    (started,started,AI_SHADOW_MODEL,int(raw_signal_id)))
+                    (started,started,AI_SHADOW_MODEL,attempt_count,int(raw_signal_id)))
         conn.commit()
 
     api = _aiobs_openai_call(model_input, int(raw_signal_id))
     now = now_utc_iso()
     with get_conn() as conn:
         if not api.get("ok"):
+            retryable = bool(api.get("retryable"))
+            http_status = int(safe_float(api.get("http_status")) or 0) or None
+            error = safe_str(api.get("error"))[:4000]
+            if retryable and attempt_count < AI_SHADOW_RETRY_MAX_ATTEMPTS:
+                delay = _aiobs_retry_delay_seconds(
+                    attempt_count,
+                    safe_float(api.get("retry_after_seconds")),
+                )
+                next_retry = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+                conn.execute("""UPDATE ai_regime_observer
+                                SET status='RETRY_WAIT',updated_at_utc=?,completed_at_utc=NULL,
+                                    error=?,next_retry_at_utc=?,last_http_status=?,
+                                    retryable_error=1
+                                WHERE raw_signal_id=?""",
+                             (now,error,next_retry,http_status,int(raw_signal_id)))
+                conn.commit()
+                return {
+                    "ok": False,
+                    "retry_scheduled": True,
+                    "error": error,
+                    "attempt_count": attempt_count,
+                    "next_retry_at_utc": next_retry,
+                    "http_status": http_status,
+                }
             conn.execute("""UPDATE ai_regime_observer SET status='ERROR',updated_at_utc=?,
-                            completed_at_utc=?,error=? WHERE raw_signal_id=?""",
-                         (now,now,safe_str(api.get("error"))[:4000],int(raw_signal_id)))
+                            completed_at_utc=?,error=?,next_retry_at_utc=NULL,
+                            last_http_status=?,retryable_error=?
+                            WHERE raw_signal_id=?""",
+                         (now,now,error,http_status,1 if retryable else 0,int(raw_signal_id)))
             conn.commit()
             return api
         d = api["decision"]
@@ -5811,7 +6074,8 @@ def process_ai_regime_observer(raw_signal_id):
                         entry_view=?,management_view=?,regime=?,directional_bias=?,
                         directional_regime=?,long_view=?,short_view=?,confidence=?,
                         live_rule_assessment=?,reason_codes=?,short_reason=?,
-                        response_id=?,input_tokens=?,output_tokens=?,model=?,error=''
+                        response_id=?,input_tokens=?,output_tokens=?,model=?,error='',
+                        next_retry_at_utc=NULL,last_http_status=?,retryable_error=0
                         WHERE raw_signal_id=?""",
                      (now,now,safe_str(d.get("entry_view")),safe_str(d.get("management_view")),
                       safe_str(d.get("regime")),safe_str(d.get("directional_bias")),
@@ -5820,26 +6084,41 @@ def process_ai_regime_observer(raw_signal_id):
                       safe_str(d.get("live_rule_assessment")),json.dumps(d.get("reason_codes") or []),
                       safe_str(d.get("short_reason"))[:1500],safe_str(api.get("response_id")),
                       int(api.get("input_tokens") or 0),int(api.get("output_tokens") or 0),
-                      AI_SHADOW_MODEL,int(raw_signal_id)))
+                      AI_SHADOW_MODEL,int(safe_float(api.get("http_status")) or 200),int(raw_signal_id)))
         conn.commit()
-    return {"ok":True,"decision":d,"research_only":True}
+    return {"ok":True,"decision":d,"research_only":True,"attempt_count":attempt_count}
 
 
 def _aiobs_worker_loop():
     global _ai_regime_last_heartbeat_utc, _ai_regime_last_raw_signal_id
+    try:
+        _aiobs_recover_retryable_rows()
+        _aiobs_enqueue_due_retries(force=True)
+    except Exception:
+        pass
     while True:
         _ai_regime_last_heartbeat_utc = now_utc_iso()
         try:
             rid = _ai_regime_queue.get(timeout=0.5)
         except queue.Empty:
+            try:
+                _aiobs_enqueue_due_retries()
+            except Exception:
+                pass
             continue
         try:
             _ai_regime_last_raw_signal_id = int(rid)
             process_ai_regime_observer(int(rid))
         finally:
+            with _ai_regime_queue_lock:
+                _ai_regime_enqueued_ids.discard(int(rid))
             _ai_regime_last_heartbeat_utc = now_utc_iso()
             try:
                 _ai_regime_queue.task_done()
+            except Exception:
+                pass
+            try:
+                _aiobs_enqueue_due_retries()
             except Exception:
                 pass
 
@@ -5848,6 +6127,7 @@ def _aiobs_ensure_worker():
     global _ai_regime_worker_started, _ai_regime_worker_thread
     if not AI_SHADOW_ENABLED or not AI_SHADOW_OPENAI_API_KEY:
         return
+    ensure_ai_regime_observer_table()
     if _ai_regime_worker_thread is not None and _ai_regime_worker_thread.is_alive():
         _ai_regime_worker_started = True
         return
@@ -5861,12 +6141,17 @@ def enqueue_ai_regime_observer(raw_signal_id):
         return {"queued":False,"reason":"AI_SHADOW_ENABLED=false"}
     if not AI_SHADOW_OPENAI_API_KEY:
         return {"queued":False,"reason":"OPENAI_API_KEY missing"}
+    rid = int(raw_signal_id)
     _aiobs_ensure_worker()
-    try:
-        _ai_regime_queue.put_nowait(int(raw_signal_id))
-        return {"queued":True}
-    except queue.Full:
-        return {"queued":False,"reason":"observer_queue_full"}
+    with _ai_regime_queue_lock:
+        if rid in _ai_regime_enqueued_ids:
+            return {"queued":False,"reason":"already_queued"}
+        try:
+            _ai_regime_queue.put_nowait(rid)
+            _ai_regime_enqueued_ids.add(rid)
+            return {"queued":True}
+        except queue.Full:
+            return {"queued":False,"reason":"observer_queue_full"}
 
 
 def ai_regime_observer_status():
@@ -5888,6 +6173,11 @@ def ai_regime_observer_status():
         "worker_started":_ai_regime_worker_started,
         "thread_alive":bool(_ai_regime_worker_thread and _ai_regime_worker_thread.is_alive()),
         "queue_size":_ai_regime_queue.qsize(),
+        "queued_unique_ids":len(_ai_regime_enqueued_ids),
+        "retry_max_attempts":AI_SHADOW_RETRY_MAX_ATTEMPTS,
+        "retry_base_seconds":AI_SHADOW_RETRY_BASE_SECONDS,
+        "retry_max_seconds":AI_SHADOW_RETRY_MAX_SECONDS,
+        "short_state_min_call_gap_hours":AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS,
         "last_heartbeat_utc":_ai_regime_last_heartbeat_utc,
         "last_raw_signal_id":_ai_regime_last_raw_signal_id,
     }
@@ -5966,7 +6256,8 @@ def build_ai_regime_observer_html():
         <strong>Research only — zero broker authority.</strong>
         Same event-driven regime-observer architecture and output taxonomy as Live Indices.
         Every signal snapshot is frozen before deterministic processing; paid calls occur only
-        on meaningful state changes. No observer field is consumed by entry, exit, stop,
+        on meaningful state changes. Retryable 429/5xx/network failures are durably retried
+        with backoff, and redundant short-state churn is coalesced without losing snapshots. No observer field is consumed by entry, exit, stop,
         sizing, harvesting or basket-management code.
       </div>
       <div class="cards three">
@@ -6413,6 +6704,373 @@ def export_bco_directional_intelligence_csv(limit: int = 25000):
     return csv_response(bco_directional_intelligence_rows(limit), "bco-directional-intelligence.csv")
 
 
+# ============================================================
+# v0.8.19 — PROSPECTIVE STACKING-BRAKE RESEARCH CHALLENGER
+# ============================================================
+# ZERO execution authority. This layer never changes entry_allowed, create_trade,
+# sizing, exits, stops, harvesting or basket state. It simply freezes what a
+# pre-declared "stop adding fresh copies while deterioration is visible" rule
+# WOULD have done and compares that with later outcomes.
+BCO_STACKING_BRAKE_VERSION = "bco_stacking_brake_v1_2026_09_18"
+BCO_STACKING_BRAKE_HORIZONS = [6, 12, 24, 48, 72, 96]
+BCO_STACKING_BRAKE_MIN_EXISTING_FOR_AMBER = 3
+BCO_STACKING_BRAKE_EXECUTION_AUTHORITY = False
+
+
+def _ensure_bco_stacking_brake_on_conn(conn: DBConn) -> None:
+    id_type = "BIGSERIAL PRIMARY KEY" if getattr(conn, "postgres", False) else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS bco_stacking_brake_research (
+        id {id_type},
+        created_at_utc TEXT NOT NULL,
+        updated_at_utc TEXT NOT NULL,
+        research_version TEXT NOT NULL,
+        raw_signal_id BIGINT NOT NULL UNIQUE,
+        signal_time TEXT,
+        cycle_id TEXT,
+        production_candidate INTEGER DEFAULT 0,
+        production_entry_allowed INTEGER DEFAULT 0,
+        production_entry_created INTEGER DEFAULT 0,
+        local_trade_id TEXT,
+        entry_close DOUBLE PRECISION,
+        sl_pct DOUBLE PRECISION,
+        open_count_before_entry BIGINT,
+        basket_r_before_entry DOUBLE PRECISION,
+        basket_high_water_r DOUBLE PRECISION,
+        basket_giveback_pct DOUBLE PRECISION,
+        losing_pct DOUBLE PRECISION,
+        tide_score BIGINT,
+        tide_status TEXT,
+        manager_action TEXT,
+        short_candidate INTEGER DEFAULT 0,
+        short_state TEXT,
+        eligible_for_challenge INTEGER DEFAULT 0,
+        primary_decision TEXT,
+        primary_reason TEXT,
+        red_only_block INTEGER DEFAULT 0,
+        amber_or_worse_block INTEGER DEFAULT 0,
+        confluence_v1_block INTEGER DEFAULT 0,
+        actual_trade_status TEXT,
+        actual_exit_reason TEXT,
+        actual_realized_r DOUBLE PRECISION,
+        actual_realized_pnl_gbp DOUBLE PRECISION,
+        outcome_6_r DOUBLE PRECISION, outcome_6_mfe_r DOUBLE PRECISION, outcome_6_mae_r DOUBLE PRECISION, completed_6 INTEGER DEFAULT 0,
+        outcome_12_r DOUBLE PRECISION, outcome_12_mfe_r DOUBLE PRECISION, outcome_12_mae_r DOUBLE PRECISION, completed_12 INTEGER DEFAULT 0,
+        outcome_24_r DOUBLE PRECISION, outcome_24_mfe_r DOUBLE PRECISION, outcome_24_mae_r DOUBLE PRECISION, completed_24 INTEGER DEFAULT 0,
+        outcome_48_r DOUBLE PRECISION, outcome_48_mfe_r DOUBLE PRECISION, outcome_48_mae_r DOUBLE PRECISION, completed_48 INTEGER DEFAULT 0,
+        outcome_72_r DOUBLE PRECISION, outcome_72_mfe_r DOUBLE PRECISION, outcome_72_mae_r DOUBLE PRECISION, completed_72 INTEGER DEFAULT 0,
+        outcome_96_r DOUBLE PRECISION, outcome_96_mfe_r DOUBLE PRECISION, outcome_96_mae_r DOUBLE PRECISION, completed_96 INTEGER DEFAULT 0
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_stack_brake_decision ON bco_stacking_brake_research(primary_decision,eligible_for_challenge,raw_signal_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_stack_brake_pending ON bco_stacking_brake_research(completed_96,raw_signal_id)")
+
+
+def ensure_bco_stacking_brake_table() -> None:
+    with get_conn() as conn:
+        _ensure_bco_stacking_brake_on_conn(conn)
+        conn.commit()
+
+
+def _bco_stacking_brake_decision(
+    tide_status: str,
+    open_count: int,
+    basket_r: float,
+    giveback_pct: float,
+    losing_pct: float,
+    short_candidate: bool,
+) -> Dict[str, Any]:
+    status = safe_str(tide_status).upper()
+    open_n = max(0, int(open_count or 0))
+    red_only = bool(open_n > 0 and status in {"RED", "CRITICAL"})
+    amber_or_worse = bool(
+        open_n >= BCO_STACKING_BRAKE_MIN_EXISTING_FOR_AMBER
+        and status in {"AMBER", "RED", "CRITICAL"}
+    )
+
+    reasons: List[str] = []
+    primary = False
+    if red_only:
+        primary = True
+        reasons.append(f"{status}_with_existing_exposure")
+    elif status == "AMBER" and open_n >= BCO_STACKING_BRAKE_MIN_EXISTING_FOR_AMBER:
+        if bool(short_candidate):
+            reasons.append("amber_plus_short_candidate")
+        if float(basket_r) < 0:
+            reasons.append("amber_plus_negative_basket")
+        if float(giveback_pct) >= 25.0:
+            reasons.append("amber_plus_25pct_giveback")
+        if float(losing_pct) >= 60.0:
+            reasons.append("amber_plus_60pct_losing")
+        primary = bool(reasons)
+
+    return {
+        "primary_decision": "BLOCK" if primary else "ALLOW",
+        "primary_reason": "|".join(reasons) if reasons else "no_frozen_v1_brake_condition",
+        "red_only_block": red_only,
+        "amber_or_worse_block": amber_or_worse,
+        "confluence_v1_block": primary,
+    }
+
+
+def update_bco_stacking_brake_outcomes(conn: DBConn, limit: int = 500) -> Dict[str, Any]:
+    _ensure_bco_stacking_brake_on_conn(conn)
+    rows = fetchall_dict(conn.execute("""
+        SELECT * FROM bco_stacking_brake_research
+        WHERE COALESCE(completed_96,0)=0
+           OR (COALESCE(local_trade_id,'')<>'' AND COALESCE(actual_trade_status,'') NOT IN ('CLOSED','BROKER_CLOSED','ENTRY_FAILED'))
+        ORDER BY id ASC LIMIT ?
+    """, (max(1, min(int(limit), 2000)),)))
+    updated = 0
+    for row in rows:
+        rid = int(safe_float(row.get("raw_signal_id")) or 0)
+        entry = safe_float(row.get("entry_close"))
+        sl = float(safe_float(row.get("sl_pct")) or BCO_SL_PCT)
+        if rid <= 0 or entry is None or float(entry) <= 0 or sl <= 0:
+            continue
+        sets: List[str] = []
+        vals: List[Any] = []
+
+        trade_id = safe_str(row.get("local_trade_id"))
+        if trade_id:
+            tr = fetchone_dict(conn.execute("""
+                SELECT status,exit_reason,realized_R,realized_pnl_gbp
+                FROM trades WHERE trade_id=? LIMIT 1
+            """, (trade_id,))) or {}
+            if tr:
+                for col, val in (
+                    ("actual_trade_status", safe_str(tr.get("status"))),
+                    ("actual_exit_reason", safe_str(tr.get("exit_reason"))),
+                    ("actual_realized_r", safe_float(tr.get("realized_R"))),
+                    ("actual_realized_pnl_gbp", safe_float(tr.get("realized_pnl_gbp"))),
+                ):
+                    if val is not None and val != row.get(col):
+                        sets.append(f"{col}=?")
+                        vals.append(val)
+
+        future = _bco_directional_future_rows(conn, rid, max(BCO_STACKING_BRAKE_HORIZONS) + 2)
+        risk_px = float(entry) * sl / 100.0
+        for h in BCO_STACKING_BRAKE_HORIZONS:
+            if int(safe_float(row.get(f"completed_{h}")) or 0) == 1 or len(future) < h:
+                continue
+            path = future[:h]
+            close = safe_float(path[h-1].get("exec_close"))
+            if close is None or risk_px <= 0:
+                continue
+            outcome_r = (float(close) - float(entry)) / risk_px
+            metrics = _bco_directional_path_metrics(float(entry), sl, "LONG", path)
+            sets.extend([
+                f"outcome_{h}_r=?",
+                f"outcome_{h}_mfe_r=?",
+                f"outcome_{h}_mae_r=?",
+                f"completed_{h}=?",
+            ])
+            vals.extend([
+                outcome_r,
+                metrics.get("mfe_r"),
+                metrics.get("mae_r"),
+                1,
+            ])
+
+        if sets:
+            sets.append("updated_at_utc=?")
+            vals.extend([now_utc_iso(), int(row["id"])])
+            conn.execute(
+                f"UPDATE bco_stacking_brake_research SET {', '.join(sets)} WHERE id=?",
+                tuple(vals),
+            )
+            updated += 1
+    return {
+        "ok": True, "checked": len(rows), "updated": updated,
+        "research_only": True, "execution_authority": False,
+    }
+
+
+def record_bco_stacking_brake_research(
+    conn: DBConn,
+    raw_signal_id: int,
+    payload: Dict[str, Any],
+    signal_time: str,
+    production_candidate: bool,
+    production_entry_allowed: bool,
+    production_entry_created: bool,
+    local_trade_id: Optional[str],
+    cycle_id: str,
+    open_count_before_entry: int,
+    basket_r_before_entry: float,
+    basket_high_water_r: float,
+    basket_giveback_pct: float,
+    losing_pct: float,
+    tide_score: int,
+    tide_status: str,
+    manager_action: str,
+) -> Dict[str, Any]:
+    _ensure_bco_stacking_brake_on_conn(conn)
+    update_bco_stacking_brake_outcomes(conn, 500)
+
+    rid = int(raw_signal_id or 0)
+    existing = fetchone_dict(conn.execute(
+        "SELECT * FROM bco_stacking_brake_research WHERE raw_signal_id=? LIMIT 1",
+        (rid,),
+    ))
+    if existing:
+        return {
+            "ok": True, "existing": True,
+            "primary_decision": existing.get("primary_decision"),
+            "research_only": True, "execution_authority": False,
+        }
+
+    entry = safe_float(
+        payload.get("exec_close") or payload.get("close") or payload.get("rule_entry_price")
+    )
+    short_ctx = _bco_short_research_context(conn, rid, payload)
+    decision = _bco_stacking_brake_decision(
+        tide_status=tide_status,
+        open_count=open_count_before_entry,
+        basket_r=float(basket_r_before_entry),
+        giveback_pct=float(basket_giveback_pct),
+        losing_pct=float(losing_pct),
+        short_candidate=bool(short_ctx.get("short_candidate")),
+    )
+    eligible = bool(production_candidate and production_entry_allowed)
+    primary_decision = decision["primary_decision"] if eligible else "OBSERVE_ONLY"
+    primary_reason = decision["primary_reason"] if eligible else "production_entry_not_eligible_for_challenge"
+
+    conn.execute("""INSERT INTO bco_stacking_brake_research(
+        created_at_utc,updated_at_utc,research_version,raw_signal_id,signal_time,cycle_id,
+        production_candidate,production_entry_allowed,production_entry_created,local_trade_id,
+        entry_close,sl_pct,open_count_before_entry,basket_r_before_entry,basket_high_water_r,
+        basket_giveback_pct,losing_pct,tide_score,tide_status,manager_action,
+        short_candidate,short_state,eligible_for_challenge,primary_decision,primary_reason,
+        red_only_block,amber_or_worse_block,confluence_v1_block
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        now_utc_iso(),now_utc_iso(),BCO_STACKING_BRAKE_VERSION,rid,safe_str(signal_time),safe_str(cycle_id),
+        1 if production_candidate else 0,1 if production_entry_allowed else 0,1 if production_entry_created else 0,
+        safe_str(local_trade_id) or None,entry,BCO_SL_PCT,int(open_count_before_entry),float(basket_r_before_entry),
+        float(basket_high_water_r),float(basket_giveback_pct),float(losing_pct),int(tide_score),safe_str(tide_status),
+        safe_str(manager_action),1 if short_ctx.get("short_candidate") else 0,safe_str(short_ctx.get("short_state")),
+        1 if eligible else 0,primary_decision,primary_reason,
+        1 if decision["red_only_block"] else 0,1 if decision["amber_or_worse_block"] else 0,
+        1 if decision["confluence_v1_block"] else 0,
+    ))
+    return {
+        "ok": True,
+        "research_only": True,
+        "execution_authority": False,
+        "eligible_for_challenge": eligible,
+        "primary_decision": primary_decision,
+        "primary_reason": primary_reason,
+        "variants": {
+            "red_only_block": bool(decision["red_only_block"]),
+            "amber_or_worse_block": bool(decision["amber_or_worse_block"]),
+            "confluence_v1_block": bool(decision["confluence_v1_block"]),
+        },
+    }
+
+
+def bco_stacking_brake_rows(limit: int = 25000) -> List[Dict[str, Any]]:
+    ensure_bco_stacking_brake_table()
+    lim = max(1, min(int(limit), 100000))
+    with get_conn() as conn:
+        update_bco_stacking_brake_outcomes(conn, min(lim, 2000))
+        conn.commit()
+        return fetchall_dict(conn.execute(
+            "SELECT * FROM bco_stacking_brake_research ORDER BY id DESC LIMIT ?",
+            (lim,),
+        ))
+
+
+def bco_stacking_brake_summary(limit: int = 5000) -> Dict[str, Any]:
+    rows = bco_stacking_brake_rows(limit)
+    eligible = [r for r in rows if int(safe_float(r.get("eligible_for_challenge")) or 0) == 1]
+    blocked = [r for r in eligible if safe_str(r.get("primary_decision")).upper() == "BLOCK"]
+    allowed = [r for r in eligible if safe_str(r.get("primary_decision")).upper() == "ALLOW"]
+
+    def _horizon_stats(group: List[Dict[str, Any]], h: int) -> Dict[str, Any]:
+        vals = [
+            float(safe_float(r.get(f"outcome_{h}_r")))
+            for r in group
+            if int(safe_float(r.get(f"completed_{h}")) or 0) == 1
+            and safe_float(r.get(f"outcome_{h}_r")) is not None
+        ]
+        return {
+            "n": len(vals),
+            "avg_long_r": (sum(vals) / len(vals)) if vals else None,
+            "positive_rate": (sum(1 for v in vals if v > 0) / len(vals)) if vals else None,
+            # Positive block_benefit means avoiding the entry would have helped.
+            "avg_block_benefit_r": (-sum(vals) / len(vals)) if vals else None,
+        }
+
+    actual_blocked = [
+        float(safe_float(r.get("actual_realized_r")))
+        for r in blocked
+        if safe_float(r.get("actual_realized_r")) is not None
+        and safe_str(r.get("actual_trade_status")).upper() in {"CLOSED","BROKER_CLOSED"}
+    ]
+    return {
+        "ok": True,
+        "research_only": True,
+        "execution_authority": False,
+        "version": BCO_STACKING_BRAKE_VERSION,
+        "prospective_only_no_backfill": True,
+        "frozen_primary_rule": {
+            "red_or_critical": "BLOCK when >=1 existing open trade",
+            "amber": "BLOCK only when >=3 existing trades plus SHORT candidate, negative basket, >=25% giveback, or >=60% losing trades",
+        },
+        "rows": len(rows),
+        "eligible": len(eligible),
+        "primary_blocked": len(blocked),
+        "primary_allowed": len(allowed),
+        "blocked_actual_closed_n": len(actual_blocked),
+        "blocked_actual_avg_realized_r": (sum(actual_blocked)/len(actual_blocked)) if actual_blocked else None,
+        "blocked": {str(h): _horizon_stats(blocked,h) for h in BCO_STACKING_BRAKE_HORIZONS},
+        "allowed": {str(h): _horizon_stats(allowed,h) for h in BCO_STACKING_BRAKE_HORIZONS},
+        "latest": rows[:50],
+    }
+
+
+def build_bco_stacking_brake_html() -> str:
+    s = bco_stacking_brake_summary(5000)
+    blocked48 = (s.get("blocked") or {}).get("48") or {}
+    allowed48 = (s.get("allowed") or {}).get("48") or {}
+    rows = ""
+    for r in (s.get("latest") or [])[:50]:
+        rows += (
+            f"<tr><td>{esc(r.get('signal_time'))}</td>"
+            f"<td>{esc(r.get('tide_status'))}</td>"
+            f"<td>{esc(r.get('open_count_before_entry'))}</td>"
+            f"<td>{_fmt_metric(r.get('basket_r_before_entry'),'R')}</td>"
+            f"<td>{esc(r.get('short_state') or '—')}</td>"
+            f"<td><strong>{esc(r.get('primary_decision'))}</strong></td>"
+            f"<td>{esc(r.get('primary_reason'))}</td>"
+            f"<td>{_fmt_metric(r.get('outcome_24_r'),'R')}</td>"
+            f"<td>{_fmt_metric(r.get('outcome_48_r'),'R')}</td>"
+            f"<td>{_fmt_metric(r.get('actual_realized_r'),'R')}</td></tr>"
+        )
+    if not rows:
+        rows = "<tr><td colspan='10'>No prospective stacking-brake observations yet.</td></tr>"
+    return f"""<details class='research-inner'><summary>Stacking Brake — Prospective Entry-Admission Challenger</summary>
+    <div class='research-inner-body'>
+      <div class='section-note small'><strong>RESEARCH ONLY · ZERO execution authority.</strong>
+      Production entry_allowed remains untouched. The frozen v1 challenger asks whether a fresh LONG should have been withheld once an existing basket was visibly deteriorating. No historical backfill.</div>
+      <div class='cards three'>
+        <div class='card'><div class='label'>Eligible / Blocked</div><div class='value'>{int(s.get('eligible') or 0)} / {int(s.get('primary_blocked') or 0)}</div><div class='small'>Prospective production-eligible candidates only.</div></div>
+        <div class='card'><div class='label'>Blocked 48h Avg Long</div><div class='value'>{_fmt_metric(blocked48.get('avg_long_r'),'R')}</div><div class='small'>Block benefit {_fmt_metric(blocked48.get('avg_block_benefit_r'),'R')} · n={int(blocked48.get('n') or 0)}</div></div>
+        <div class='card'><div class='label'>Allowed 48h Avg Long</div><div class='value'>{_fmt_metric(allowed48.get('avg_long_r'),'R')}</div><div class='small'>n={int(allowed48.get('n') or 0)} · v1 frozen prospectively.</div></div>
+      </div>
+      <div class='table-scroll'><table><thead><tr><th>Signal</th><th>Tide</th><th>Open</th><th>Basket R</th><th>Short State</th><th>Brake</th><th>Reason</th><th>24h R</th><th>48h R</th><th>Actual R</th></tr></thead><tbody>{rows}</tbody></table></div>
+      <div class='section-note small'><a href='/bco-stacking-brake'>Stacking-brake JSON</a> · <a href='/export/bco-stacking-brake.csv'>Stacking-brake CSV</a></div>
+    </div></details>"""
+
+
+@app.get("/bco-stacking-brake")
+def bco_stacking_brake_api(limit: int = 5000):
+    return bco_stacking_brake_summary(limit)
+
+
+@app.get("/export/bco-stacking-brake.csv")
+def export_bco_stacking_brake_csv(limit: int = 25000):
+    return csv_response(bco_stacking_brake_rows(limit), "bco-stacking-brake.csv")
+
+
 def _bco_aiobs_state(conn, raw_signal_id, payload, include_short_context: bool = True):
     """Freeze current-candle BCO observer state before deterministic processing.
 
@@ -6477,15 +7135,36 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
             try: previous=(json.loads(previous_row["snapshot_json"]) or {}).get("event_state") or {}
             except Exception: previous={}
         reasons=[]
+        coalesced_reasons=[]
         if not previous:
             reasons.append("FIRST_OBSERVATION")
         else:
             if bool(current["candidate"]) != bool(previous.get("candidate")):
                 reasons.append("CANDIDATE_FLIP_TO_TRUE" if current["candidate"] else "CANDIDATE_FLIP_TO_FALSE")
             if bool(current.get("short_candidate")) != bool(previous.get("short_candidate")):
+                # Candidate ON/OFF is always material and never coalesced.
                 reasons.append("SHORT_RESEARCH_CANDIDATE_ON" if current.get("short_candidate") else "SHORT_RESEARCH_CANDIDATE_OFF")
             elif safe_str(current.get("short_state")) != safe_str(previous.get("short_state")):
-                reasons.append("SHORT_RESEARCH_STATE_CHANGE")
+                # State-only churn can be noisy. Keep every frozen snapshot, but
+                # suppress repeated paid calls inside the cooldown unless some
+                # other independent trigger also fires on this candle.
+                last_short_call = conn.execute("""
+                    SELECT created_at_utc FROM ai_regime_observer
+                    WHERE raw_signal_id<?
+                      AND api_eligible=1
+                      AND trigger_reason LIKE '%SHORT_RESEARCH_%'
+                    ORDER BY raw_signal_id DESC LIMIT 1
+                """, (int(raw_signal_id),)).fetchone()
+                allow_short_state_call = True
+                if last_short_call and AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS > 0:
+                    last_dt = _bco_parse_aware_utc(last_short_call["created_at_utc"])
+                    if last_dt is not None:
+                        age_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
+                        allow_short_state_call = age_h >= AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS
+                if allow_short_state_call:
+                    reasons.append("SHORT_RESEARCH_STATE_CHANGE")
+                else:
+                    coalesced_reasons.append("SHORT_RESEARCH_STATE_CHANGE_COALESCED")
             if int(previous.get("mature_48h_plus") or 0)<=0<int(current["mature_48h_plus"]):
                 reasons.append("MATURE_EXPOSURE_ON")
             elif int(previous.get("mature_48h_plus") or 0)>0>=int(current["mature_48h_plus"]):
@@ -6510,20 +7189,24 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
         recent=conn.execute("""SELECT timestamp_readable,candidate_8h,exec_close,signal_side
                                FROM raw_signals WHERE id<=? ORDER BY id DESC LIMIT 6""",(int(raw_signal_id),)).fetchall()
         model_input["recent_history"]=[dict(r) for r in recent]
-        snapshot={"captured_at_utc":now_utc_iso(),"event_state":current,"model_input":model_input}
+        snapshot={"captured_at_utc":now_utc_iso(),"event_state":current,"model_input":model_input,
+                  "coalesced_reasons":coalesced_reasons}
         status="CAPTURED" if api_eligible else "CAPTURED_NO_CALL"
         trigger="|".join(reasons)
+        coalesced_trigger="|".join(coalesced_reasons)
         conn.execute("""INSERT INTO ai_regime_observer(
             created_at_utc,updated_at_utc,raw_signal_id,asset,signal_time,
             live_candidate,candidate_side,trigger_reason,api_eligible,status,
-            snapshot_json,model,prompt_version,observer_version)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            snapshot_json,model,prompt_version,observer_version,coalesced_trigger_reason)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (now_utc_iso(),now_utc_iso(),int(raw_signal_id),"BCO",safe_str(sig.get("timestamp_readable")),
              1 if current["candidate"] else 0,current["side"],trigger,1 if api_eligible else 0,status,
-             json.dumps(snapshot,default=str),AI_SHADOW_MODEL,AI_SHADOW_PROMPT_VERSION,AI_SHADOW_OBSERVER_VERSION))
+             json.dumps(snapshot,default=str),AI_SHADOW_MODEL,AI_SHADOW_PROMPT_VERSION,AI_SHADOW_OBSERVER_VERSION,
+             coalesced_trigger))
         conn.commit()
     q=enqueue_ai_regime_observer(raw_signal_id) if api_eligible else {"queued":False,"reason":"event_driven_capture_only"}
-    return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,"queue":q,"research_only":True}
+    return {"captured":True,"api_eligible":api_eligible,"trigger_reason":trigger,
+            "coalesced_trigger_reason":coalesced_trigger,"queue":q,"research_only":True}
 
 
 # -----------------------------------------------------------------------------
@@ -6930,6 +7613,7 @@ def export_table(table: str):
         "accounting-snapshots":"accounting_snapshots",
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
         "directional-intelligence":"bco_directional_intelligence_research",
+        "stacking-brake-research":"bco_stacking_brake_research",
     }
     if table not in allowed: raise HTTPException(status_code=404,detail="unknown export")
     if allowed[table] == "bco_exit_challenger_shadow":
@@ -6959,9 +7643,11 @@ def export_all_zip():
         "accounting-snapshots":"accounting_snapshots",
         "exit-challenger-shadow":"bco_exit_challenger_shadow",
         "directional-intelligence":"bco_directional_intelligence_research",
+        "stacking-brake-research":"bco_stacking_brake_research",
     }
     ensure_bco_exit_challenger_shadow_schema()
     ensure_bco_directional_intelligence_table()
+    ensure_bco_stacking_brake_table()
     buf=io.BytesIO()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         with get_conn() as conn:
@@ -7292,9 +7978,10 @@ def _bf_table(title,rows,cols):
     return f'<details class="research-inner"><summary>{esc(title)}</summary><div class="research-inner-body"><div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div></div></details>'
 
 def build_bco_focused_research_html():
-    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers, directional LONG/SHORT evidence and the event-driven AI Regime Observer. All research layers have zero execution authority. <strong>v0.8.15:</strong> Directional Intelligence is prospective only with independent candidate episodes and no historical backfill. <strong>v0.8.5:</strong> recovery/HWM triggers are frozen pre-defence and future horizons use durable cycle economic R.</div>' + \
+    return '<div class="section-note small"><strong>Focused BCO research.</strong> Same evidence themes as the Indices master plus forward exit challengers, directional LONG/SHORT evidence, the prospective stacking-brake challenger and the event-driven AI Regime Observer. All research layers have zero execution authority. <strong>v0.8.19:</strong> Stacking Brake is prospective only/no backfill; AI 429/5xx/network retries are durable and short-state churn is coalesced. <strong>v0.8.15:</strong> Directional Intelligence is prospective only with independent candidate episodes and no historical backfill. <strong>v0.8.5:</strong> recovery/HWM triggers are frozen pre-defence and future horizons use durable cycle economic R.</div>' + \
       '<details class="research-inner"><summary>MFE + ATR2 Exit Challenger — Forward Shadow</summary><div class="research-inner-body">' + build_bco_exit_challenger_shadow_html() + '</div></details>' + \
       build_bco_directional_intelligence_html() + \
+      build_bco_stacking_brake_html() + \
       '<details class="research-inner"><summary>AI Regime Observer — Event-Driven Point-in-Time Labels</summary><div class="research-inner-body">' + build_ai_regime_observer_html() + '</div></details>' + \
       _bf_table("Live High-Water / Banking Outcomes",_bf_rows("bco_focused_highwater",100),["threshold_r","trigger_signal_time","trigger_r","trigger_hwm_r","trigger_banked_r","outcome_6_r","outcome_12_r","outcome_24_r","outcome_48_r"]) + \
       _bf_table("BCO Multi-Horizon Alignment / Divergence",_bf_rows("bco_focused_alignment",100),["signal_time","state","return_4h","return_8h","return_24h","candidate"]) + \
@@ -7305,8 +7992,9 @@ def build_bco_focused_research_html():
 @app.get("/export/bco-focused-research.zip")
 def export_bco_focused_research_zip(limit:int=25000):
     ensure_bco_focused_research_tables();limit=max(1,min(int(limit),100000));buf=io.BytesIO()
-    tables={"highwater-banking-research.csv":"bco_focused_highwater","alignment-research.csv":"bco_focused_alignment","trend-efficiency-research.csv":"bco_focused_efficiency","basket-recovery-research.csv":"bco_focused_recovery","directional-intelligence.csv":"bco_directional_intelligence_research"}
+    tables={"highwater-banking-research.csv":"bco_focused_highwater","alignment-research.csv":"bco_focused_alignment","trend-efficiency-research.csv":"bco_focused_efficiency","basket-recovery-research.csv":"bco_focused_recovery","directional-intelligence.csv":"bco_directional_intelligence_research","stacking-brake-research.csv":"bco_stacking_brake_research"}
     ensure_bco_directional_intelligence_table()
+    ensure_bco_stacking_brake_table()
     with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
         for fn,tbl in tables.items():
             rows=_bf_rows(tbl,limit);out=io.StringIO()
@@ -7350,6 +8038,18 @@ def export_bco_focused_research_zip(limit:int=25000):
             "research_only":True,
             "generated_at_utc":now_utc_iso(),
             "streams":list(tables)+["ai-regime-observer.csv","bco-exit-challenger-shadow.csv"],
+            "stacking_brake":{
+                "version":BCO_STACKING_BRAKE_VERSION,
+                "prospective_only_no_backfill":True,
+                "execution_authority":False,
+                "primary_rule":"RED/CRITICAL with existing exposure; AMBER requires >=3 existing trades plus deterioration confluence",
+            },
+            "ai_regime_observer":{
+                "durable_retry":True,
+                "retry_max_attempts":AI_SHADOW_RETRY_MAX_ATTEMPTS,
+                "short_state_min_call_gap_hours":AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS,
+                "execution_authority":False,
+            },
             "exit_challenger_shadow":{
                 "version":BCO_EXIT_SHADOW_VERSION,
                 "forward_only_no_backfill":True,
