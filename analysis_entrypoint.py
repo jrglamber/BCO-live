@@ -175,5 +175,15 @@ async def visible_dashboard(request: Request):
     return await _dashboard_passthrough(request, "/dashboard")
 
 
+@app.on_event("startup")
+async def start_core_app() -> None:
+    await core.app.router.startup()
+
+
+@app.on_event("shutdown")
+async def stop_core_app() -> None:
+    await core.app.router.shutdown()
+
+
 # Catch-all mount stays last so wrapper routes above win; all other routes remain core-owned.
 app.mount("/", core.app)
