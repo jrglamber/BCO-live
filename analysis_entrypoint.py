@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.0.0"
-VISIBLE_RELEASE_VERSION = "0.8.23"
+ANALYSIS_INTERFACE_VERSION = "2.1.0"
+VISIBLE_RELEASE_VERSION = "0.8.24"
 
 
 def _utc_now() -> str:
@@ -177,6 +177,43 @@ def analysis_slice(slice_name: str, limit: int = 100):
             data[table] = {"error":f"{type(exc).__name__}: {exc}"}
     return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"slice":slice_name,"limit_per_table":max(1,min(int(limit),250)),"data":data}
 
+
+
+
+@app.get("/analysis/episode-index")
+def analysis_episode_index(limit: int = 100):
+    """Cycle-aware BCO history derived from persisted production audit tables."""
+    n = max(1, min(int(limit), 250))
+    sql = """
+    WITH cycles AS (
+      SELECT cycle_id, MIN(created_at_utc) first_seen_at, MAX(created_at_utc) last_seen_at,
+             COUNT(*) manager_review_count, COUNT(DISTINCT trade_id) reviewed_trade_count,
+             MAX(current_r) max_trade_r, MIN(current_r) min_trade_r
+      FROM trade_manager_reviews
+      WHERE cycle_id IS NOT NULL AND cycle_id <> ''
+      GROUP BY cycle_id
+    ), harvest AS (
+      SELECT cycle_id, COUNT(*) harvest_count, MAX(threshold_r) max_harvest_threshold_r,
+             SUM(COALESCE(model_realized_r,0)) harvested_model_r,
+             SUM(COALESCE(net_realized_gbp,0)) harvested_net_gbp
+      FROM harvest_execution_outcomes
+      WHERE cycle_id IS NOT NULL AND cycle_id <> ''
+      GROUP BY cycle_id
+    )
+    SELECT c.*, COALESCE(h.harvest_count,0) harvest_count,
+           h.max_harvest_threshold_r, COALESCE(h.harvested_model_r,0) harvested_model_r,
+           COALESCE(h.harvested_net_gbp,0) harvested_net_gbp
+    FROM cycles c LEFT JOIN harvest h USING (cycle_id)
+    ORDER BY c.first_seen_at DESC LIMIT %s
+    """
+    try:
+        with core.get_conn() as conn:
+            rows = conn.execute(sql, (n,)).fetchall()
+        episodes = [{k:_jsonable(v) for k,v in row.items()} for row in rows]
+        error = None
+    except Exception as exc:
+        episodes, error = [], f"{type(exc).__name__}: {exc}"
+    return {"status":"ok" if error is None else "degraded","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"limit":n,"episodes":episodes,"error":error}
 
 
 @app.get("/analysis/status")
