@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.2.0"
-VISIBLE_RELEASE_VERSION = "0.8.25"
+ANALYSIS_INTERFACE_VERSION = "2.2.1"
+VISIBLE_RELEASE_VERSION = "0.8.26"
 
 
 def _utc_now() -> str:
@@ -229,7 +229,9 @@ def bco_adaptive_protection_context(limit: int = 200):
             r=x.get("current_r")
             try: r=float(r)
             except Exception: r=None
-            st=by_cycle.setdefault(cid,{"peak_trade_r":None,"prev_r":None,"prev_at":None})
+            tid=x.get("trade_id")
+            key=(cid,tid)
+            st=by_cycle.setdefault(key,{"peak_trade_r":None,"prev_r":None,"prev_at":None})
             if r is not None: st["peak_trade_r"]=r if st["peak_trade_r"] is None else max(st["peak_trade_r"],r)
             delta=(r-st["prev_r"]) if r is not None and st["prev_r"] is not None else None
             repair=bool(delta is not None and delta>0 and st["peak_trade_r"] is not None and r<st["peak_trade_r"])
