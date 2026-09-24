@@ -11,9 +11,12 @@ import os
 from typing import Any, Dict
 
 import app as core
+from fastapi import Request
+from fastapi.responses import Response
 
 app = core.app
-ANALYSIS_INTERFACE_VERSION = "1.0.0"
+ANALYSIS_INTERFACE_VERSION = "1.1.0"
+VISIBLE_RELEASE_VERSION = "0.8.20"
 
 
 def _utc_now() -> str:
@@ -95,7 +98,7 @@ def analysis_status():
         "project": "BCO-live",
         "analysis_interface_version": ANALYSIS_INTERFACE_VERSION,
         "app_name": getattr(core, "APP_NAME", "BCO"),
-        "app_version": getattr(core, "APP_VERSION", None),
+        "app_version": VISIBLE_RELEASE_VERSION,
         "policy_version": getattr(core, "POLICY_VERSION", None),
         "environment": getattr(core, "OANDA_ENV", None),
         "read_only_interface": True,
@@ -126,3 +129,46 @@ def analysis_quality():
         "execution_authority": False,
         "time_utc": _utc_now(),
     }
+
+
+def _rewrite_dashboard_version(body: bytes, content_type: str) -> bytes:
+    if "text/html" not in (content_type or "").lower():
+        return body
+    try:
+        text = body.decode("utf-8")
+        current = getattr(core, "APP_VERSION", None)
+        if current and str(current) != VISIBLE_RELEASE_VERSION:
+            text = text.replace(str(current), VISIBLE_RELEASE_VERSION)
+        return text.encode("utf-8")
+    except Exception:
+        return body
+
+
+async def _dashboard_passthrough(request: Request, path: str) -> Response:
+    scope = dict(request.scope)
+    scope["path"] = path
+    scope["raw_path"] = path.encode("utf-8")
+    messages = []
+    async def receive():
+        return await request.receive()
+    async def send(message):
+        messages.append(message)
+    await core.app(scope, receive, send)
+    start = next((m for m in messages if m["type"] == "http.response.start"), None)
+    chunks = [m.get("body", b"") for m in messages if m["type"] == "http.response.body"]
+    if not start:
+        return Response(status_code=500)
+    headers = dict(start.get("headers", []))
+    body = _rewrite_dashboard_version(b"".join(chunks), headers.get(b"content-type", b"").decode("latin-1"))
+    out_headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in start.get("headers", []) if k.lower() not in (b"content-length", b"content-encoding")}
+    return Response(content=body, status_code=start["status"], headers=out_headers, media_type=None)
+
+
+@app.get("/")
+async def visible_root(request: Request):
+    return await _dashboard_passthrough(request, "/")
+
+
+@app.get("/dashboard")
+async def visible_dashboard(request: Request):
+    return await _dashboard_passthrough(request, "/dashboard")
