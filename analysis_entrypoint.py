@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.1.0"
-VISIBLE_RELEASE_VERSION = "0.8.24"
+ANALYSIS_INTERFACE_VERSION = "2.2.0"
+VISIBLE_RELEASE_VERSION = "0.8.25"
 
 
 def _utc_now() -> str:
@@ -214,6 +214,40 @@ def analysis_episode_index(limit: int = 100):
     except Exception as exc:
         episodes, error = [], f"{type(exc).__name__}: {exc}"
     return {"status":"ok" if error is None else "degraded","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"limit":n,"episodes":episodes,"error":error}
+
+
+
+@app.get("/analysis/adaptive-protection-context")
+def bco_adaptive_protection_context(limit: int = 200):
+    """Causal, research-only decision ledger derived from persisted manager reviews."""
+    n=max(20,min(int(limit),250))
+    try:
+        rows=_recent_rows("trade_manager_reviews",n); rows=list(reversed(rows)); out=[]; by_cycle={}
+        for x in rows:
+            cid=x.get("cycle_id")
+            if not cid: continue
+            r=x.get("current_r")
+            try: r=float(r)
+            except Exception: r=None
+            st=by_cycle.setdefault(cid,{"peak_trade_r":None,"prev_r":None,"prev_at":None})
+            if r is not None: st["peak_trade_r"]=r if st["peak_trade_r"] is None else max(st["peak_trade_r"],r)
+            delta=(r-st["prev_r"]) if r is not None and st["prev_r"] is not None else None
+            repair=bool(delta is not None and delta>0 and st["peak_trade_r"] is not None and r<st["peak_trade_r"])
+            out.append({"event_at":x.get("created_at_utc") or x.get("updated_at_utc"),"cycle_id":cid,"trade_id":x.get("trade_id"),
+              "current_r":r,"peak_trade_r_to_date":st["peak_trade_r"],"delta_r":delta,"repair_attempt":repair,
+              "decision":x.get("decision") or x.get("action") or x.get("manager_action"),
+              "age_hours":x.get("age_hours") or x.get("trade_age_hours")})
+            if r is not None: st["prev_r"]=r
+            st["prev_at"]=out[-1]["event_at"]
+        return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_adaptive_context_v1",
+          "news_layer_included":False,"principles":{"point_in_time_only":True,"future_fields_are_labels_only":True,
+          "observers":["volatility/regime","cross-market confirmation","change/acceleration","failed-repair quality","decision ledger/ablation"],
+          "note":"Single-market BCO uses manager-review path as the initial causal ledger. External context must be recorded prospectively, not backfilled from hindsight."},
+          "observations":out}
+    except Exception as exc:
+        return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_adaptive_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
 @app.get("/analysis/status")
