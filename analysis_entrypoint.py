@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "1.2.0"
-VISIBLE_RELEASE_VERSION = "0.8.22"
+ANALYSIS_INTERFACE_VERSION = "2.0.0"
+VISIBLE_RELEASE_VERSION = "0.8.23"
 
 
 def _utc_now() -> str:
@@ -84,6 +84,99 @@ def _analysis_db_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
+
+def _table_inventory():
+    with core.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema='public' AND table_type='BASE TABLE'
+            ORDER BY table_name
+        """).fetchall()
+    return [r.get("table_name") if isinstance(r, dict) else r[0] for r in rows]
+
+
+def _table_columns(table: str):
+    with core.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s
+            ORDER BY ordinal_position
+        """, (table,)).fetchall()
+    return [r.get("column_name") if isinstance(r, dict) else r[0] for r in rows]
+
+
+BCO_ANALYSIS_SLICE_TABLES = {
+    "signals": ("raw_signals",),
+    "execution": ("execution_audit", "broker_action_queue"),
+    "harvest": ("harvest_execution_outcomes",),
+    "exits": ("trade_manager_reviews",),
+    "research": ("bco_directional_intelligence_research", "bco_stacking_brake_research"),
+}
+
+
+def _recent_rows(table: str, limit: int):
+    if table not in set(_table_inventory()):
+        return []
+    cols = _table_columns(table)
+    order_col = next((x for x in ("created_at_utc", "updated_at_utc", "signal_time", "timestamp_readable", "id") if x in cols), None)
+    sql = f'SELECT * FROM "{table}"'
+    if order_col:
+        sql += f' ORDER BY "{order_col}" DESC'
+    sql += ' LIMIT %s'
+    with core.get_conn() as conn:
+        rows = conn.execute(sql, (max(1, min(int(limit), 250)),)).fetchall()
+    return [{k: _jsonable(v) for k, v in (row.items() if isinstance(row, dict) else zip(cols, row))} for row in rows]
+
+
+@app.get("/analysis/schema")
+def analysis_schema():
+    try:
+        tables = _table_inventory()
+        return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"data":{"ok":True,"tables":tables}}
+    except Exception as exc:
+        return {"status":"degraded","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"data":{"ok":False,"tables":[],"error":f"{type(exc).__name__}: {exc}"}}
+
+
+@app.get("/analysis/catalog")
+def analysis_catalog():
+    catalog = {}
+    try:
+        for table in _table_inventory():
+            low = table.lower()
+            if any(h in low for h in ("signal","trade","basket","harvest","manager","exit","research","execution","hwm","highwater")):
+                catalog[table] = _table_columns(table)
+        status, error = "ok", None
+    except Exception as exc:
+        status, error = "degraded", f"{type(exc).__name__}: {exc}"
+    return {"status":status,"project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"data":{"catalog":catalog,"error":error}}
+
+
+@app.get("/analysis/slice/{slice_name}")
+def analysis_slice(slice_name: str, limit: int = 100):
+    allowed = BCO_ANALYSIS_SLICE_TABLES.get(slice_name)
+    if not allowed:
+        return {"status":"error","error":"unknown analysis slice","allowed":sorted(BCO_ANALYSIS_SLICE_TABLES)}
+    data = {}
+    for table in allowed:
+        try:
+            rows = _recent_rows(table, limit)
+            if rows:
+                data[table] = rows
+        except Exception as exc:
+            data[table] = {"error":f"{type(exc).__name__}: {exc}"}
+    return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"slice":slice_name,"limit_per_table":max(1,min(int(limit),250)),"data":data}
+
 
 
 @app.get("/analysis/status")
