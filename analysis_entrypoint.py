@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "1.1.0"
-VISIBLE_RELEASE_VERSION = "0.8.20"
+ANALYSIS_INTERFACE_VERSION = "1.2.0"
+VISIBLE_RELEASE_VERSION = "0.8.21"
 
 
 def _utc_now() -> str:
@@ -29,6 +29,11 @@ def _scalar(conn, sql: str, params=()):
         row = conn.execute(sql, params).fetchone()
         if row is None:
             return None
+        # psycopg dict-like rows iterate keys, so list(row)[0] returns
+        # the literal column name ("count"). Prefer mapping values first.
+        if hasattr(row, "values"):
+            vals = list(row.values())
+            return vals[0] if vals else None
         try:
             return row[0]
         except Exception:
