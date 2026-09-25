@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.2.1"
-VISIBLE_RELEASE_VERSION = "0.8.26"
+ANALYSIS_INTERFACE_VERSION = "2.3.0"
+VISIBLE_RELEASE_VERSION = "0.8.27"
 
 
 def _utc_now() -> str:
@@ -250,6 +250,41 @@ def bco_adaptive_protection_context(limit: int = 200):
     except Exception as exc:
         return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
           "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_adaptive_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
+
+
+@app.get("/analysis/cycle-economic-context")
+def bco_cycle_economic_context(limit: int = 250):
+    """Cycle-level research view derived from contemporaneous per-trade manager reviews."""
+    try:
+        rows=list(reversed(_recent_rows("trade_manager_reviews",limit)))
+        grouped={}
+        for x in rows:
+            cid=x.get("cycle_id"); at=x.get("created_at_utc") or x.get("updated_at_utc")
+            if not cid or not at: continue
+            # Reviews are emitted as a batch; second-level timestamps belong to one cycle observation.
+            bucket=str(at)[:16]
+            g=grouped.setdefault((cid,bucket),{"event_at":at,"cycle_id":cid,"trades":{}})
+            tid=x.get("trade_id"); r=x.get("current_r")
+            try: r=float(r)
+            except Exception: continue
+            if tid: g["trades"][tid]=r
+        out=[]; state={}
+        for _,g in sorted(grouped.items(),key=lambda kv:str(kv[1]["event_at"])):
+            vals=list(g["trades"].values())
+            if not vals: continue
+            cid=g["cycle_id"]; basket=sum(vals); st=state.setdefault(cid,{"hwm":basket,"prev":None})
+            st["hwm"]=max(st["hwm"],basket); hwm=st["hwm"]; delta=None if st["prev"] is None else basket-st["prev"]
+            gb=((hwm-basket)/hwm*100.0) if hwm>0 else None
+            out.append({"event_at":g["event_at"],"cycle_id":cid,"reviewed_trade_count":len(vals),"reviewed_trade_r_sum":basket,
+              "reviewed_trade_hwm_r":hwm,"giveback_pct":gb,"delta_r":delta,"repair_attempt":bool(delta is not None and delta>0 and basket<hwm),
+              "scope_note":"sum of trades present in contemporaneous manager-review batch; research proxy, not broker/account P&L"})
+            st["prev"]=basket
+        return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v1",
+          "limitations":["manager-review batches can contain only the reviewed/eligible subset","do not equate reviewed_trade_r_sum with full broker basket economics"],"observations":out}
+    except Exception as exc:
+        return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
+          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
 @app.get("/analysis/status")
