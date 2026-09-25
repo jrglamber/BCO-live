@@ -16,8 +16,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.3.0"
-VISIBLE_RELEASE_VERSION = "0.8.27"
+ANALYSIS_INTERFACE_VERSION = "2.4.0"
+VISIBLE_RELEASE_VERSION = "0.8.28"
 
 
 def _utc_now() -> str:
@@ -254,37 +254,41 @@ def bco_adaptive_protection_context(limit: int = 200):
 
 @app.get("/analysis/cycle-economic-context")
 def bco_cycle_economic_context(limit: int = 250):
-    """Cycle-level research view derived from contemporaneous per-trade manager reviews."""
+    """Like-for-like cycle research using a stable reviewed-trade cohort."""
     try:
-        rows=list(reversed(_recent_rows("trade_manager_reviews",limit)))
-        grouped={}
+        rows=list(reversed(_recent_rows("trade_manager_reviews",limit))); grouped={}
         for x in rows:
-            cid=x.get("cycle_id"); at=x.get("created_at_utc") or x.get("updated_at_utc")
-            if not cid or not at: continue
-            # Reviews are emitted as a batch; second-level timestamps belong to one cycle observation.
-            bucket=str(at)[:16]
-            g=grouped.setdefault((cid,bucket),{"event_at":at,"cycle_id":cid,"trades":{}})
-            tid=x.get("trade_id"); r=x.get("current_r")
-            try: r=float(r)
+            cid=x.get("cycle_id"); at=x.get("created_at_utc") or x.get("updated_at_utc"); tid=x.get("trade_id")
+            if not cid or not at or not tid: continue
+            try: r=float(x.get("current_r"))
             except Exception: continue
-            if tid: g["trades"][tid]=r
-        out=[]; state={}
-        for _,g in sorted(grouped.items(),key=lambda kv:str(kv[1]["event_at"])):
-            vals=list(g["trades"].values())
-            if not vals: continue
-            cid=g["cycle_id"]; basket=sum(vals); st=state.setdefault(cid,{"hwm":basket,"prev":None})
-            st["hwm"]=max(st["hwm"],basket); hwm=st["hwm"]; delta=None if st["prev"] is None else basket-st["prev"]
-            gb=((hwm-basket)/hwm*100.0) if hwm>0 else None
-            out.append({"event_at":g["event_at"],"cycle_id":cid,"reviewed_trade_count":len(vals),"reviewed_trade_r_sum":basket,
-              "reviewed_trade_hwm_r":hwm,"giveback_pct":gb,"delta_r":delta,"repair_attempt":bool(delta is not None and delta>0 and basket<hwm),
-              "scope_note":"sum of trades present in contemporaneous manager-review batch; research proxy, not broker/account P&L"})
-            st["prev"]=basket
-        return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
-          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v1",
-          "limitations":["manager-review batches can contain only the reviewed/eligible subset","do not equate reviewed_trade_r_sum with full broker basket economics"],"observations":out}
+            bucket=str(at)[:16]; g=grouped.setdefault((cid,bucket),{"event_at":at,"cycle_id":cid,"trades":{}}); g["trades"][tid]=r
+        by_cycle={}
+        for _,g in sorted(grouped.items(),key=lambda kv:str(kv[1]["event_at"])): by_cycle.setdefault(g["cycle_id"],[]).append(g)
+        out=[]
+        for cid,seq in by_cycle.items():
+            # Use the modal trade count after the cohort has stabilised; compare only exact trade-ID sets.
+            counts={}
+            for g in seq: counts[len(g["trades"])]=counts.get(len(g["trades"]),0)+1
+            stable_n=max(counts,key=lambda n:(counts[n],n)) if counts else 0
+            candidates=[g for g in seq if len(g["trades"])==stable_n]; cohorts={}
+            for g in candidates:
+                key=tuple(sorted(g["trades"])); cohorts[key]=cohorts.get(key,0)+1
+            stable_ids=max(cohorts,key=lambda k:cohorts[k]) if cohorts else (); hwm=None; prev=None
+            for g in seq:
+                ids=tuple(sorted(g["trades"])); comparable=(ids==stable_ids and bool(stable_ids)); basket=sum(g["trades"].values()) if comparable else None
+                if comparable:
+                    hwm=basket if hwm is None else max(hwm,basket); delta=None if prev is None else basket-prev; gb=((hwm-basket)/hwm*100.0) if hwm and hwm>0 else None
+                    prev=basket
+                else: delta=gb=None
+                out.append({"event_at":g["event_at"],"cycle_id":cid,"reviewed_trade_count":len(ids),"stable_cohort_count":len(stable_ids),"cohort_comparable":comparable,
+                  "reviewed_trade_r_sum":basket,"reviewed_trade_hwm_r":hwm if comparable else None,"giveback_pct":gb,"delta_r":delta,
+                  "repair_attempt":bool(comparable and delta is not None and delta>0 and basket<hwm),
+                  "exclusion_reason":None if comparable else "trade_set_changed","scope_note":"like-for-like R sum for the same stable reviewed trade IDs; still a research proxy, not broker/account P&L"})
+        return {"status":"ok","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),
+          "study_version":"bco_cycle_economic_context_v2","cohort_policy":"modal repeated exact trade-ID set within each cycle; nonmatching batches excluded from economic deltas","limitations":["stable cohort may represent only a subset of the live basket","harvested/closed trades can change economic exposure outside the stable cohort","do not equate proxy with broker/account P&L"],"observations":out}
     except Exception as exc:
-        return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,
-          "read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v1","observations":[],"error":type(exc).__name__+": "+str(exc)}
+        return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v2","observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
 @app.get("/analysis/status")
