@@ -291,6 +291,14 @@ def bco_cycle_economic_context(limit: int = 250):
         return {"status":"error","project":"BCO-live","analysis_interface_version":ANALYSIS_INTERFACE_VERSION,"app_version":VISIBLE_RELEASE_VERSION,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"study_version":"bco_cycle_economic_context_v2","observations":[],"error":type(exc).__name__+": "+str(exc)}
 
 
+@app.get("/analysis/performance")
+def analysis_performance() -> Dict[str, Any]:
+    """Canonical read-only performance data for automated reviews."""
+    top = core.bco_standard_top_snapshot(force=False)
+    account = top.get("account") or {}; accounting = top.get("accounting") or {}; strategy = top.get("strategy") or {}; mode = str(top.get("mode") or getattr(core,"OANDA_ENV","")).lower()
+    return {"status":"ok","project":"BCO-live","contract_version":1,"read_only_interface":True,"execution_authority":False,"time_utc":_utc_now(),"mode":mode,"live_capital":mode=="live","scope":"BCO; practice/demo excluded from combined live totals","realised":{"week_gbp":accounting.get("week_pnl"),"month_gbp":accounting.get("month_pnl")},"open":{"unrealised_gbp":strategy.get("headline_pnl"),"basket_r":strategy.get("basket_r"),"open_trades":strategy.get("open_trades")},"nav_gbp":account.get("nav")}
+
+
 @app.get("/analysis/status")
 def analysis_status():
     """Compact public-safe observability endpoint. No secrets/account IDs."""
