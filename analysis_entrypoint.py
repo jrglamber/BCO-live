@@ -1,8 +1,9 @@
 """Project Exit Plan — BCO read-only analysis interface v1.
 
-Observability only. This module imports the production BCO application and attaches
-read-only endpoints. It contains no broker-write, strategy, sizing, exit, stop,
-harvest, or research-decision authority.
+Analysis endpoints remain read-only. This wrapper also exposes one explicit,
+authenticated manual risk-per-new-trade control requested by the user. It does
+not place/close trades, move stops, harvest, resize existing positions, or give
+research layers execution authority.
 """
 from __future__ import annotations
 
@@ -412,6 +413,8 @@ async def control_risk_per_trade_apply(
         except Exception:
             pass
     current = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
+    if abs(current - requested) > 0.005:
+        raise HTTPException(status_code=500, detail="Risk override did not persist; no confirmed change")
     try:
         core.log_event(
             "bco_manual_live_risk_control_applied",
