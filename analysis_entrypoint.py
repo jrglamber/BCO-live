@@ -17,8 +17,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.4.0"
-VISIBLE_RELEASE_VERSION = "0.8.29"
+ANALYSIS_INTERFACE_VERSION = "2.5.0"
+VISIBLE_RELEASE_VERSION = "0.8.30"
 
 
 def _utc_now() -> str:
@@ -352,21 +352,48 @@ def analysis_quality():
 
 
 
-@app.get("/control/risk-per-trade")
-def control_risk_per_trade_status() -> Dict[str, Any]:
+BCO_FIXED_RISK_PCT_OF_NAV = 0.10
+
+
+def _bco_fixed_risk_snapshot() -> Dict[str, Any]:
     current = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
+    acct = core.account_summary()
+    nav = float(acct.get("NAV") or 0.0) if acct.get("ok") else 0.0
+    min_risk = 0.01
     max_risk = max(0.01, float(os.getenv("BCO_RISK_CONTROL_MAX_GBP", "50")))
+    raw_target = nav * (BCO_FIXED_RISK_PCT_OF_NAV / 100.0) if nav > 0 else 0.0
+    bounded = max(min_risk, min(max_risk, raw_target)) if raw_target > 0 else 0.0
+    target = round(bounded, 2) if bounded > 0 else 0.0
+    sizing_preview = {}
+    if target > 0:
+        try:
+            sizing_preview = core.risk_preview(target)
+        except Exception:
+            sizing_preview = {}
     return {
-        "status": "ok",
+        "status": "ok" if nav > 0 and target > 0 else "error",
         "strategy": "bco",
+        "fixed_risk_pct_of_nav": BCO_FIXED_RISK_PCT_OF_NAV,
+        "nav_gbp": nav or None,
+        "raw_calculated_risk_gbp": raw_target or None,
+        "calculated_risk_per_trade_gbp": target or None,
         "current_risk_per_trade_gbp": current,
-        "min_risk_gbp": 0.01,
+        "min_risk_gbp": min_risk,
         "max_risk_gbp": max_risk,
+        "minimum_position_size_rule": "If calculated BCO units are below OANDA minimumTradeSize, use the broker minimum size. Existing broker overage guardrails remain authoritative.",
+        "sizing_preview": sizing_preview,
         "applies_to_new_trades_only": True,
         "existing_positions_resized": False,
         "persistent": True,
+        "nav_source": "fresh_oanda_account_summary",
+        "error": "" if nav > 0 else str(acct.get("error") or "OANDA NAV unavailable"),
         "time_utc": _utc_now(),
     }
+
+
+@app.get("/control/risk-per-trade")
+def control_risk_per_trade_status() -> Dict[str, Any]:
+    return _bco_fixed_risk_snapshot()
 
 
 @app.post("/control/risk-per-trade")
@@ -374,7 +401,7 @@ async def control_risk_per_trade_apply(
     request: Request,
     x_control_secret: str | None = Header(default=None),
 ) -> Dict[str, Any]:
-    """Authenticated manual risk control for NEW BCO entries only."""
+    """Apply the agreed 0.10% NAV risk target to NEW BCO entries only."""
     admin_secret = str(getattr(core, "ADMIN_SECRET", "") or "")
     webhook_secret = str(getattr(core, "WEBHOOK_SECRET", "") or "")
     valid = x_control_secret and x_control_secret in {admin_secret, webhook_secret}
@@ -386,40 +413,48 @@ async def control_risk_per_trade_apply(
     except Exception:
         body = {}
     body = body if isinstance(body, dict) else {}
-    if str(body.get("confirm") or "") != "APPLY_NEW_TRADE_RISK":
-        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_NEW_TRADE_RISK")
+    if str(body.get("confirm") or "") != "APPLY_FIXED_RISK_PCT":
+        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_FIXED_RISK_PCT")
 
-    try:
-        requested = float(body.get("risk_per_trade_gbp"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="risk_per_trade_gbp must be numeric")
+    preview = _bco_fixed_risk_snapshot()
+    if preview.get("status") != "ok":
+        raise HTTPException(status_code=503, detail=preview.get("error") or "Could not calculate fixed risk from live NAV")
 
-    min_risk = 0.01
-    max_risk = max(0.01, float(os.getenv("BCO_RISK_CONTROL_MAX_GBP", "50")))
-    if requested < min_risk or requested > max_risk:
-        raise HTTPException(
-            status_code=400,
-            detail=f"risk_per_trade_gbp must be between £{min_risk:.2f} and £{max_risk:.2f}",
-        )
-
+    requested = float(preview["calculated_risk_per_trade_gbp"])
     previous = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
     core.init_db()
     with core.get_conn() as conn:
         core.runtime_set(conn, core.BCO_RISK_RUNTIME_OVERRIDE_KEY, f"{requested:.2f}")
+        core.runtime_set(conn, "bco_fixed_risk_pct_of_nav", f"{BCO_FIXED_RISK_PCT_OF_NAV:.6f}")
         core.runtime_set(conn, "bco_manual_risk_last_review_utc", _utc_now())
+        core.runtime_set(conn, "bco_manual_risk_last_nav", f"{float(preview['nav_gbp']):.2f}")
+        core.runtime_set(conn, "bco_manual_risk_last_raw_formula_risk", f"{float(preview['raw_calculated_risk_gbp']):.6f}")
         core.runtime_set(conn, "bco_manual_risk_last_applied_risk", f"{requested:.2f}")
         try:
             conn.commit()
         except Exception:
             pass
+
     current = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
     if abs(current - requested) > 0.005:
         raise HTTPException(status_code=500, detail="Risk override did not persist; no confirmed change")
+
+    sizing_preview = {}
+    try:
+        sizing_preview = core.risk_preview(current)
+    except Exception:
+        sizing_preview = {}
+
     try:
         core.log_event(
-            "bco_manual_live_risk_control_applied",
-            f"Portfolio Hub/manual control changed new-trade risk from £{previous:.2f} to £{current:.2f}; existing positions unchanged.",
-            {"previous_risk_gbp": previous, "new_risk_gbp": current},
+            "bco_fixed_pct_live_risk_applied",
+            f"Applied BCO fixed risk {BCO_FIXED_RISK_PCT_OF_NAV:.2f}% of NAV: NAV £{float(preview['nav_gbp']):.2f}, target £{current:.2f}/new trade; broker minimum size may set higher effective risk; existing positions unchanged.",
+            {
+                "fixed_risk_pct_of_nav": BCO_FIXED_RISK_PCT_OF_NAV,
+                "nav_gbp": preview.get("nav_gbp"),
+                "previous_risk_gbp": previous,
+                "new_risk_gbp": current,
+            },
         )
     except Exception:
         pass
@@ -427,8 +462,13 @@ async def control_risk_per_trade_apply(
     return {
         "status": "ok",
         "strategy": "bco",
+        "fixed_risk_pct_of_nav": BCO_FIXED_RISK_PCT_OF_NAV,
+        "nav_gbp": preview.get("nav_gbp"),
+        "raw_calculated_risk_gbp": preview.get("raw_calculated_risk_gbp"),
         "previous_risk_per_trade_gbp": previous,
         "current_risk_per_trade_gbp": current,
+        "sizing_preview": sizing_preview,
+        "minimum_position_size_rule": preview.get("minimum_position_size_rule"),
         "applies_to_new_trades_only": True,
         "existing_positions_resized": False,
         "persistent": True,
