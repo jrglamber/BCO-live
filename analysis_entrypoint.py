@@ -1,8 +1,9 @@
 """Project Exit Plan — BCO read-only analysis interface v1.
 
-Observability only. This module imports the production BCO application and attaches
-read-only endpoints. It contains no broker-write, strategy, sizing, exit, stop,
-harvest, or research-decision authority.
+Analysis endpoints remain read-only. This wrapper also exposes one explicit,
+authenticated manual risk-per-new-trade control requested by the user. It does
+not place/close trades, move stops, harvest, resize existing positions, or give
+research layers execution authority.
 """
 from __future__ import annotations
 
@@ -11,13 +12,13 @@ import os
 from typing import Any, Dict
 
 import app as core
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
 ANALYSIS_INTERFACE_VERSION = "2.4.0"
-VISIBLE_RELEASE_VERSION = "0.8.28"
+VISIBLE_RELEASE_VERSION = "0.8.29"
 
 
 def _utc_now() -> str:
@@ -346,6 +347,91 @@ def analysis_quality():
         "data": data,
         "read_only_interface": True,
         "execution_authority": False,
+        "time_utc": _utc_now(),
+    }
+
+
+
+@app.get("/control/risk-per-trade")
+def control_risk_per_trade_status() -> Dict[str, Any]:
+    current = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
+    max_risk = max(0.01, float(os.getenv("BCO_RISK_CONTROL_MAX_GBP", "50")))
+    return {
+        "status": "ok",
+        "strategy": "bco",
+        "current_risk_per_trade_gbp": current,
+        "min_risk_gbp": 0.01,
+        "max_risk_gbp": max_risk,
+        "applies_to_new_trades_only": True,
+        "existing_positions_resized": False,
+        "persistent": True,
+        "time_utc": _utc_now(),
+    }
+
+
+@app.post("/control/risk-per-trade")
+async def control_risk_per_trade_apply(
+    request: Request,
+    x_control_secret: str | None = Header(default=None),
+) -> Dict[str, Any]:
+    """Authenticated manual risk control for NEW BCO entries only."""
+    admin_secret = str(getattr(core, "ADMIN_SECRET", "") or "")
+    webhook_secret = str(getattr(core, "WEBHOOK_SECRET", "") or "")
+    valid = x_control_secret and x_control_secret in {admin_secret, webhook_secret}
+    if not valid or x_control_secret in {"change-me", "change-me-too"}:
+        raise HTTPException(status_code=401, detail="Invalid control secret")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    if str(body.get("confirm") or "") != "APPLY_NEW_TRADE_RISK":
+        raise HTTPException(status_code=400, detail="Missing confirm=APPLY_NEW_TRADE_RISK")
+
+    try:
+        requested = float(body.get("risk_per_trade_gbp"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="risk_per_trade_gbp must be numeric")
+
+    min_risk = 0.01
+    max_risk = max(0.01, float(os.getenv("BCO_RISK_CONTROL_MAX_GBP", "50")))
+    if requested < min_risk or requested > max_risk:
+        raise HTTPException(
+            status_code=400,
+            detail=f"risk_per_trade_gbp must be between £{min_risk:.2f} and £{max_risk:.2f}",
+        )
+
+    previous = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
+    core.init_db()
+    with core.get_conn() as conn:
+        core.runtime_set(conn, core.BCO_RISK_RUNTIME_OVERRIDE_KEY, f"{requested:.2f}")
+        core.runtime_set(conn, "bco_manual_risk_last_review_utc", _utc_now())
+        core.runtime_set(conn, "bco_manual_risk_last_applied_risk", f"{requested:.2f}")
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    current = float(core.effective_bco_risk_per_trade_gbp() or 0.0)
+    if abs(current - requested) > 0.005:
+        raise HTTPException(status_code=500, detail="Risk override did not persist; no confirmed change")
+    try:
+        core.log_event(
+            "bco_manual_live_risk_control_applied",
+            f"Portfolio Hub/manual control changed new-trade risk from £{previous:.2f} to £{current:.2f}; existing positions unchanged.",
+            {"previous_risk_gbp": previous, "new_risk_gbp": current},
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "strategy": "bco",
+        "previous_risk_per_trade_gbp": previous,
+        "current_risk_per_trade_gbp": current,
+        "applies_to_new_trades_only": True,
+        "existing_positions_resized": False,
+        "persistent": True,
         "time_utc": _utc_now(),
     }
 

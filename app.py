@@ -1719,6 +1719,27 @@ def runtime_set(conn: DBConn, key: str, value: Any) -> None:
 
 
 
+
+BCO_RISK_RUNTIME_OVERRIDE_KEY = "bco_risk_per_trade_gbp_override"
+
+
+def effective_bco_risk_per_trade_gbp() -> float:
+    """Durable manual override for NEW BCO entries; env value remains fallback."""
+    baseline = max(0.01, float(BCO_RISK_PER_TRADE_GBP))
+    try:
+        with get_conn() as conn:
+            raw = runtime_get(conn, BCO_RISK_RUNTIME_OVERRIDE_KEY, "")
+        if not safe_str(raw):
+            return baseline
+        value = float(raw)
+        max_risk = max(0.01, float(os.getenv("BCO_RISK_CONTROL_MAX_GBP", "50")))
+        if 0.01 <= value <= max_risk:
+            return value
+    except Exception:
+        pass
+    return baseline
+
+
 def _bco_parse_aware_utc(value: Any) -> Optional[datetime]:
     s = safe_str(value)
     if not s:
@@ -2555,7 +2576,7 @@ def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
     preview_attempts = 0
     for attempt in range(1, BCO_ENTRY_PREVIEW_MAX_ATTEMPTS + 1):
         preview_attempts = attempt
-        preview = risk_preview(BCO_RISK_PER_TRADE_GBP)
+        preview = risk_preview(effective_bco_risk_per_trade_gbp())
         if preview.get("ok") or preview.get("blocked"):
             break
         if attempt < BCO_ENTRY_PREVIEW_MAX_ATTEMPTS:
@@ -2579,7 +2600,7 @@ def open_bco_broker_trade(local_trade_id: str) -> Dict[str, Any]:
     explicit_failure = _bco_oanda_order_failure_reason(resp)
     accepted = bool(resp.get("ok")) and fill_valid and not explicit_failure
     failure_reason = "" if accepted else (explicit_failure or fill_reason or safe_str(resp.get("error")) or "broker_entry_not_filled")
-    audit("OPEN_BCO_DETAILS", accepted, trade_id=local_trade_id, broker_trade_id=fill.get("broker_trade_id"), instrument=BCO_OANDA_INSTRUMENT, requested_units=units, filled_units=fill.get("units"), intended_price=preview.get("entry_price"), actual_price=fill.get("price"), spread_pct=preview.get("spread_pct"), requested_risk_gbp=BCO_RISK_PER_TRADE_GBP, effective_risk_gbp=preview.get("effective_risk_gbp"), message="broker open filled" if accepted else f"broker open NOT filled: {failure_reason}", raw=resp.get("data") or resp)
+    audit("OPEN_BCO_DETAILS", accepted, trade_id=local_trade_id, broker_trade_id=fill.get("broker_trade_id"), instrument=BCO_OANDA_INSTRUMENT, requested_units=units, filled_units=fill.get("units"), intended_price=preview.get("entry_price"), actual_price=fill.get("price"), spread_pct=preview.get("spread_pct"), requested_risk_gbp=effective_bco_risk_per_trade_gbp(), effective_risk_gbp=preview.get("effective_risk_gbp"), message="broker open filled" if accepted else f"broker open NOT filled: {failure_reason}", raw=resp.get("data") or resp)
     return {"ok": accepted, "error": failure_reason if not accepted else "", "market_halted": safe_str(failure_reason).upper() == "MARKET_HALTED", "response": resp, "fill": fill, "preview": preview, "preview_attempts": preview_attempts, "order_submitted": True, "fill_valid": fill_valid, "fill_validation": fill_reason}
 
 
@@ -3285,7 +3306,7 @@ def create_trade(conn: DBConn, raw_signal_id: int, signal: Dict[str, Any], cycle
         INSERT INTO trades(trade_id,status,direction,cycle_id,entry_raw_signal_id,entry_signal_id,entry_time,entry_price,
             requested_risk_gbp,effective_risk_gbp,sl_pct,hard_sl_price,current_price,highest_high,lowest_low,created_at_utc,updated_at_utc)
         VALUES(?, 'OPEN','long',?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (trade_id,cycle_id,raw_signal_id,signal_id,signal_time,entry,BCO_RISK_PER_TRADE_GBP,BCO_RISK_PER_TRADE_GBP,BCO_SL_PCT,hard,entry,entry,entry,now_utc_iso(),now_utc_iso()))
+    """, (trade_id,cycle_id,raw_signal_id,signal_id,signal_time,entry,effective_bco_risk_per_trade_gbp(),effective_bco_risk_per_trade_gbp(),BCO_SL_PCT,hard,entry,entry,entry,now_utc_iso(),now_utc_iso()))
     if BCO_AUTO_ENTRY_ENABLED:
         result=open_bco_broker_trade(trade_id)
         if result.get("ok"):
@@ -5364,7 +5385,7 @@ def snapshot() -> Dict[str,Any]:
     broker=bco_broker_live_snapshot()
     return {
         "status":"ok","app":APP_NAME,"policy_version":POLICY_VERSION,
-        "strategy":{"asset":BCO_ASSET,"direction":BCO_DIRECTION,"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,
+        "strategy":{"asset":BCO_ASSET,"direction":BCO_DIRECTION,"risk_per_trade_gbp":effective_bco_risk_per_trade_gbp(),
                     "sl_pct":BCO_SL_PCT,"min_hold_hours":BCO_MIN_HOLD_HOURS,
                     "execution_multiplier":BCO_EXECUTION_MULTIPLIER},
         "basket":state,
@@ -7538,7 +7559,7 @@ def discover_endpoint(): return discover_bco_instruments()
 
 
 @app.get("/broker/risk-preview")
-def risk_preview_endpoint(target_risk_gbp: float = Query(default=BCO_RISK_PER_TRADE_GBP, gt=0)): return risk_preview(target_risk_gbp)
+def risk_preview_endpoint(target_risk_gbp: Optional[float] = Query(default=None, gt=0)): return risk_preview(target_risk_gbp if target_risk_gbp is not None else effective_bco_risk_per_trade_gbp())
 
 
 @app.post("/admin/broker/practice-smoke-open")
@@ -7668,7 +7689,7 @@ def export_all_zip():
             "policy":POLICY_VERSION,
             "asset":"BCOUSD",
             "direction":"long",
-            "requested_risk_gbp":BCO_RISK_PER_TRADE_GBP,
+            "requested_risk_gbp":effective_bco_risk_per_trade_gbp(),
             "sl_pct":BCO_SL_PCT,
             "live_accounting_epoch_utc":bco_live_accounting_epoch() or None,
             "pre_live_demo_archive":bco_pre_live_demo_archive(),
@@ -7698,7 +7719,7 @@ def dashboard_full():
     allowed="YES" if safety.get("orders_allowed") else "NO — LOCKED"
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='60'><title>{esc(APP_NAME)}</title><style>
     body{{background:#0b1220;color:#e5e7eb;font-family:Arial,sans-serif;margin:22px}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}} .card{{background:#111827;border:1px solid #243044;border-radius:10px;padding:14px}} .label{{color:#94a3b8;font-size:12px;text-transform:uppercase}} .value{{font-size:24px;font-weight:700;margin-top:5px}} .ok{{color:#86efac}} .bad{{color:#fca5a5}} table{{width:100%;border-collapse:collapse;background:#111827;margin-top:12px}} th,td{{padding:8px;border-bottom:1px solid #243044;text-align:left;font-size:13px}} a{{color:#7dd3fc}} code{{color:#fde68a}} .note{{background:#172033;padding:10px;border-radius:8px;margin:12px 0}}.research-inner{{margin:7px 10px}}.research-inner>summary{{background:#11161d;border-left-color:#315f39}}.research-inner-body{{padding:0}}</style></head><body>
-    <h1>BCO Live</h1><div class='note'>Production bootstrap. Shared OANDA account may be read, but this service owns <strong>BCO only</strong>. Initial live v1 is LONG-only, £{BCO_RISK_PER_TRADE_GBP:.2f}/R requested, {BCO_SL_PCT:.2f}% SL, 48h minimum then hourly management.</div>
+    <h1>BCO Live</h1><div class='note'>Production bootstrap. Shared OANDA account may be read, but this service owns <strong>BCO only</strong>. Initial live v1 is LONG-only, £{effective_bco_risk_per_trade_gbp():.2f}/R requested, {BCO_SL_PCT:.2f}% SL, 48h minimum then hourly management.</div>
     <div class='grid'>
       <div class='card'><div class='label'>Broker writes</div><div class='value {'ok' if safety.get('orders_allowed') else 'bad'}'>{allowed}</div><div>{esc(safety.get('reason'))}</div></div>
       <div class='card'><div class='label'>Shared OANDA NAV</div><div class='value'>£{safe_float(acct.get('NAV')) or 0:,.2f}</div><div>Margin available £{safe_float(acct.get('marginAvailable')) or 0:,.2f}</div></div>
@@ -8886,7 +8907,7 @@ def _bco_standard_top_uncached():
                  "fresh_signal_max_age_seconds":BCO_FRESH_SIGNAL_MAX_AGE_SECONDS,
                  "processing_health_source":"fresh unprocessed raw_signals missing basket_decisions",
                  "recovery_interval_seconds":BCO_SIGNAL_RECOVERY_INTERVAL_SECONDS},
-      "config":{"risk_per_trade_gbp":BCO_RISK_PER_TRADE_GBP,"sl_pct":BCO_SL_PCT,
+      "config":{"risk_per_trade_gbp":effective_bco_risk_per_trade_gbp(),"sl_pct":BCO_SL_PCT,
                 "min_hold_hours":BCO_MIN_HOLD_HOURS,"instrument":BCO_OANDA_INSTRUMENT,"direction":BCO_DIRECTION,
                 "new_cycle_exit_manager":BCO_NEW_CYCLE_EXIT_MANAGER,
                 "risk_round_up_max_overage_pct":BCO_RISK_ROUND_UP_MAX_OVERAGE_PCT,
@@ -9897,7 +9918,7 @@ def _bco_standard_broker_html():
         <div class="mini-card"><div class="k">BCO Open P&amp;L</div><div class="v {_pnl_class(broker.get('owned_unrealized_pl'))}">{_money(broker.get('owned_unrealized_pl'))}</div><div class="small">{int(broker.get('owned_open_count') or 0)} owned broker trades</div></div>
         <div class="mini-card"><div class="k">Reconciliation</div><div class="v {'pos' if not local_missing and not broker_only else 'neg'}">{'SAFE' if not local_missing and not broker_only else 'CHECK'}</div><div class="small">Local missing {len(local_missing)} · broker-only {len(broker_only)}</div></div>
         <div class="mini-card"><div class="k">Broker Queue</div><div class="v {'warn' if pending else 'pos'}">{pending}</div><div class="small">{failed} failed final</div></div>
-        <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{BCO_RISK_PER_TRADE_GBP:.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL · 1.00x locked</div></div>
+        <div class="mini-card"><div class="k">Risk / Trade</div><div class="v">£{effective_bco_risk_per_trade_gbp():.2f}</div><div class="small">{BCO_SL_PCT:.2f}% SL · 1.00x locked</div></div>
       </div>
 
       <h3>BCO Profit Performance</h3>
@@ -9934,7 +9955,7 @@ def _bco_standard_broker_html():
 
       <h3>Risk / Order Preview</h3>
       <div class="table-scroll"><table><thead><tr><th>Instrument</th><th>Requested Risk</th><th>Effective Risk</th><th>Units</th><th>Entry</th><th>SL</th><th>State</th></tr></thead>
-      <tbody><tr><td>{esc(preview.get('instrument') or BCO_OANDA_INSTRUMENT)}</td><td>£{BCO_RISK_PER_TRADE_GBP:.2f}</td>
+      <tbody><tr><td>{esc(preview.get('instrument') or BCO_OANDA_INSTRUMENT)}</td><td>£{effective_bco_risk_per_trade_gbp():.2f}</td>
       <td>{_money(preview.get('effective_risk_gbp'))}</td><td>{esc(preview.get('units') or preview.get('order_units') or '-')}</td>
       <td>{_fmt_metric(preview.get('entry_price'),3)}</td><td>{_fmt_metric(preview.get('sl_price'),3)}</td>
       <td class='{'pos' if preview.get('ok') else 'warn'}'>{'OK' if preview.get('ok') else 'BLOCKED'}</td></tr></tbody></table></div>
