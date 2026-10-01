@@ -37,9 +37,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.19 — Stacking-Brake Shadow + Durable AI Retry"
-APP_VERSION = "0.8.19"
-POLICY_VERSION = "bco_v0.8.19_stacking_brake_shadow_durable_ai_retry_2026_09_18"
+APP_NAME = "Project Exit Plan — BCO v0.8.31 — Fresh Dashboard HWM Ratchet"
+APP_VERSION = "0.8.31"
+POLICY_VERSION = "bco_v0.8.31_fresh_dashboard_hwm_ratchet_2026_10_01"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
 # v0.8.19 — research stacking-brake challenger + resilient AI collector.
@@ -4997,6 +4997,92 @@ def _bco_seed_live_hwm_for_cycle(
     }
 
 
+def _bco_refresh_live_hwm_read_only(
+    live: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ratchet the current-cycle live HWM from one fresh broker sample.
+
+    Dashboard-safe: updates only runtime HWM/current observation state. It never
+    runs harvest execution, closes/modifies trades, or sends a broker order.
+    """
+    if not live.get("ok"):
+        return {"ok": False, "skipped": True, "reason": "broker_read_failed"}
+
+    with _db_lock, get_conn() as conn:
+        state = fetchone_dict(conn.execute(
+            "SELECT * FROM basket_state WHERE singleton_key='BCO_LONG' LIMIT 1"
+        )) or {}
+        cycle = safe_str(state.get("cycle_id"))
+        metrics = bco_live_broker_r_metrics(conn, live)
+
+        local_open_row = fetchone_dict(conn.execute(
+            "SELECT COUNT(*) AS c FROM trades WHERE status='OPEN'"
+        )) or {}
+        local_open = int(safe_float(local_open_row.get("c")) or 0)
+        broker_open = int(live.get("owned_open_count") or 0)
+
+        if local_open == 0 and broker_open == 0:
+            _bco_reset_live_hwm_state(conn)
+            conn.commit()
+            return {
+                "ok": True, "flat": True, "cycle_id": cycle,
+                "current_r": 0.0, "current_gbp": 0.0,
+                "high_water_r": 0.0, "high_water_gbp": 0.0,
+                "high_water_at_utc": "",
+            }
+
+        if not cycle:
+            return {
+                "ok": True, "skipped": True,
+                "reason": "active_open_trades_without_cycle_id",
+                "metrics": metrics,
+            }
+
+        if not metrics.get("complete"):
+            return {
+                "ok": True, "skipped": True,
+                "reason": "broker_local_mapping_incomplete",
+                "cycle_id": cycle, "metrics": metrics,
+            }
+
+        hwm_state = _bco_live_hwm_state(conn, cycle)
+        if not hwm_state.get("same_cycle"):
+            hwm_state = _bco_seed_live_hwm_for_cycle(conn, cycle, state, metrics)
+
+        current_r = float(safe_float(metrics.get("basket_R")) or 0.0)
+        current_gbp = float(safe_float(metrics.get("basket_pnl_gbp")) or 0.0)
+        observed_at = safe_str(metrics.get("time_utc")) or now_utc_iso()
+
+        runtime_set(conn, BCO_LIVE_CURRENT_R_KEY, current_r)
+        runtime_set(conn, BCO_LIVE_CURRENT_GBP_KEY, current_gbp)
+        runtime_set(conn, BCO_LIVE_CURRENT_AT_KEY, observed_at)
+
+        stored_hwm_r = float(safe_float(hwm_state.get("high_water_r")) or 0.0)
+        if current_r > stored_hwm_r + 1e-9:
+            runtime_set(conn, BCO_LIVE_HWM_R_KEY, current_r)
+            runtime_set(conn, BCO_LIVE_HWM_GBP_KEY, current_gbp)
+            runtime_set(conn, BCO_LIVE_HWM_AT_KEY, observed_at)
+            runtime_set(conn, BCO_LIVE_HWM_SOURCE_KEY, "DASHBOARD_FRESH_BROKER_RATCHET")
+
+        runtime_set(conn, BCO_LIVE_MONITOR_LAST_STATUS_KEY, "OK")
+        conn.commit()
+
+        refreshed = _bco_live_hwm_state(conn, cycle)
+        return {
+            "ok": True,
+            "cycle_id": cycle,
+            "mapping_complete": True,
+            "current_r": current_r,
+            "current_gbp": current_gbp,
+            "current_at_utc": observed_at,
+            "high_water_r": refreshed.get("high_water_r"),
+            "high_water_gbp": refreshed.get("high_water_gbp"),
+            "high_water_at_utc": refreshed.get("high_water_at_utc"),
+            "source": refreshed.get("high_water_source"),
+            "read_only_dashboard_ratchet": True,
+        }
+
+
 def _bco_execute_live_harvest_levels(
     conn: DBConn,
     cycle_id: str,
@@ -8690,6 +8776,11 @@ def _bco_standard_top_uncached():
     live_hwm_state = {}
     live_metrics = {}
     if current_cycle and not authoritative_flat:
+        # v0.8.31: ratchet the live HWM against the SAME fresh broker snapshot
+        # used for the Broker P&L headline before rendering the dashboard. This
+        # keeps HWM >= current basket P&L/R whenever reconciliation is complete,
+        # without invoking harvest execution or any broker write.
+        _bco_refresh_live_hwm_read_only(broker)
         with get_conn() as _live_conn:
             live_hwm_state = _bco_live_hwm_state(_live_conn, current_cycle)
             live_metrics = bco_live_broker_r_metrics(_live_conn, broker)
