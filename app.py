@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import queue
+import entry_lab
 import time
 import urllib.error
 import urllib.parse
@@ -37,9 +38,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
-APP_NAME = "Project Exit Plan — BCO v0.8.31 — Fresh Dashboard HWM Ratchet"
-APP_VERSION = "0.8.31"
-POLICY_VERSION = "bco_v0.8.31_fresh_dashboard_hwm_ratchet_2026_10_01"
+APP_NAME = "Project Exit Plan — BCO v0.8.32 — Entry Lab Shadow"
+APP_VERSION = "0.8.32"
+POLICY_VERSION = "bco_v0.8.32_entry_lab_shadow_2026_10_02"
 AGGREGATE_SOURCE_SECRET = os.getenv("AGGREGATE_SOURCE_SECRET", "").strip()
 
 # v0.8.19 — research stacking-brake challenger + resilient AI collector.
@@ -7627,6 +7628,28 @@ async def tradingview_webhook(request: Request, secret: str = Query(default=""))
         directional_research={"ok":False,"research_only":True,"execution_authority":False,"error":f"{type(_dir_exc).__name__}: {_dir_exc}"}
     try:
         result=process_signal(raw_id,payload); focused_research=record_bco_focused_research(raw_id)
+        # v0.8.32: common research-only Entry Lab. It records alternative
+        # entry decisions/outcomes only and is never read by production logic.
+        try:
+            with _db_lock, get_conn() as _elc:
+                _el = entry_lab.capture(
+                    _elc,
+                    project="BCO",
+                    raw_signal_id=int(raw_id),
+                    baseline_candidate=bool(bco_long_candidate(payload)),
+                    actual_entry=(bool(result.get("entry_created")) if isinstance(result,dict) and "entry_created" in result else None),
+                    sl_pct=float(BCO_SL_PCT),
+                    now_utc_iso=now_utc_iso(),
+                )
+                _elu = entry_lab.update_outcomes(_elc, "BCO", now_utc_iso(), max_rows=400)
+                _elc.commit()
+            result["entry_lab_shadow"] = _el
+            result["entry_lab_outcomes"] = _elu
+        except Exception as _el_exc:
+            result["entry_lab_shadow"] = {
+                "ok":False,"research_only":True,"execution_authority":False,
+                "error":f"{type(_el_exc).__name__}: {_el_exc}",
+            }
     except Exception as e:
         log_event("signal_processing_error",str(e),{"raw_signal_id":raw_id}); raise
     return {"status":"ok","raw_signal_id":raw_id,"ingress_receipt_id":receipt_id,"result":result,"focused_research":focused_research,"directional_research":directional_research,"ai_regime_observer":ai_regime_observer}
