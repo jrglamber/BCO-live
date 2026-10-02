@@ -17,8 +17,8 @@ from fastapi.responses import Response
 
 # Stable outer app: explicit wrapper routes take precedence over the unchanged core app.
 app = FastAPI(title="Project Exit Plan — Wrapper")
-ANALYSIS_INTERFACE_VERSION = "2.5.1"
-VISIBLE_RELEASE_VERSION = "0.8.31"
+ANALYSIS_INTERFACE_VERSION = "2.5.2"
+VISIBLE_RELEASE_VERSION = "0.8.32"
 
 
 def _utc_now() -> str:
