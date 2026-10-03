@@ -10375,6 +10375,25 @@ async function startNewBCOBasketCycle(){{
 document.querySelectorAll('details.lazy-section').forEach(d=>d.addEventListener('toggle',()=>{{if(d.open)loadSection(d)}}));loadTop(false);setInterval(()=>loadTop(true),60000);
 </script></body></html>'''
 
+@app.get("/analysis/short-promotion-summary")
+def bco_short_promotion_summary() -> Dict[str, Any]:
+    """Read-only forward SHORT evidence for review/promotion decisions."""
+    horizons=(6,12,24,48,72,96)
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("""SELECT * FROM bco_directional_intelligence_research
+            WHERE UPPER(direction)='SHORT' AND COALESCE(candidate,0)=1 ORDER BY raw_signal_id""").fetchall()]
+    out={"lane":"BCO_SHORT","research_only":True,"execution_authority":False,"candidates":len(rows),"horizons":{}}
+    for h in horizons:
+        vals=[]
+        for r in rows:
+            if int(r.get(f"completed_{h}") or 0)!=1: continue
+            v=safe_float(r.get(f"outcome_{h}_r"))
+            if v is not None: vals.append(float(v))
+        out["horizons"][str(h)]={"settled":len(vals),"wins":sum(v>0 for v in vals),"losses":sum(v<0 for v in vals),
+            "total_r":round(sum(vals),4),"avg_r":round(sum(vals)/len(vals),4) if vals else None,
+            "max_r":round(max(vals),4) if vals else None,"min_r":round(min(vals),4) if vals else None}
+    return {"status":"ok","time_utc":now_utc_iso(),"short_lanes":{"BCO_SHORT":out}}
+
 @app.get("/dashboard-standard-status")
 def bco_standard_status():
     return {
