@@ -6742,20 +6742,30 @@ def bco_directional_intelligence_rows(limit: int = 25000) -> List[Dict[str, Any]
 
 
 def bco_directional_intelligence_summary(limit: int = 5000) -> Dict[str, Any]:
-    rows = bco_directional_intelligence_rows(limit); candidates = [r for r in rows if int(safe_float(r.get("candidate")) or 0) == 1]
+    rows = bco_directional_intelligence_rows(limit)
+    candidates = [r for r in rows if int(safe_float(r.get("candidate")) or 0) == 1]
     groups = []
+    now=datetime.now(timezone.utc); week=now-timedelta(days=7); month=now-timedelta(days=30)
+    def dt(v):
+        try:return datetime.fromisoformat(safe_str(v).replace("Z","+00:00"))
+        except:return None
     for direction in ("LONG","SHORT"):
-        subset = [r for r in candidates if safe_str(r.get("direction")).upper() == direction]
-        complete = [r for r in subset if int(safe_float(r.get("completed_48")) or 0) == 1 and safe_float(r.get("outcome_48_r")) is not None]
-        episodes = len({safe_str(r.get("candidate_episode_id")) for r in subset if safe_str(r.get("candidate_episode_id"))})
-        def avg(key: str) -> Optional[float]:
-            vals = [safe_float(r.get(key)) for r in complete]; vals = [float(v) for v in vals if v is not None]
-            return (sum(vals)/len(vals)) if vals else None
-        groups.append({"direction": direction, "candidate_rows": len(subset), "independent_candidate_episodes": episodes,
-                       "completed_48": len(complete), "avg_48_r": avg("outcome_48_r"), "avg_48_mfe_r": avg("outcome_48_mfe_r"),
-                       "avg_48_mae_r": avg("outcome_48_mae_r"), "avg_48_snapback_r": avg("outcome_48_snapback_r")})
-    return {"ok": True, "research_only": True, "execution_authority": False, "prospective_only": True,
-            "version": BCO_DIRECTIONAL_INTELLIGENCE_VERSION, "groups": groups, "recent_candidates": candidates[:60], "time_utc": now_utc_iso()}
+        subset=[r for r in candidates if safe_str(r.get("direction")).upper()==direction]
+        complete=[r for r in subset if int(safe_float(r.get("completed_48")) or 0)==1 and safe_float(r.get("outcome_48_r")) is not None]
+        episodes=len({safe_str(r.get("candidate_episode_id")) for r in subset if safe_str(r.get("candidate_episode_id"))})
+        vals=[float(safe_float(r.get("outcome_48_r"))) for r in complete]
+        def period(since):
+            x=[r for r in complete if dt(r.get("signal_time")) and dt(r.get("signal_time"))>=since]
+            v=[float(safe_float(r.get("outcome_48_r"))) for r in x]
+            return {"settled":len(v),"wins":sum(z>0 for z in v),"losses":sum(z<0 for z in v),"total_r":round(sum(v),4),"avg_r":round(sum(v)/len(v),4) if v else None}
+        groups.append({"asset":"BCO","direction":direction,"candidate_rows":len(subset),"independent_candidate_episodes":episodes,
+          "completed_48":len(complete),"wins_48":sum(z>0 for z in vals),"losses_48":sum(z<0 for z in vals),
+          "total_48_r":round(sum(vals),4),"avg_48_r":round(sum(vals)/len(vals),4) if vals else None,
+          "worst_48_r":min(vals) if vals else None,"best_48_r":max(vals) if vals else None,
+          "week":period(week),"month":period(month)})
+    return {"ok":True,"research_only":True,"execution_authority":False,"prospective_only":True,
+      "accounting_basis":"48h direction-normalised forward outcome; research proxy, not broker cash P&L",
+      "version":BCO_DIRECTIONAL_INTELLIGENCE_VERSION,"groups":groups,"recent_candidates":candidates[:60],"time_utc":now_utc_iso()}
 
 
 def build_bco_directional_intelligence_html() -> str:
