@@ -6582,6 +6582,35 @@ def _ensure_bco_directional_intelligence_on_conn(conn: DBConn) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_directional_pending ON bco_directional_intelligence_research(completed_96,direction,raw_signal_id)")
 
 
+@app.get("/analysis/short-lane-performance")
+def bco_short_lane_performance() -> Dict[str, Any]:
+    """Read-only promotion view of the existing prospective BCO SHORT research lane."""
+    try:
+        with get_conn() as conn:
+            rows=[dict(r) for r in conn.execute("""
+                SELECT signal_time,candidate,candidate_state,entry_close,sl_pct,
+                       outcome_48_r,outcome_48_mfe_r,outcome_48_mae_r,completed_48,
+                       outcome_96_r,outcome_96_mfe_r,outcome_96_mae_r,completed_96
+                FROM bco_directional_intelligence_research
+                WHERE UPPER(direction)='SHORT' AND COALESCE(candidate,0)=1
+                ORDER BY raw_signal_id
+            """).fetchall()]
+        def summary(h):
+            done=[r for r in rows if bool(r.get("completed_"+str(h))) and r.get("outcome_"+str(h)+"_r") is not None]
+            rs=[float(r["outcome_"+str(h)+"_r"]) for r in done]
+            mf=[float(r["outcome_"+str(h)+"_mfe_r"]) for r in done if r.get("outcome_"+str(h)+"_mfe_r") is not None]
+            ma=[float(r["outcome_"+str(h)+"_mae_r"]) for r in done if r.get("outcome_"+str(h)+"_mae_r") is not None]
+            return {"settled":len(rs),"wins":sum(x>0 for x in rs),"losses":sum(x<0 for x in rs),
+                    "total_r":round(sum(rs),4),"avg_r":round(sum(rs)/len(rs),4) if rs else None,
+                    "avg_mfe_r":round(sum(mf)/len(mf),4) if mf else None,
+                    "avg_mae_r":round(sum(ma)/len(ma),4) if ma else None}
+        return {"status":"ok","asset":"BCO","lane":"SHORT","research_only":True,"execution_authority":False,
+                "candidate_rows":len(rows),"horizon_48h":summary(48),"horizon_96h":summary(96),
+                "note":"Prospective directional-intelligence outcomes; not broker P&L."}
+    except Exception as exc:
+        return {"status":"error","asset":"BCO","lane":"SHORT","research_only":True,
+                "execution_authority":False,"error":type(exc).__name__+": "+str(exc)}
+
 def ensure_bco_directional_intelligence_table() -> None:
     with get_conn() as conn:
         _ensure_bco_directional_intelligence_on_conn(conn)
