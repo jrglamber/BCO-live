@@ -6588,6 +6588,34 @@ def ensure_bco_directional_intelligence_table() -> None:
         conn.commit()
 
 
+@app.get("/analysis/short-lane-performance")
+def bco_short_lane_performance() -> Dict[str, Any]:
+    """Read-only forward SHORT research summary; zero execution authority."""
+    ensure_bco_directional_intelligence_table()
+    with get_conn() as conn:
+        rows=[dict(r) for r in conn.execute("""
+            SELECT created_at_utc,signal_time,candidate,candidate_state,
+                   outcome_48_r,outcome_48_mfe_r,outcome_48_mae_r,completed_48
+            FROM bco_directional_intelligence_research
+            WHERE UPPER(direction)='SHORT' AND COALESCE(candidate,0)=1
+            ORDER BY raw_signal_id
+        """).fetchall()]
+    now=datetime.now(timezone.utc); ws=now.replace(hour=0,minute=0,second=0,microsecond=0)-timedelta(days=now.weekday()); ms=now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    def dt(v):
+        try:return datetime.fromisoformat(str(v).replace("Z","+00:00"))
+        except:return None
+    def calc(start=None):
+        rr=[r for r in rows if (start is None or ((dt(r.get("signal_time") or r.get("created_at_utc")) or datetime.min.replace(tzinfo=timezone.utc))>=start))]
+        settled=[r for r in rr if int(r.get("completed_48") or 0)==1 and r.get("outcome_48_r") is not None]
+        vals=[float(r["outcome_48_r"]) for r in settled]
+        return {"candidates":len(rr),"settled_48h":len(vals),"wins":sum(x>0 for x in vals),"losses":sum(x<0 for x in vals),
+                "net_r":round(sum(vals),4),"avg_r":round(sum(vals)/len(vals),4) if vals else None,
+                "max_mfe_r":max([float(r["outcome_48_mfe_r"]) for r in settled if r.get("outcome_48_mfe_r") is not None],default=None),
+                "worst_mae_r":min([float(r["outcome_48_mae_r"]) for r in settled if r.get("outcome_48_mae_r") is not None],default=None)}
+    return {"status":"ok","lane":"BCO_SHORT","research_only":True,"execution_authority":False,"settlement_basis":"48h forward directional R",
+            "all_time":calc(),"week":calc(ws),"month":calc(ms),"time_utc":now.isoformat()}
+
+
 def _bco_directional_ai_fields(conn: DBConn, raw_signal_id: int) -> Dict[str, Any]:
     try:
         row = fetchone_dict(conn.execute("""SELECT id,status,regime,directional_bias,directional_regime,long_view,short_view
