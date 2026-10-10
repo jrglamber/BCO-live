@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 ENTRY_LAB_VERSION = "entry_lab_v2_outcome_repair_2026_10_10"
 HORIZONS = (6, 12, 24, 48, 72, 96)
+MIN_MATURATION_SCAN = 1200
 
 
 def _f(v: Any) -> Optional[float]:
@@ -121,15 +122,16 @@ def capture(conn,*,project,raw_signal_id,baseline_candidate,actual_entry,sl_pct,
 def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
     """Mature every known challenger decision, including rejected candidates.
 
-    v1 filtered on decision=1, which made the lab unable to compare what a
-    challenger accepted with what it rejected and could leave the exported
-    outcome matrix effectively blank. This repair is research-only and does not
-    touch production entry/exit state.
+    The caller historically passed max_rows=400. To repair the existing backlog
+    without touching the production webhook/entry path, this research-only
+    routine now enforces a 1200-row minimum scan. It remains bounded and has no
+    execution authority.
     """
     ensure_schema(conn)
+    scan_limit=max(MIN_MATURATION_SCAN,int(max_rows or 0))
     pending=conn.execute("""SELECT * FROM entry_lab_shadow
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
-      ORDER BY raw_signal_id ASC LIMIT ?""",(asset,int(max_rows))).fetchall()
+      ORDER BY raw_signal_id ASC LIMIT ?""",(asset,scan_limit)).fetchall()
     updated=0; immature=0; invalid=0; horizons_written={str(h):0 for h in HORIZONS}
     for raw in pending:
         r=_rowdict(raw); rid=int(r.get("raw_signal_id") or 0); entry=_f(r.get("entry_price")); sl=_f(r.get("sl_pct"))
@@ -147,4 +149,4 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
             sets += [f"outcome_{h}h_r=?",f"outcome_{h}h_mfe_r=?",f"outcome_{h}h_mae_r=?"]; params += [rr,mfe,mae]; horizons_written[str(h)]+=1
         if sets:
             sets.append("updated_at_utc=?"); params.extend([now_utc_iso,r.get("id")]); conn.execute("UPDATE entry_lab_shadow SET "+",".join(sets)+" WHERE id=?",tuple(params)); updated+=1
-    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
+    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"scan_limit":scan_limit,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
