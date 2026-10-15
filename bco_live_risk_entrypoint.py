@@ -8,3 +8,4 @@ try:
     print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
 except Exception:
     pass
+# Fresh-build marker: Railway start-command sync 2026-10-15.
