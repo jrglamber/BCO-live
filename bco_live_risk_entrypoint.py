@@ -39,3 +39,4 @@ def _install_route():
 
 LIVE_RISK_INSTALL = _install_route()
 print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
+# Procfile-synchronised fresh-build marker 2026-10-15.
