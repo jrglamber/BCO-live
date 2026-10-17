@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-ENTRY_LAB_VERSION = "entry_lab_v2_outcome_repair_2026_10_10"
+ENTRY_LAB_VERSION = "entry_lab_v3_asset_sequence_maturation_2026_10_17"
 HORIZONS = (6, 12, 24, 48, 72, 96)
 MIN_MATURATION_SCAN = 1200
 
@@ -120,12 +120,12 @@ def capture(conn,*,project,raw_signal_id,baseline_candidate,actual_entry,sl_pct,
 
 
 def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
-    """Mature every known challenger decision, including rejected candidates.
+    """Mature known challenger decisions from later candles of the same asset.
 
-    The caller historically passed max_rows=400. To repair the existing backlog
-    without touching the production webhook/entry path, this research-only
-    routine now enforces a 1200-row minimum scan. It remains bounded and has no
-    execution authority.
+    raw_signals is a shared/interleaved table, so global row ids are not a
+    candle counter. Future observations are therefore selected by asset and
+    ordered by id; the first 6/12/24/48/72/96 same-asset observations are the
+    fixed horizons. The routine is research-only and has no execution authority.
     """
     ensure_schema(conn)
     scan_limit=max(MIN_MATURATION_SCAN,int(max_rows or 0))
