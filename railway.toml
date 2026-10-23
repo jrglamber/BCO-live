@@ -2,4 +2,4 @@
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "uvicorn bco_live_risk_entrypoint:app --host 0.0.0.0 --port $PORT"
+startCommand = "uvicorn bco_daily_summary_entrypoint:app --host 0.0.0.0 --port $PORT"
