@@ -39,4 +39,11 @@ def _install_route():
 
 LIVE_RISK_INSTALL = _install_route()
 print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
+
+# Research-only overlay. This wraps post-signal observability/export paths and
+# has no broker-write or production decision authority.
+import bco_protection_research_v2 as protection_research
+PROTECTION_RESEARCH_INSTALL = protection_research.STATUS
+print("BCO_PROTECTION_RESEARCH_IMPORT", PROTECTION_RESEARCH_INSTALL, flush=True)
+
 # Procfile-synchronised fresh-build marker 2026-10-15.
