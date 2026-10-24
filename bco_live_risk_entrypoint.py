@@ -42,7 +42,7 @@ print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
 
 # Research-only overlay. This wraps post-signal observability/export paths and
 # has no broker-write or production decision authority.
-import bco_protection_research_v3 as protection_research
+import bco_protection_research_v4 as protection_research
 PROTECTION_RESEARCH_INSTALL = protection_research.STATUS
 print("BCO_PROTECTION_RESEARCH_IMPORT", PROTECTION_RESEARCH_INSTALL, flush=True)
 
