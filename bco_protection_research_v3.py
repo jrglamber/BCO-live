@@ -13,13 +13,14 @@ import bco_oct14_strategy_update as oct14
 
 core = v2.core
 app = v2.app
-VERSION = "bco_protection_research_v3_2026_10_24"
+VERSION = "bco_protection_research_v3_2026_10_30"
 
 
 def _market_rows(conn) -> List[Dict[str, Any]]:
     rows = v2._rows(conn.execute(
         "SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals "
-        "WHERE UPPER(pair) LIKE 'BCO%' AND exec_close IS NOT NULL ORDER BY id ASC"
+        "WHERE UPPER(pair) LIKE ? AND exec_close IS NOT NULL ORDER BY id ASC",
+        ("BCO%",),
     ))
     prev = None
     atr = None
@@ -54,8 +55,8 @@ def _fixed_entry_outcomes(conn, max_rows: int = 1500) -> Dict[str, Any]:
             continue
         future = core.fetchall_dict(conn.execute("""
             SELECT id,exec_close,exec_high,exec_low FROM raw_signals
-            WHERE UPPER(pair) LIKE 'BCO%' AND id>? AND exec_close IS NOT NULL ORDER BY id ASC LIMIT 96
-        """, (rid,)))
+            WHERE UPPER(pair) LIKE ? AND id>? AND exec_close IS NOT NULL ORDER BY id ASC LIMIT 96
+        """, ("BCO%", rid)))
         if len(future) < 6:
             continue
         sets: List[str] = []; params: List[Any] = []
@@ -98,8 +99,8 @@ def _repair_partial_bank_outcomes(conn, raw_signal_id: int) -> None:
                          (core.now_utc_iso(),int(raw_signal_id),row.get("id")))
             continue
         c = core.fetchone_dict(conn.execute(
-            "SELECT COUNT(*) AS n FROM raw_signals WHERE UPPER(pair) LIKE 'BCO%' AND id>? AND id<=?",
-            (trigger_id,int(raw_signal_id)))) or {}
+            "SELECT COUNT(*) AS n FROM raw_signals WHERE UPPER(pair) LIKE ? AND id>? AND id<=?",
+            ("BCO%", trigger_id, int(raw_signal_id)))) or {}
         elapsed = int(v2._sf(c.get("n")))
         sets: List[str] = []; params: List[Any] = []
         for h in (24,48,72,96):
