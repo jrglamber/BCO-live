@@ -46,4 +46,11 @@ import bco_protection_research_v4 as protection_research
 PROTECTION_RESEARCH_INSTALL = protection_research.STATUS
 print("BCO_PROTECTION_RESEARCH_IMPORT", PROTECTION_RESEARCH_INSTALL, flush=True)
 
-# Procfile-synchronised fresh-build marker 2026-10-15.
+# Approved 2026-10-30 live basket-monetisation change only:
+# 30R -> bank 20% before the unchanged 50/100/150R+ ladder. The module includes
+# an explicit current-R guard so the old ~38.9R HWM cannot trigger retroactively.
+import bco_harvest_30r as harvest_30r
+HARVEST_30R_INSTALL = harvest_30r.STATUS
+print("BCO_HARVEST_30R_IMPORT", HARVEST_30R_INSTALL, flush=True)
+
+# Procfile-synchronised fresh-build marker 2026-10-30.
