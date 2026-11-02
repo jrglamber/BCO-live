@@ -51,8 +51,6 @@ import bco_exit_lab_v1 as exit_lab
 EXIT_LAB_INSTALL = exit_lab.STATUS
 print("BCO_EXIT_LAB_V1_IMPORT", EXIT_LAB_INSTALL, flush=True)
 
-# Approved 2026-11-02: expose a research-safe live-entry pause state. The actual
-# production admission path checks this flag before any new live BCO order.
 import bco_live_entry_pause_v2 as live_entry_pause
 LIVE_ENTRY_PAUSE_INSTALL = live_entry_pause.STATUS
 print("BCO_LIVE_ENTRY_PAUSE_V2_IMPORT", LIVE_ENTRY_PAUSE_INSTALL, flush=True)
