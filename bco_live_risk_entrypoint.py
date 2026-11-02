@@ -53,4 +53,10 @@ import bco_harvest_30r as harvest_30r
 HARVEST_30R_INSTALL = harvest_30r.STATUS
 print("BCO_HARVEST_30R_IMPORT", HARVEST_30R_INSTALL, flush=True)
 
-# Procfile-synchronised fresh-build marker 2026-10-30.
+# Research-only 2026-11-02 BCO Exit Lab. Replays alternative ATR, adaptive,
+# economic-HWM and partial-bank exit/protection policies with zero broker authority.
+import bco_exit_lab_v1 as exit_lab_v1
+EXIT_LAB_V1_INSTALL = exit_lab_v1.STATUS
+print("BCO_EXIT_LAB_V1_IMPORT", EXIT_LAB_V1_INSTALL, flush=True)
+
+# Procfile-synchronised fresh-build marker 2026-11-02.
