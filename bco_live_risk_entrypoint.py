@@ -1,6 +1,22 @@
 """BCO production entrypoint + read-only broker-backed risk telemetry."""
 from __future__ import annotations
 import bco_oct14_strategy_update as base
+
+# Production Postgres compatibility hotfix (2026-11-02).
+# app.py stores SQL in SQLite-style qmark form and converts '?' -> '%s' for
+# psycopg. Literal percent signs must also be escaped as '%%' or psycopg treats
+# them as malformed placeholders (for example: LIKE 'ARMED%'). Keep the fix at
+# the production entrypoint so strategy logic remains unchanged.
+core = base.core
+
+
+def _postgres_safe_qmark_to_pg(sql: str) -> str:
+    return str(sql).replace("%", "%%").replace("?", "%s")
+
+
+core._qmark_to_pg = _postgres_safe_qmark_to_pg
+core.BCO_POSTGRES_PERCENT_COMPAT_VERSION = "bco_pg_percent_compat_2026_11_02"
+
 import portfolio_live_risk as live_risk
 
 app = base.app
@@ -38,6 +54,7 @@ def _install_route():
 
 LIVE_RISK_INSTALL = _install_route()
 print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
+print("BCO_POSTGRES_PERCENT_COMPAT", core.BCO_POSTGRES_PERCENT_COMPAT_VERSION, flush=True)
 
 import bco_protection_research_v4 as protection_research
 PROTECTION_RESEARCH_INSTALL = protection_research.STATUS
