@@ -53,10 +53,15 @@ import bco_harvest_30r as harvest_30r
 HARVEST_30R_INSTALL = harvest_30r.STATUS
 print("BCO_HARVEST_30R_IMPORT", HARVEST_30R_INSTALL, flush=True)
 
-# Research-only 2026-11-02 BCO Exit Lab. Replays alternative ATR, adaptive,
-# economic-HWM and partial-bank exit/protection policies with zero broker authority.
-import bco_exit_lab_v1 as exit_lab_v1
-EXIT_LAB_V1_INSTALL = exit_lab_v1.STATUS
-print("BCO_EXIT_LAB_V1_IMPORT", EXIT_LAB_V1_INSTALL, flush=True)
+# Research-only BCO Exit Lab. No production exit/entry authority.
+import bco_exit_lab_v1 as exit_lab
+EXIT_LAB_INSTALL = exit_lab.STATUS
+print("BCO_EXIT_LAB_V1_IMPORT", EXIT_LAB_INSTALL, flush=True)
+
+# Approved 2026-11-02: pause NEW live BCO entries while preserving all existing
+# position management, exits, harvesting, reconciliation and research capture.
+import bco_live_entry_pause as live_entry_pause
+LIVE_ENTRY_PAUSE_INSTALL = live_entry_pause.STATUS
+print("BCO_LIVE_ENTRY_PAUSE_IMPORT", LIVE_ENTRY_PAUSE_INSTALL, flush=True)
 
 # Procfile-synchronised fresh-build marker 2026-11-02.
