@@ -36,32 +36,25 @@ def _install_route():
         "routes_after": len(routes or []),
     }
 
-
 LIVE_RISK_INSTALL = _install_route()
 print("BCO_LIVE_RISK_TELEMETRY", LIVE_RISK_INSTALL, flush=True)
 
-# Research-only overlay. This wraps post-signal observability/export paths and
-# has no broker-write or production decision authority.
 import bco_protection_research_v4 as protection_research
 PROTECTION_RESEARCH_INSTALL = protection_research.STATUS
 print("BCO_PROTECTION_RESEARCH_IMPORT", PROTECTION_RESEARCH_INSTALL, flush=True)
 
-# Approved 2026-10-30 live basket-monetisation change only:
-# 30R -> bank 20% before the unchanged 50/100/150R+ ladder. The module includes
-# an explicit current-R guard so the old ~38.9R HWM cannot trigger retroactively.
 import bco_harvest_30r as harvest_30r
 HARVEST_30R_INSTALL = harvest_30r.STATUS
 print("BCO_HARVEST_30R_IMPORT", HARVEST_30R_INSTALL, flush=True)
 
-# Research-only BCO Exit Lab. No production exit/entry authority.
 import bco_exit_lab_v1 as exit_lab
 EXIT_LAB_INSTALL = exit_lab.STATUS
 print("BCO_EXIT_LAB_V1_IMPORT", EXIT_LAB_INSTALL, flush=True)
 
-# Approved 2026-11-02: pause NEW live BCO entries while preserving all existing
-# position management, exits, harvesting, reconciliation and research capture.
-import bco_live_entry_pause as live_entry_pause
+# Approved 2026-11-02: expose a research-safe live-entry pause state. The actual
+# production admission path checks this flag before any new live BCO order.
+import bco_live_entry_pause_v2 as live_entry_pause
 LIVE_ENTRY_PAUSE_INSTALL = live_entry_pause.STATUS
-print("BCO_LIVE_ENTRY_PAUSE_IMPORT", LIVE_ENTRY_PAUSE_INSTALL, flush=True)
+print("BCO_LIVE_ENTRY_PAUSE_V2_IMPORT", LIVE_ENTRY_PAUSE_INSTALL, flush=True)
 
 # Procfile-synchronised fresh-build marker 2026-11-02.
