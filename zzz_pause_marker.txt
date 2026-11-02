@@ -1,0 +1,1 @@
+BCO live-entry pause approved 2026-11-02. Research signal preservation required. Do not treat candidate suppression as the live gate; enforce only at broker admission path.
