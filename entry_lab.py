@@ -129,8 +129,10 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
     """
     ensure_schema(conn)
     scan_limit=max(MIN_MATURATION_SCAN,int(max_rows or 0))
+    # Invalid historical entries must not monopolise the maturation scan.
     pending=conn.execute("""SELECT * FROM entry_lab_shadow
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
+        AND raw_signal_id>0 AND entry_price>0 AND sl_pct>0
       ORDER BY raw_signal_id ASC LIMIT ?""",(asset,scan_limit)).fetchall()
     updated=0; immature=0; invalid=0; horizons_written={str(h):0 for h in HORIZONS}
     # A bounded scan of oldest pending rows can starve newer eligible rows.
@@ -138,6 +140,9 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
     total_pending=conn.execute("""SELECT COUNT(*) AS n FROM entry_lab_shadow
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL""",(asset,)).fetchone()[0]
     last_scanned_raw_signal_id=None
+    invalid_pending=conn.execute("""SELECT COUNT(*) FROM entry_lab_shadow
+      WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
+        AND (raw_signal_id<=0 OR entry_price IS NULL OR entry_price<=0 OR sl_pct IS NULL OR sl_pct<=0)""",(asset,)).fetchone()[0]
     for raw in pending:
         r=_rowdict(raw); rid=int(r.get("raw_signal_id") or 0); entry=_f(r.get("entry_price")); sl=_f(r.get("sl_pct"))
         last_scanned_raw_signal_id=rid
@@ -155,4 +160,4 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
             sets += [f"outcome_{h}h_r=?",f"outcome_{h}h_mfe_r=?",f"outcome_{h}h_mae_r=?"]; params += [rr,mfe,mae]; horizons_written[str(h)]+=1
         if sets:
             sets.append("updated_at_utc=?"); params.extend([now_utc_iso,r.get("id")]); conn.execute("UPDATE entry_lab_shadow SET "+",".join(sets)+" WHERE id=?",tuple(params)); updated+=1
-    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
+    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"invalid_pending":invalid_pending,"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
