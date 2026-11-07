@@ -133,8 +133,14 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
       ORDER BY raw_signal_id ASC LIMIT ?""",(asset,scan_limit)).fetchall()
     updated=0; immature=0; invalid=0; horizons_written={str(h):0 for h in HORIZONS}
+    # A bounded scan of oldest pending rows can starve newer eligible rows.
+    # Surface this explicitly rather than declaring maturation healthy.
+    total_pending=conn.execute("""SELECT COUNT(*) AS n FROM entry_lab_shadow
+      WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL""",(asset,)).fetchone()[0]
+    last_scanned_raw_signal_id=None
     for raw in pending:
         r=_rowdict(raw); rid=int(r.get("raw_signal_id") or 0); entry=_f(r.get("entry_price")); sl=_f(r.get("sl_pct"))
+        last_scanned_raw_signal_id=rid
         if rid<=0 or entry is None or entry<=0 or sl is None or sl<=0:
             invalid+=1; continue
         future=[_rowdict(x) for x in conn.execute("""SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals
@@ -149,4 +155,4 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
             sets += [f"outcome_{h}h_r=?",f"outcome_{h}h_mfe_r=?",f"outcome_{h}h_mae_r=?"]; params += [rr,mfe,mae]; horizons_written[str(h)]+=1
         if sets:
             sets.append("updated_at_utc=?"); params.extend([now_utc_iso,r.get("id")]); conn.execute("UPDATE entry_lab_shadow SET "+",".join(sets)+" WHERE id=?",tuple(params)); updated+=1
-    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"scan_limit":scan_limit,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
+    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
