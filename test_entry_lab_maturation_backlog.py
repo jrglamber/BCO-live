@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime,timedelta,timezone
 import unittest
 from entry_lab import ensure_schema, update_outcomes
 
@@ -14,8 +15,12 @@ class EntryLabMaturationTests(unittest.TestCase):
                        ('2026-10-01','2026-10-01','test','bco',i+1,'BCO','shadow',1,None,None))
         db.execute(f'INSERT INTO entry_lab_shadow ({cols}) VALUES (?,?,?,?,?,?,?,?,?,?)',
                    ('2026-10-01','2026-10-01','test','bco',1300,'BCO','shadow',1,100.,1.))
-        for i in range(1301,1400):
-            db.execute('INSERT INTO raw_signals VALUES (?,?,?,?,?,?)',(i,'BCO','2026-10-01',101.,102.,100.))
+        start=datetime(2026,10,1,tzinfo=timezone.utc)
+        db.execute('INSERT INTO raw_signals VALUES (?,?,?,?,?,?)',
+                   (1300,'BCO',start.isoformat(),100.,100.,100.))
+        for h in range(1,100):
+            db.execute('INSERT INTO raw_signals VALUES (?,?,?,?,?,?)',
+                       (1300+h,'BCO',(start+timedelta(hours=h)).isoformat(),101.,102.,100.))
         result=update_outcomes(db,'BCO','2026-11-07',max_rows=1200)
         self.assertEqual(result['invalid_pending'],1205)
         self.assertEqual(result['updated'],1)
