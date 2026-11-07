@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-ENTRY_LAB_VERSION = "entry_lab_v3_asset_sequence_maturation_2026_10_17"
+ENTRY_LAB_VERSION = "entry_lab_v4_elapsed_utc_horizons_2026_11_07"
 HORIZONS = (6, 12, 24, 48, 72, 96)
 MIN_MATURATION_SCAN = 1200
 
@@ -142,7 +142,7 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
         AND raw_signal_id>0 AND entry_price>0 AND sl_pct>0
       ORDER BY raw_signal_id ASC LIMIT ?""",(asset,scan_limit)).fetchall()
-    updated=0; immature=0; invalid=0; horizons_written={str(h):0 for h in HORIZONS}
+    updated=0; immature=0; invalid=0; truncated=0; horizons_written={str(h):0 for h in HORIZONS}
     # A bounded scan of oldest pending rows can starve newer eligible rows.
     # Surface this explicitly rather than declaring maturation healthy.
     total_pending=conn.execute("""SELECT COUNT(*) AS n FROM entry_lab_shadow
@@ -168,6 +168,11 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
         future=[_rowdict(x) for x in conn.execute("""SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals
           WHERE UPPER(pair)=UPPER(?) AND id>? AND exec_close IS NOT NULL
           ORDER BY id ASC LIMIT 1000""",(asset,rid)).fetchall()]
+        if len(future)==1000:
+            # Could be missing later observations within the 96h window;
+            # do not claim MFE/MAE completeness from a truncated sample.
+            truncated+=1
+            continue
         observed=[]
         for x in future:
             t=_utc_timestamp(x.get("timestamp_readable"))
@@ -190,4 +195,4 @@ def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
             params += [rr,mfe,mae]; horizons_written[str(h)]+=1
         if sets:
             sets.append("updated_at_utc=?"); params.extend([now_utc_iso,r.get("id")]); conn.execute("UPDATE entry_lab_shadow SET "+",".join(sets)+" WHERE id=?",tuple(params)); updated+=1
-    return {"ok":True,"horizon_basis":"exact_elapsed_utc_hours","updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"invalid_pending":invalid_pending,"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
+    return {"ok":True,"horizon_basis":"exact_elapsed_utc_hours","updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"invalid_pending":invalid_pending,"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"truncated":truncated,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
