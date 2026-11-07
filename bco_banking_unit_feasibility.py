@@ -47,7 +47,7 @@ def whole_trade_basket_bank(trades, fraction):
         try:
             tid=str(t["broker_trade_id"])
             units=float(t["units"]); pnl=float(t["unrealised_net_gbp"])
-            if not tid or tid in seen or not all(isfinite(x) for x in (units,pnl)) or units<=0:
+            if not tid.strip() or tid.lower() in {"none", "null"} or tid in seen or not all(isfinite(x) for x in (units,pnl)) or units<=0:
                 return {"feasible":False,"reason":"invalid_or_duplicate_trade","selected":[]}
             seen.add(tid)
             if pnl>0: eligible.append((tid,units,pnl))
