@@ -6,9 +6,10 @@ It never places/blocks/closes/modifies broker trades.
 """
 from __future__ import annotations
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-ENTRY_LAB_VERSION = "entry_lab_v3_asset_sequence_maturation_2026_10_17"
+ENTRY_LAB_VERSION = "entry_lab_v4_elapsed_utc_horizons_2026_11_07"
 HORIZONS = (6, 12, 24, 48, 72, 96)
 MIN_MATURATION_SCAN = 1200
 
@@ -119,34 +120,79 @@ def capture(conn,*,project,raw_signal_id,baseline_candidate,actual_entry,sl_pct,
     return {"ok":True,"inserted":inserted,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
 
 
-def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
-    """Mature known challenger decisions from later candles of the same asset.
+def _utc_timestamp(value):
+    if isinstance(value, datetime): dt=value
+    else:
+        raw=str(value or "").strip()
+        if not raw: return None
+        try: dt=datetime.fromisoformat(raw.replace("Z","+00:00"))
+        except (TypeError,ValueError): return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
-    raw_signals is a shared/interleaved table, so global row ids are not a
-    candle counter. Future observations are therefore selected by asset and
-    ordered by id; the first 6/12/24/48/72/96 same-asset observations are the
-    fixed horizons. The routine is research-only and has no execution authority.
+
+def update_outcomes(conn,asset,now_utc_iso,max_rows=1200):
+    """Mature research outcomes by exact elapsed UTC hours, never row counts.
+
+    Missing horizon observations remain NULL; no execution authority.
     """
     ensure_schema(conn)
     scan_limit=max(MIN_MATURATION_SCAN,int(max_rows or 0))
+    # Invalid historical entries must not monopolise the maturation scan.
     pending=conn.execute("""SELECT * FROM entry_lab_shadow
       WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
+        AND raw_signal_id>0 AND entry_price>0 AND sl_pct>0
       ORDER BY raw_signal_id ASC LIMIT ?""",(asset,scan_limit)).fetchall()
-    updated=0; immature=0; invalid=0; horizons_written={str(h):0 for h in HORIZONS}
+    updated=0; immature=0; invalid=0; truncated=0; horizons_written={str(h):0 for h in HORIZONS}
+    # A bounded scan of oldest pending rows can starve newer eligible rows.
+    # Surface this explicitly rather than declaring maturation healthy.
+    total_pending=conn.execute("""SELECT COUNT(*) AS n FROM entry_lab_shadow
+      WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL""",(asset,)).fetchone()[0]
+    last_scanned_raw_signal_id=None
+    invalid_pending=conn.execute("""SELECT COUNT(*) FROM entry_lab_shadow
+      WHERE UPPER(asset)=UPPER(?) AND decision_known=1 AND outcome_96h_r IS NULL
+        AND (raw_signal_id<=0 OR entry_price IS NULL OR entry_price<=0 OR sl_pct IS NULL OR sl_pct<=0)""",(asset,)).fetchone()[0]
     for raw in pending:
         r=_rowdict(raw); rid=int(r.get("raw_signal_id") or 0); entry=_f(r.get("entry_price")); sl=_f(r.get("sl_pct"))
+        last_scanned_raw_signal_id=rid
         if rid<=0 or entry is None or entry<=0 or sl is None or sl<=0:
             invalid+=1; continue
+        start_at=_utc_timestamp(r.get("signal_time"))
+        if start_at is None:
+            signal=conn.execute("SELECT timestamp_readable FROM raw_signals WHERE id=? LIMIT 1",(rid,)).fetchone()
+            start_at=_utc_timestamp(_rowdict(signal).get("timestamp_readable"))
+        if start_at is None:
+            invalid+=1; continue
+        end_at=start_at+timedelta(hours=max(HORIZONS))
+        # Scan same-asset observations and parse times in Python: legacy stored
+        # timestamp formats are not necessarily lexicographically comparable.
         future=[_rowdict(x) for x in conn.execute("""SELECT id,timestamp_readable,exec_close,exec_high,exec_low FROM raw_signals
-          WHERE UPPER(pair)=UPPER(?) AND id>? AND exec_close IS NOT NULL ORDER BY id ASC LIMIT 96""",(asset,rid)).fetchall()]
-        if len(future)<6: immature+=1; continue
+          WHERE UPPER(pair)=UPPER(?) AND id>? AND exec_close IS NOT NULL
+          ORDER BY id ASC LIMIT 1000""",(asset,rid)).fetchall()]
+        if len(future)==1000:
+            # Could be missing later observations within the 96h window;
+            # do not claim MFE/MAE completeness from a truncated sample.
+            truncated+=1
+            continue
+        observed=[]
+        for x in future:
+            t=_utc_timestamp(x.get("timestamp_readable"))
+            if t is not None and start_at<t<=end_at: observed.append((t,x))
+        if not observed: immature+=1; continue
         sets=[]; params=[]
         for h in HORIZONS:
-            if len(future)<h: continue
-            seg=future[:h]; last=_f(seg[-1].get("exec_close")); highs=[_f(x.get("exec_high")) for x in seg]; lows=[_f(x.get("exec_low")) for x in seg]
+            deadline=start_at+timedelta(hours=h)
+            eligible=[x for t,x in observed if t<=deadline]
+            exact=[x for t,x in observed if t==deadline]
+            if not exact: continue
+            last=_f(exact[-1].get("exec_close"))
+            highs=[_f(x.get("exec_high")) for x in eligible]; lows=[_f(x.get("exec_low")) for x in eligible]
             highs=[x for x in highs if x is not None]; lows=[x for x in lows if x is not None]
-            rr=((last/entry-1.0)*100.0/sl) if last is not None else None; mfe=((max(highs)/entry-1.0)*100.0/sl) if highs else None; mae=((min(lows)/entry-1.0)*100.0/sl) if lows else None
-            sets += [f"outcome_{h}h_r=?",f"outcome_{h}h_mfe_r=?",f"outcome_{h}h_mae_r=?"]; params += [rr,mfe,mae]; horizons_written[str(h)]+=1
+            if last is None: continue
+            rr=((last/entry-1.0)*100.0/sl)
+            mfe=((max(highs)/entry-1.0)*100.0/sl) if highs else None
+            mae=((min(lows)/entry-1.0)*100.0/sl) if lows else None
+            sets += [f"outcome_{h}h_r=?",f"outcome_{h}h_mfe_r=?",f"outcome_{h}h_mae_r=?"]
+            params += [rr,mfe,mae]; horizons_written[str(h)]+=1
         if sets:
             sets.append("updated_at_utc=?"); params.extend([now_utc_iso,r.get("id")]); conn.execute("UPDATE entry_lab_shadow SET "+",".join(sets)+" WHERE id=?",tuple(params)); updated+=1
-    return {"ok":True,"updated":updated,"pending_scanned":len(pending),"scan_limit":scan_limit,"immature":immature,"invalid":invalid,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
+    return {"ok":True,"horizon_basis":"exact_elapsed_utc_hours","updated":updated,"pending_scanned":len(pending),"pending_total":total_pending,"pending_unscanned":max(0,total_pending-len(pending)),"invalid_pending":invalid_pending,"scan_limit":scan_limit,"last_scanned_raw_signal_id":last_scanned_raw_signal_id,"immature":immature,"invalid":invalid,"truncated":truncated,"horizons_written":horizons_written,"research_only":True,"execution_authority":False,"version":ENTRY_LAB_VERSION}
