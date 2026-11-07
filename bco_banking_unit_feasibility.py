@@ -28,3 +28,39 @@ def partial_close_feasibility(units, fraction, min_units=1, increment=1):
         return {"feasible": False, "reason": "insufficient_remaining_units", "close_units": 0}
     return {"feasible": True, "reason": "partial_close_possible", "close_units": close_units,
             "effective_fraction": close_units / units}
+
+
+def whole_trade_basket_bank(trades, fraction):
+    """Research-only subset of profitable trades, without fractional broker units.
+
+    trades: broker trade IDs, units, and currently *unrealised* net GBP P&L.
+    Uses a deterministic greedy subset, not an optimal profit maximiser.
+    A trade must be profitable and fully closable; no live orders are sent.
+    """
+    try:
+        fraction=float(fraction)
+        if not isfinite(fraction) or not 0<fraction<1: raise ValueError()
+    except (TypeError, ValueError):
+        return {"feasible":False,"reason":"invalid_fraction","selected":[]}
+    eligible=[]; seen=set()
+    for t in trades:
+        try:
+            tid=str(t["broker_trade_id"])
+            units=float(t["units"]); pnl=float(t["unrealised_net_gbp"])
+            if not tid or tid in seen or not all(isfinite(x) for x in (units,pnl)) or units<=0:
+                return {"feasible":False,"reason":"invalid_or_duplicate_trade","selected":[]}
+            seen.add(tid)
+            if pnl>0: eligible.append((tid,units,pnl))
+        except (KeyError,TypeError,ValueError):
+            return {"feasible":False,"reason":"invalid_trade","selected":[]}
+    target=sum(x[2] for x in eligible)*fraction
+    if target<=0: return {"feasible":False,"reason":"no_profitable_trades","selected":[]}
+    # Smallest profitable positions first to avoid oversized profit banking.
+    selected=[]; banked=0.0
+    for tid,units,pnl in sorted(eligible,key=lambda x:(x[2],x[0])):
+        if banked+pnl<=target+1e-9:
+            selected.append({"broker_trade_id":tid,"units":units,"unrealised_net_gbp":pnl})
+            banked+=pnl
+    return {"feasible":bool(selected),"reason":"whole_trade_subset" if selected else "target_below_smallest_profitable_trade",
+            "selected":selected,"target_gbp":target,"banked_gbp_before_costs":banked,
+            "effective_fraction":banked/sum(x[2] for x in eligible)}
