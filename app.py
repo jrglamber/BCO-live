@@ -6371,7 +6371,9 @@ def ai_regime_observer_audit_endpoint():
 
 @app.get("/ai-regime-observer/status")
 def ai_regime_observer_status_endpoint():
-    return ai_regime_observer_status()
+    status = ai_regime_observer_status()
+    status["audit"] = ai_regime_observer_audit()
+    return status
 
 
 @app.get("/export/ai-regime-observer.csv")
