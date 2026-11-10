@@ -6291,9 +6291,89 @@ def ai_regime_observer_status():
     }
 
 
+def ai_regime_observer_audit():
+    """Read-only freshness and point-in-time forward-return audit; never controls execution."""
+    ensure_ai_regime_observer_table()
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("""
+            SELECT raw_signal_id,created_at_utc,completed_at_utc,status,api_eligible,
+                   error,long_view,short_view,entry_view,live_candidate,snapshot_json
+            FROM ai_regime_observer ORDER BY raw_signal_id DESC LIMIT 2000
+        """).fetchall()]
+    def age_hours(value):
+        dt = _bco_parse_aware_utc(value)
+        return round((now-dt).total_seconds()/3600, 2) if dt else None
+    latest = rows[0] if rows else None
+    eligible = next((r for r in rows if int(r.get("api_eligible") or 0)), None)
+    complete = next((r for r in rows if r.get("status") == "COMPLETE"), None)
+    errors = [r for r in rows[:100] if r.get("status") in ("ERROR", "RETRY_WAIT")]
+    capture_age = age_hours(latest.get("created_at_utc")) if latest else None
+    eligible_age = age_hours(eligible.get("created_at_utc")) if eligible else None
+    complete_age = age_hours(complete.get("completed_at_utc")) if complete else None
+    uncompleted = [r for r in rows if int(r.get("api_eligible") or 0)
+                   and r.get("status") not in ("COMPLETE", "ERROR")]
+    overdue = [r for r in uncompleted if (age_hours(r.get("created_at_utc")) or 0) > 3]
+    alerts = []
+    if AI_SHADOW_CAPTURE_ENABLED and (capture_age is None or capture_age > 4):
+        alerts.append("CAPTURE_STALE")
+    if AI_SHADOW_ENABLED and not AI_SHADOW_OPENAI_API_KEY:
+        alerts.append("API_KEY_MISSING")
+    if AI_SHADOW_ENABLED and overdue:
+        alerts.append("ELIGIBLE_CALL_OVERDUE")
+    if AI_SHADOW_ENABLED and eligible and (eligible_age or 0) < 24 and \
+            (complete_age is None or complete_age > 24):
+        alerts.append("NO_RECENT_COMPLETION_DESPITE_ELIGIBLE_EVENTS")
+    if errors:
+        alerts.append("RECENT_API_ERRORS")
+    # Research-only directional markout, not realised P&L or trade-execution replay.
+    # Evaluate against the first captured price >=24 hours later, never hindsight
+    # at the decision time. A missing forward snapshot remains pending.
+    chronological = list(reversed(rows))
+    snapshots = []
+    for r in chronological:
+        try:
+            event = (json.loads(r.get("snapshot_json") or "{}").get("event_state") or {})
+            price = safe_float(event.get("incoming_price"))
+            dt = _bco_parse_aware_utc(r.get("created_at_utc"))
+            if price is not None and price > 0 and dt is not None:
+                snapshots.append((dt, price, r))
+        except (ValueError, TypeError, KeyError):
+            continue
+    evaluated = []
+    for i, (dt, price, r) in enumerate(snapshots):
+        if r.get("status") != "COMPLETE":
+            continue
+        later = next(((t,p) for t,p,_ in snapshots[i+1:] if (t-dt).total_seconds() >= 86400), None)
+        if later is None:
+            continue
+        change_pct = round(100*(later[1]/price-1), 4)
+        view = safe_str(r.get("long_view") or r.get("entry_view")).upper()
+        evaluated.append({"signal_id":r.get("raw_signal_id"),"bot_long_candidate":bool(r.get("live_candidate")),
+                          "ai_long_view":view,"forward_24h_pct":change_pct,
+                          "ai_avoid_and_market_fell":view=="AVOID" and change_pct<0,
+                          "ai_avoid_and_market_rose":view=="AVOID" and change_pct>0})
+    return {"ok":not bool(alerts),"research_only":True,"alerts":alerts,
+            "capture_age_hours":capture_age,"latest_eligible_age_hours":eligible_age,
+            "latest_complete_age_hours":complete_age,"recent_errors":len(errors),
+            "overdue_eligible":len(overdue),"captured_rows":len(rows),
+            "forward_24h":{"metric":"market_price_markout_not_trade_pnl",
+                           "settled_count":len(evaluated),
+                           "avoid_correct_down":sum(x["ai_avoid_and_market_fell"] for x in evaluated),
+                           "avoid_false_alarm_up":sum(x["ai_avoid_and_market_rose"] for x in evaluated),
+                           "recent":evaluated[-30:]}}
+
+
+@app.get("/ai-regime-observer/audit")
+def ai_regime_observer_audit_endpoint():
+    return ai_regime_observer_audit()
+
+
 @app.get("/ai-regime-observer/status")
 def ai_regime_observer_status_endpoint():
-    return ai_regime_observer_status()
+    status = ai_regime_observer_status()
+    status["audit"] = ai_regime_observer_audit()
+    return status
 
 
 @app.get("/export/ai-regime-observer.csv")
