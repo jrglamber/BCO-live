@@ -6321,7 +6321,7 @@ def ai_regime_observer_audit():
         alerts.append("API_KEY_MISSING")
     if AI_SHADOW_ENABLED and overdue:
         alerts.append("ELIGIBLE_CALL_OVERDUE")
-    if AI_SHADOW_ENABLED and eligible and (eligible_age or 0) < 24 and \\
+    if AI_SHADOW_ENABLED and eligible and (eligible_age or 0) < 24 and \
             (complete_age is None or complete_age > 24):
         alerts.append("NO_RECENT_COMPLETION_DESPITE_ELIGIBLE_EVENTS")
     if errors:
