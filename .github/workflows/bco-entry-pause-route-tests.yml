@@ -1,0 +1,50 @@
+name: BCO production entry pause route availability
+on:
+  pull_request:
+    paths:
+      - 'bco_live_entry_pause_v2.py'
+      - 'bco_readonly_route_order.py'
+      - 'test_bco_entry_pause_route.py'
+      - '.github/workflows/bco-entry-pause-route-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'bco_live_entry_pause_v2.py'
+      - 'bco_readonly_route_order.py'
+      - 'test_bco_entry_pause_route.py'
+      - '.github/workflows/bco-entry-pause-route-tests.yml'
+  workflow_dispatch:
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run pure route precedence tests
+        run: |
+          pip install fastapi
+          python -m py_compile bco_readonly_route_order.py bco_live_entry_pause_v2.py test_bco_entry_pause_route.py
+          python -m unittest -v test_bco_entry_pause_route
+      - name: Verify production read-only endpoint after deployment
+        if: github.event_name != 'pull_request'
+        run: |
+          python - <<'PY'
+          import json,time,urllib.request
+          url='https://bco-live-production.up.railway.app/bco-live-entry-pause-v2'
+          for attempt in range(20):
+            try:
+              with urllib.request.urlopen(url,timeout=12) as r:
+                if r.status!=200: raise RuntimeError('HTTP '+str(r.status))
+                x=json.load(r)
+              if x.get('ok') is not True or x.get('scope')!='production_trade_creation_only' or not isinstance(x.get('paused'),bool):
+                raise AssertionError('BCO pause status contract invalid')
+              print('PASS: read-only BCO pause endpoint reachable, paused='+str(x['paused']))
+              break
+            except Exception as exc:
+              print('Attempt '+str(attempt+1)+': '+str(exc)[:150])
+              time.sleep(6)
+          else: raise SystemExit('FAIL: BCO pause endpoint unavailable')
+          PY
