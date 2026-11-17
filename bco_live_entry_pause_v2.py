@@ -9,6 +9,7 @@ Reversible with BCO_LIVE_ENTRIES_PAUSED=false + redeploy.
 from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
+from bco_readonly_route_order import promote_get
 import bco_oct14_strategy_update as base
 
 core = base.core
@@ -58,6 +59,12 @@ def bco_live_entry_pause_status_v2():
         "re_enable": "set BCO_LIVE_ENTRIES_PAUSED=false and redeploy",
     }
 
+# The legacy BCO root mount precedes late-defined routes. Promote only this
+# read-only pause-status GET; never touch production order/manager routes.
+PAUSE_STATUS_ROUTE = promote_get(
+    app, "/bco-live-entry-pause-v2", bco_live_entry_pause_status_v2
+)
+print("BCO_ENTRY_PAUSE_STATUS_ROUTE", PAUSE_STATUS_ROUTE, flush=True)
 
 STATUS = {
     "installed": True,
