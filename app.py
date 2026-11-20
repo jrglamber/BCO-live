@@ -6297,8 +6297,8 @@ def ai_regime_observer_audit():
     now = datetime.now(timezone.utc)
     with get_conn() as conn:
         rows = [dict(r) for r in conn.execute("""
-            SELECT raw_signal_id,created_at_utc,completed_at_utc,status,api_eligible,
-                   error,long_view,short_view,entry_view,live_candidate,snapshot_json
+            SELECT raw_signal_id,created_at_utc,updated_at_utc,completed_at_utc,status,api_eligible,
+                   error,last_http_status,asset,long_view,short_view,entry_view,live_candidate,snapshot_json
             FROM ai_regime_observer ORDER BY raw_signal_id DESC LIMIT 2000
         """).fetchall()]
     def age_hours(value):
@@ -6307,7 +6307,27 @@ def ai_regime_observer_audit():
     latest = rows[0] if rows else None
     eligible = next((r for r in rows if int(r.get("api_eligible") or 0)), None)
     complete = next((r for r in rows if r.get("status") == "COMPLETE"), None)
-    errors = [r for r in rows[:100] if r.get("status") in ("ERROR", "RETRY_WAIT")]
+    # Historical failures should not look like a current outage. Retry waits
+    # are tracked by the overdue pending check, not as completed API errors.
+    historical_errors = [r for r in rows[:100] if r.get("status") in ("ERROR", "RETRY_WAIT")]
+    complete_by_asset = {}
+    for item in rows:
+        if item.get("status") != "COMPLETE":
+            continue
+        asset = safe_str(item.get("asset") or "BCO")
+        dt = _bco_parse_aware_utc(item.get("completed_at_utc") or item.get("updated_at_utc"))
+        if dt and (asset not in complete_by_asset or dt > complete_by_asset[asset]):
+            complete_by_asset[asset] = dt
+    active_errors = []
+    for item in historical_errors:
+        if item.get("status") != "ERROR" or not int(item.get("api_eligible") or 0):
+            continue
+        failed_at = _bco_parse_aware_utc(item.get("updated_at_utc") or item.get("completed_at_utc") or item.get("created_at_utc"))
+        if not failed_at or failed_at < now - timedelta(hours=24):
+            continue
+        recovered_at = complete_by_asset.get(safe_str(item.get("asset") or "BCO"))
+        if recovered_at is None or recovered_at < failed_at:
+            active_errors.append(item)
     capture_age = age_hours(latest.get("created_at_utc")) if latest else None
     eligible_age = age_hours(eligible.get("created_at_utc")) if eligible else None
     complete_age = age_hours(complete.get("completed_at_utc")) if complete else None
@@ -6324,7 +6344,7 @@ def ai_regime_observer_audit():
     if AI_SHADOW_ENABLED and eligible and (eligible_age or 0) < 24 and \
             (complete_age is None or complete_age > 24):
         alerts.append("NO_RECENT_COMPLETION_DESPITE_ELIGIBLE_EVENTS")
-    if errors:
+    if active_errors:
         alerts.append("RECENT_API_ERRORS")
     # Research-only directional markout, not realised P&L or trade-execution replay.
     # Evaluate against the first captured price >=24 hours later, never hindsight
@@ -6355,7 +6375,9 @@ def ai_regime_observer_audit():
                           "ai_avoid_and_market_rose":view=="AVOID" and change_pct>0})
     return {"ok":not bool(alerts),"research_only":True,"alerts":alerts,
             "capture_age_hours":capture_age,"latest_eligible_age_hours":eligible_age,
-            "latest_complete_age_hours":complete_age,"recent_errors":len(errors),
+            "latest_complete_age_hours":complete_age,"recent_errors":len(active_errors),
+            "historical_error_rows_last_100":len(historical_errors),
+            "active_error_codes":sorted({str(r.get("last_http_status") or "UNKNOWN") for r in active_errors}),
             "overdue_eligible":len(overdue),"captured_rows":len(rows),
             "forward_24h":{"metric":"market_price_markout_not_trade_pnl",
                            "settled_count":len(evaluated),
