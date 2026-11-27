@@ -3687,7 +3687,7 @@ def process_signal(raw_signal_id: int, payload: Dict[str,Any]) -> Dict[str,Any]:
         if final["open_count"]<=0:
             cycle=safe_str(state.get("cycle_id"))
             if cycle:
-                conn.execute("UPDATE protection_stages SET status='EXPIRED_FLAT',updated_at_utc=? WHERE cycle_id=? AND status LIKE 'ARMED%'",(now_utc_iso(),cycle))
+                conn.execute("UPDATE protection_stages SET status='EXPIRED_FLAT',updated_at_utc=? WHERE cycle_id=? AND status LIKE ?",(now_utc_iso(),cycle,"ARMED%"))
             flat_reset = reset_flat_bco_basket_state(
                 conn,
                 reason="process_signal_final_open_count_zero",
@@ -6037,10 +6037,10 @@ def _aiobs_recover_retryable_rows() -> Dict[str, Any]:
             SELECT raw_signal_id FROM ai_regime_observer
             WHERE api_eligible=1
               AND UPPER(COALESCE(status,''))='ERROR'
-              AND (error LIKE '%429%' OR UPPER(COALESCE(error,'')) LIKE '%TOO MANY REQUESTS%')
+              AND (error LIKE ? OR UPPER(COALESCE(error,'')) LIKE ?)
               AND COALESCE(attempt_count,0) < ?
             ORDER BY raw_signal_id ASC
-        """, (AI_SHADOW_RETRY_MAX_ATTEMPTS,)).fetchall()
+        """, ("%429%", "%TOO MANY REQUESTS%", AI_SHADOW_RETRY_MAX_ATTEMPTS)).fetchall()
         for row in rows:
             conn.execute("""
                 UPDATE ai_regime_observer
@@ -7429,9 +7429,9 @@ def capture_ai_regime_snapshot(raw_signal_id, payload):
                     SELECT created_at_utc FROM ai_regime_observer
                     WHERE raw_signal_id<?
                       AND api_eligible=1
-                      AND trigger_reason LIKE '%SHORT_RESEARCH_%'
+                      AND trigger_reason LIKE ?
                     ORDER BY raw_signal_id DESC LIMIT 1
-                """, (int(raw_signal_id),)).fetchone()
+                """, ("%SHORT_RESEARCH_%", int(raw_signal_id))).fetchone()
                 allow_short_state_call = True
                 if last_short_call and AI_SHADOW_SHORT_STATE_MIN_CALL_GAP_HOURS > 0:
                     last_dt = _bco_parse_aware_utc(last_short_call["created_at_utc"])
