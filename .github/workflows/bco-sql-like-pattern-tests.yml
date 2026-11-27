@@ -1,0 +1,27 @@
+name: BCO SQL LIKE parameter regression
+on:
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'test_bco_sql_like_pattern_binding.py'
+      - '.github/workflows/bco-sql-like-pattern-tests.yml'
+  push:
+    branches:
+      - '*'
+      - main
+    paths:
+      - 'app.py'
+      - 'test_bco_sql_like_pattern_binding.py'
+      - '.github/workflows/bco-sql-like-pattern-tests.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile and test parameterized wildcard queries
+        run: |
+          python -m py_compile app.py test_bco_sql_like_pattern_binding.py
+          python -m unittest -v test_bco_sql_like_pattern_binding
